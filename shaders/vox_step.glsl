@@ -488,10 +488,14 @@ void do_emit() {
 		if (is_water ? (nm == AIR) : (nm == AIR || nm == WATER)) { exposed = true; }
 	}
 	if (!exposed) { return; }
-	// place the voxel at its WORLD position (toroidal buffer slot -> world) so a
-	// streamed window renders where the camera actually is
-	vec3 origin = vec3(float(world_coord(x, p.gen_ox, p.W)) + 0.5,
-			float(int(y) + int(p.gen_oy)) + 0.5, float(world_coord(z, p.gen_oz, p.D)) + 0.5);
+	// FLOATING ORIGIN: emit at the position RELATIVE to the window origin
+	// (world_coord - origin, in [0, W/D)), not the absolute world coord. Drawing
+	// 5 cm cubes at world coords ~1e5 cracks seams open (float32 view-transform
+	// precision); rendering in the small local frame keeps them tight. The camera
+	// is offset by the same origin, so the view still shows the right world region.
+	vec3 origin = vec3(float(world_coord(x, p.gen_ox, p.W) - p.gen_ox) + 0.5,
+			float(int(y) + int(p.gen_oy)) + 0.5,
+			float(world_coord(z, p.gen_oz, p.D) - p.gen_oz) + 0.5);
 	if (is_water) {
 		uint slot = atomicAdd(n_water, 1u);
 		if (slot < cap_water) { write_inst(true, slot, origin, vec4(1.0), 1.0); }
@@ -547,9 +551,9 @@ void do_block_emit() {
 			m = MAT(cells[cidx(cx, min(y0 + 10u, p.H - 1u), cz)]);
 			if (m == AIR) { m = SOIL; }
 		}
-		vec3 center = vec3(float(int(x0) + int(p.gen_ox)) + 10.0,
+		vec3 center = vec3(float(int(x0)) + 10.0,        // local frame (floating origin)
 				float(int(y0) + int(p.gen_oy)) + 10.0,
-				float(int(z0) + int(p.gen_oz)) + 10.0);
+				float(int(z0)) + 10.0);
 		if (m == WATER) {
 			uint slot = atomicAdd(n_water, 1u);
 			if (slot < cap_water) { write_inst(true, slot, center, vec4(1.0), 20.0); }
@@ -616,12 +620,23 @@ void do_skin_emit() {
 	// lowest exposed voxel: the top is always exposed; each block edge whose
 	// neighbouring block is shorter exposes this column's side down to it
 	uint low = topf - 1u;
-	if (x % 20u == 19u && x + 1u < p.W) { uint hn = block_top_h(bx + 1u, bz); if (hn < topf) { low = min(low, hn); } }
-	if (x % 20u == 0u  && x > 0u)       { uint hn = block_top_h(bx - 1u, bz); if (hn < topf) { low = min(low, hn); } }
-	if (z % 20u == 19u && z + 1u < p.D) { uint hn = block_top_h(bx, bz + 1u); if (hn < topf) { low = min(low, hn); } }
-	if (z % 20u == 0u  && z > 0u)       { uint hn = block_top_h(bx, bz - 1u); if (hn < topf) { low = min(low, hn); } }
-	float wx = float(world_coord(x, p.gen_ox, p.W));   // world pos (torus)
-	float wz = float(world_coord(z, p.gen_oz, p.D));
+	bool xhi = x % 20u == 19u && x + 1u < p.W;
+	bool xlo = x % 20u == 0u  && x > 0u;
+	bool zhi = z % 20u == 19u && z + 1u < p.D;
+	bool zlo = z % 20u == 0u  && z > 0u;
+	if (xhi) { uint hn = block_top_h(bx + 1u, bz); if (hn < topf) { low = min(low, hn); } }
+	if (xlo) { uint hn = block_top_h(bx - 1u, bz); if (hn < topf) { low = min(low, hn); } }
+	if (zhi) { uint hn = block_top_h(bx, bz + 1u); if (hn < topf) { low = min(low, hn); } }
+	if (zlo) { uint hn = block_top_h(bx, bz - 1u); if (hn < topf) { low = min(low, hn); } }
+	// diagonal corner columns: if only the DIAGONAL block is shorter, the 4 checks
+	// above miss it and a pinhole opens at the block corner. Seal it by dropping to
+	// the diagonal neighbour's height too.
+	if (xhi && zhi) { uint hn = block_top_h(bx + 1u, bz + 1u); if (hn < topf) { low = min(low, hn); } }
+	if (xhi && zlo) { uint hn = block_top_h(bx + 1u, bz - 1u); if (hn < topf) { low = min(low, hn); } }
+	if (xlo && zhi) { uint hn = block_top_h(bx - 1u, bz + 1u); if (hn < topf) { low = min(low, hn); } }
+	if (xlo && zlo) { uint hn = block_top_h(bx - 1u, bz - 1u); if (hn < topf) { low = min(low, hn); } }
+	float wx = float(world_coord(x, p.gen_ox, p.W) - p.gen_ox);   // local frame (floating origin)
+	float wz = float(world_coord(z, p.gen_oz, p.D) - p.gen_oz);
 	for (uint y = low; y < topf; y++) {
 		uint raw = cells[cidx(x, y, z)];
 		uint m = MAT(raw);

@@ -100,12 +100,14 @@ func set_visible_counts(ns: int, nw: int) -> void:
 	solid_mm.multimesh.visible_instance_count = ns
 	water_mm.multimesh.visible_instance_count = nw
 
-## streaming: the emit writes voxels at world coords [origin, origin+W); move the
-## instance AABBs there so the GPU-written instances aren't frustum-culled away
-func set_stream_origin(ox: int, oz: int) -> void:
+## FLOATING ORIGIN: the emit writes voxels in the LOCAL frame [0, W) (relative to
+## the window origin), so the culling AABB is a fixed local box — the whole scene
+## is drawn near 0 and the camera is offset by the same origin. Kept as a hook so
+## streaming can call it; the box no longer depends on the world origin.
+func set_stream_origin(_ox: int, _oz: int) -> void:
 	if not use_instances:
 		return
-	var a := AABB(Vector3(ox - 16, -16, oz - 16),
+	var a := AABB(Vector3(-16, -16, -16),
 			Vector3(world.W + 32, AABB_Y, world.D + 32))
 	solid_mm.custom_aabb = a
 	water_mm.custom_aabb = a

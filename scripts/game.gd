@@ -131,7 +131,13 @@ func _ready() -> void:
 
 	cam = Camera3D.new()
 	cam.far = maxf(2000.0, world.W * 1.6)   # see across a big world
+	# a 0.05 near plane against a 2000 far plane wastes almost all depth precision
+	# up close, so coincident voxel-cube faces z-fight into thin seams. 1 unit = 1
+	# voxel (5 cm); a 0.3-voxel near plane (1.5 cm) is closer than you fly yet lifts
+	# the far:near ratio ~7x, and 4x MSAA smooths the high-contrast cube edges.
+	cam.near = 0.3
 	add_child(cam)
+	get_viewport().msaa_3d = Viewport.MSAA_4X
 	dist = world.W * 1.12
 	interactive = not ("--sim" in OS.get_cmdline_user_args() or "--shot" in OS.get_cmdline_user_args())
 	if interactive:
@@ -252,8 +258,17 @@ func _track_band() -> void:
 	gw.reset_water_stats()
 	_refresh_view(true)
 
+## FLOATING ORIGIN: the emit draws the world in a local frame relative to the
+## window origin (world_coord - gen_origin), so the camera is offset by the same
+## origin. This keeps rendered coordinates small (~0..W) even when the sim runs at
+## world coords ~1e5, where float32 would otherwise crack seams between the voxels.
+func _render_off() -> Vector3:
+	if world is GpuWorld:
+		return Vector3(world.gen_origin_x, 0.0, world.gen_origin_z)
+	return Vector3.ZERO
+
 func _place_fly() -> void:
-	cam.position = fly_pos
+	cam.position = fly_pos - _render_off()
 	cam.basis = Basis(Vector3.UP, fly_yaw) * Basis(Vector3.RIGHT, fly_pitch)
 
 ## creative-mode free flight: WASD in the look direction, Space/Shift straight
@@ -340,6 +355,7 @@ func _process(dt: float) -> void:
 		if _band_acc > 0.2:
 			_band_acc = 0.0
 			_track_band()
+		_place_fly()   # re-sync camera to the (possibly shifted) render origin
 	elif not _freeze_cam:
 		_place_cam()
 	_title_acc += dt
@@ -491,8 +507,14 @@ func _take_screenshot() -> void:
 		print("BANDSHOT: relief over 2km sample = %.0f..%.0f vox (%.1f..%.1f m) = %.1f m span" \
 			% [lo, hi, lo * 0.05, hi * 0.05, (hi - lo) * 0.05])
 		print("BANDSHOT: emit solid=%d water=%d instances" % [cnt[0], cnt[1]])
-		cam.position = Vector3(cx - world.W * 0.35, surf + world.H * 0.85, cz - world.D * 0.35)
-		cam.look_at(Vector3(cx, surf, cz), Vector3.UP)
+		var ro := _render_off()                            # floating origin: draw near 0
+		if OS.get_environment("VOX_CLOSE") != "":
+			# close low-angle view to inspect seams between individual voxels
+			cam.position = Vector3(cx, surf + 10.0, cz - 70.0) - ro
+			cam.look_at(Vector3(cx, surf - 6.0, cz) - ro, Vector3.UP)
+		else:
+			cam.position = Vector3(cx - world.W * 0.35, surf + world.H * 0.85, cz - world.D * 0.35) - ro
+			cam.look_at(Vector3(cx, surf, cz) - ro, Vector3.UP)
 		await get_tree().create_timer(0.4).timeout
 		get_viewport().get_texture().get_image().save_png("user://shot.png")
 		print("BANDSHOT saved: ", ProjectSettings.globalize_path("user://shot.png"))
