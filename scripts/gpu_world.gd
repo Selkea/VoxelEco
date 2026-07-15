@@ -49,6 +49,9 @@ var rules_mask := 0   # debug: bit0 gravity, 1 diagonal, 2 lateral, 3 evap, 4 er
 var gen_origin_x := 0
 var gen_origin_z := 0
 var gen_flags := 0        # bit0: 1 = terraced worldgen, 0 = blended
+# toroidal edge regen: packed x0|width<<16 buffer-slot strip (0 = full width)
+var gen_strip_x := 0
+var gen_strip_z := 0
 
 ## grids past this size generate on the GPU instead of a GDScript loop
 const CPU_GEN_LIMIT := 400_000
@@ -160,6 +163,30 @@ func regen(ox: int, oz: int) -> void:
 	rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 	rd.compute_list_end()
 
+## toroidal streaming: shift the window's world origin without regenerating —
+## the buffer keeps its live sim state; only regen_strip refills entered edges.
+func set_origin(ox: int, oz: int) -> void:
+	gen_origin_x = ox
+	gen_origin_z = oz
+
+## regenerate ONLY the buffer-slot strip [x0, x0+width) x [z0, z0+depth) (mod
+## W/D) at the current origin — the freshly-entered edge — leaving the rest of
+## the window (and its water/erosion) untouched. This is what makes streaming
+## state-preserving instead of resetting the whole window each recenter.
+func regen_strip(x0: int, width: int, z0: int, depth: int) -> void:
+	if not gpu_ok:
+		return
+	gen_strip_x = (x0 & 0xFFFF) | (width << 16)
+	gen_strip_z = (z0 & 0xFFFF) | (depth << 16)
+	var cl := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(cl, pipeline)
+	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
+	rd.compute_list_set_push_constant(cl, _pc(4, 0), PC_SIZE)
+	rd.compute_list_dispatch(cl, _col_groups, 1, 1)
+	rd.compute_list_end()
+	gen_strip_x = 0   # restore full width for any later whole-buffer regen
+	gen_strip_z = 0
+
 func _rebuild_uniform_set() -> void:
 	var bufs := [cells_buf, pack_buf, stats_buf, dirty_buf,
 			_solid_target, _water_target, inst_count_buf]
@@ -181,11 +208,12 @@ func bind_instance_buffers(solid_rid: RID, water_rid: RID) -> void:
 	_water_target = water_rid
 	_rebuild_uniform_set()
 
-const PC_SIZE := 56   # push constant byte size (must match the shader struct)
+const PC_SIZE := 64   # push constant byte size (must match the shader struct)
 
 func _pc(mode: int, offset: int) -> PackedByteArray:
-	# 56-byte push constant: 11 uints + 2 floats + gen origin (2) + 1 pad. rain
-	# is an integer threshold out of 2^24; evap/erode are float probabilities.
+	# 64-byte push constant. rain is an integer threshold out of 2^24; evap/erode
+	# are float probabilities; strip_x/z pack (x0 | width<<16) for toroidal edge
+	# regen (0 -> full width, i.e. regenerate the whole buffer).
 	var pc := PackedByteArray()
 	pc.resize(PC_SIZE)
 	pc.encode_u32(0, W)
@@ -202,6 +230,8 @@ func _pc(mode: int, offset: int) -> PackedByteArray:
 	pc.encode_s32(44, gen_origin_x)   # signed origin (two's complement); int(uint) in-shader
 	pc.encode_s32(48, gen_origin_z)
 	pc.encode_u32(52, gen_flags)
+	pc.encode_u32(56, gen_strip_x if gen_strip_x != 0 else (W << 16))
+	pc.encode_u32(60, gen_strip_z if gen_strip_z != 0 else (D << 16))
 	return pc
 
 func step() -> void:

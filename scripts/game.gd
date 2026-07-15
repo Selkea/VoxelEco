@@ -130,13 +130,18 @@ func _ready() -> void:
 	dist = world.W * 1.12
 	interactive = not ("--sim" in OS.get_cmdline_user_args() or "--shot" in OS.get_cmdline_user_args())
 	if interactive:
-		# creative fly: start high over the middle, looking down into the world
-		fly_pos = Vector3(world.W * 0.5, world.H * 1.4, world.D * 0.5)
+		# Start the streaming window at a large positive world origin (chunk-
+		# aligned) so the toroidal coordinate math — which is unsigned — stays
+		# valid whichever way you fly, with kilometres of room in every direction.
+		var base := 100000
+		if world is GpuWorld:
+			(world as GpuWorld).regen(base, base)
+			view.set_stream_origin(base, base)
+		fly_pos = Vector3(base + world.W * 0.5, world.H * 1.4, base + world.D * 0.5)
 		fly_yaw = 0.0
 		fly_pitch = -0.6
-		# light distance fog so the streaming window's far edge fades into sky
-		e.fog_density = 1.8 / float(world.W)
-		view.set_stream_origin(0, 0)
+		# faint distance fog so the streaming window's far edge fades into sky
+		e.fog_density = 0.9 / float(world.W)
 		_capture_mouse(true)
 		_place_fly()
 	else:
@@ -190,18 +195,29 @@ func _stream() -> void:
 	var margin := world.W * 0.16
 	var ox := gw.gen_origin_x
 	var oz := gw.gen_origin_z
-	var moved := false
+	var nox := ox
+	var noz := oz
 	if fly_pos.x - ox < margin or fly_pos.x - ox > world.W - margin:
-		ox = _chunk_snap(fly_pos.x - world.W * 0.5)
-		moved = true
+		nox = _chunk_snap(fly_pos.x - world.W * 0.5)
 	if fly_pos.z - oz < margin or fly_pos.z - oz > world.D - margin:
-		oz = _chunk_snap(fly_pos.z - world.D * 0.5)
-		moved = true
-	if moved:
-		gw.regen(ox, oz)
+		noz = _chunk_snap(fly_pos.z - world.D * 0.5)
+	if nox == ox and noz == oz:
+		return
+	var dx := absi(nox - ox)
+	var dz := absi(noz - oz)
+	if dx >= world.W or dz >= world.D:
+		gw.regen(nox, noz)          # teleport: whole window is new
 		gw.reset_water_stats()
-		view.set_stream_origin(ox, oz)
-		_refresh_view(true)
+	else:
+		# TOROIDAL: shift the origin and regenerate ONLY the freshly-entered edge
+		# strips, keeping the rest of the window's water/erosion state intact.
+		gw.set_origin(nox, noz)
+		if nox != ox:
+			gw.regen_strip(posmod(mini(ox, nox), world.W), dx, 0, world.D)
+		if noz != oz:
+			gw.regen_strip(0, world.W, posmod(mini(oz, noz), world.D), dz)
+	view.set_stream_origin(nox, noz)
+	_refresh_view(true)
 
 func _place_fly() -> void:
 	cam.position = fly_pos
@@ -509,6 +525,37 @@ func _run_sim_test() -> void:
 			% [mismatch, 400 * 400 * Hh, solid])
 		print("SEAMLESS" if mismatch == 0 else "SEAM MISMATCH")
 		big.free_gpu(); one.free_gpu()
+		get_tree().quit()
+		return
+	if OS.get_environment("VOX_TOROTEST") != "":
+		# toroidal streaming: after advancing the window one chunk, the NEWLY-
+		# ENTERED edge strip regenerates but the rest of the window keeps its live
+		# sim state. Rain a while to build state, snapshot, advance, and confirm
+		# only the strip changed.
+		var Wt := 800
+		var gw := GpuWorld.new(555, Wt, Wt, 96)
+		if not gw.gpu_ok:
+			print("TOROTEST: no GPU"); get_tree().quit(); return
+		var base := 100400                     # chunk-aligned positive origin
+		gw.regen(base, base)
+		gw.set_rain_mm_hr(80.0); gw.run(150)   # accumulate water + erosion state
+		gw.set_rain_mm_hr(0.0); gw.run(60)
+		gw.sync_cells()
+		var before := gw.cell.duplicate()
+		var stripx := posmod(base, Wt)          # buffer slots that will regenerate
+		gw.set_origin(base + 400, base)          # fly east one chunk
+		gw.regen_strip(stripx, 400, 0, Wt)
+		gw.sync_cells()
+		var kept_changed := 0
+		var strip_changed := 0
+		for i in range(before.size()):
+			if before[i] == gw.cell[i]: continue
+			if posmod((i % Wt) - stripx, Wt) < 400: strip_changed += 1
+			else: kept_changed += 1
+		print("TOROTEST: after +1 chunk: kept-region cells changed=%d (want 0), strip changed=%d" \
+			% [kept_changed, strip_changed])
+		print("STATE PRESERVED" if kept_changed == 0 and strip_changed > 0 else "STATE LOST")
+		gw.free_gpu()
 		get_tree().quit()
 		return
 	if OS.get_environment("VOX_SHORETEST") != "":

@@ -118,15 +118,18 @@ Creative-mode free flight (no gravity / collision):
   `VOX_RENDER=voxel`) for the full per-5 cm-voxel renderer — the true 5 cm shape
   (fine steps) rather than chunky blocks. Instance buffers are sized for both,
   so **B** flips modes live with no reallocation.
-- **Streaming (endless world)**: the sim buffer is a **window that follows the
-  camera**. As you fly near an edge, the window recenters on you and regenerates
-  at the new world origin; because worldgen is deterministic per world-coordinate
-  (verified bit-exact seamless), the overlapping terrain is identical, so the
-  world scrolls seamlessly and extends forever. The emit writes voxels at their
-  **world** positions (buffer + window origin) so the render lands where the
-  camera is. Distance fog fades the window's far edge into sky. *(The window's
-  live sim state resets on recenter — a full-window regen; state-preserving
-  toroidal streaming is a future refinement.)*
+- **Toroidal streaming (endless, state-preserving world)**: the sim buffer is a
+  **torus that follows the camera**. Buffer slot = world column mod W, so as you
+  fly, only the freshly-entered edge strip regenerates (one thin `regen_strip`)
+  while the rest of the window keeps its **live water and erosion** — verified:
+  after advancing a chunk, 0 kept-region cells change. Physics wraps around the
+  torus but skips the moving "seam" (the join at the window's far edge, where
+  buffer-adjacent columns are world-far), so nothing flows across it. Worldgen
+  is deterministic and bit-exact seamless per world-coordinate, so the terrain
+  scrolls without a ripple and extends forever. Gen + emit map buffer slots to
+  world coords with an all-unsigned wrap (this GPU miscomputes signed subtraction
+  that goes negative), and the window rides in positive world space. Distance
+  fog fades the far edge into sky.
 - **Scale**: the default fly window is **1280x1280x128 voxels at ~5 cm** = a
   64 m x 64 m x 6.4 m plot (~210M sim cells), sized so the full per-voxel
   renderer flies smoothly. A single fixed (non-streamed) map is capped by a hard

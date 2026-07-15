@@ -35,6 +35,10 @@ layout(push_constant) uniform Params {
 	// position lines up seamlessly with its neighbours. int via bit-reinterpret.
 	uint gen_ox; uint gen_oz;
 	uint gen_flags;   // bit0: 1 = terraced (flat 1m plateaus), 0 = blended (smooth)
+	// toroidal streaming: worldgen only fills the buffer-slot strip
+	// [x0, x0+width) x [z0, z0+depth) (mod W/D) — the freshly-entered edge —
+	// packed lo|hi<<16. Full regen = width/depth == W/D.
+	uint strip_x; uint strip_z;
 } p;
 
 const uint CHUNK = 16u;
@@ -146,6 +150,17 @@ bool movable(uint m) { return m == WATER || is_soil(m); }
 
 uint cidx(uint x, uint y, uint z) { return x + z * p.W + y * p.W * p.D; }
 
+// world coordinate of buffer slot s on the toroidal window (which covers world
+// [origin, origin+len); buffer slot = world mod len). Used by gen + render so a
+// streamed window generates/draws at its true world position. ALL-UNSIGNED with
+// no negative intermediate: this driver miscomputes `int - int` that goes
+// negative (wraps as uint, shifting the modulo by 2^32 mod len). The streaming
+// camera is kept in positive world space so origin >= 0.
+uint world_coord(uint s, uint origin, uint len) {
+	uint seam = origin % len;            // origin mod len, buffer column of the join
+	return (origin - seam) + s + (s < seam ? len : 0u);
+}
+
 uint pcg(uint v) {
 	v = v * 747796405u + 2891336453u;
 	v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
@@ -208,13 +223,22 @@ bool water_flowing(uint cc[8], uint j) {
 // local cell index bits: bit0 = x, bit1 = y, bit2 = z
 void do_step() {
 	uvec3 base = gl_GlobalInvocationID * 2u + uvec3(p.offset);
+	// Toroidal window: x/z wrap so the buffer is a torus, EXCEPT at the seam
+	// (buffer column origin mod W/D) where buffer-adjacent cells are world-far —
+	// skip Margolus blocks straddling it so nothing flows across the join. The
+	// seam sits at the window's far edge, away from the camera. y never wraps.
+	uint sx = p.gen_ox % p.W;   // seam column (origin >= 0, so plain uint mod)
+	uint sz = p.gen_oz % p.D;
+	if ((base.x + 1u) % p.W == sx || (base.z + 1u) % p.D == sz) { return; }
 	uint c[8];
 	bool ib[8];
 	uint ids[8];
 	bool any_active = false;
 	for (uint l = 0u; l < 8u; l++) {
 		uvec3 pos = base + uvec3(l & 1u, (l >> 1u) & 1u, (l >> 2u) & 1u);
-		bool ok = pos.x < p.W && pos.y < p.H && pos.z < p.D;
+		pos.x %= p.W;   // toroidal wrap in x/z
+		pos.z %= p.D;
+		bool ok = pos.y < p.H;
 		ib[l] = ok;
 		ids[l] = ok ? cidx(pos.x, pos.y, pos.z) : 0u;
 		c[l] = ok ? cells[ids[l]] : BEDROCK;
@@ -460,10 +484,10 @@ void do_emit() {
 		if (is_water ? (nm == AIR) : (nm == AIR || nm == WATER)) { exposed = true; }
 	}
 	if (!exposed) { return; }
-	// place the voxel at its WORLD position (buffer + this window's origin) so a
+	// place the voxel at its WORLD position (toroidal buffer slot -> world) so a
 	// streamed window renders where the camera actually is
-	vec3 origin = vec3(float(int(x) + int(p.gen_ox)) + 0.5, float(y) + 0.5,
-			float(int(z) + int(p.gen_oz)) + 0.5);
+	vec3 origin = vec3(float(world_coord(x, p.gen_ox, p.W)) + 0.5,
+			float(y) + 0.5, float(world_coord(z, p.gen_oz, p.D)) + 0.5);
 	if (is_water) {
 		uint slot = atomicAdd(n_water, 1u);
 		if (slot < cap_water) { write_inst(true, slot, origin, vec4(1.0), 1.0); }
@@ -591,12 +615,13 @@ void do_skin_emit() {
 	if (x % 20u == 0u  && x > 0u)       { uint hn = block_top_h(bx - 1u, bz); if (hn < topf) { low = min(low, hn); } }
 	if (z % 20u == 19u && z + 1u < p.D) { uint hn = block_top_h(bx, bz + 1u); if (hn < topf) { low = min(low, hn); } }
 	if (z % 20u == 0u  && z > 0u)       { uint hn = block_top_h(bx, bz - 1u); if (hn < topf) { low = min(low, hn); } }
-	float wox = float(int(p.gen_ox)), woz = float(int(p.gen_oz));   // window world origin
+	float wx = float(world_coord(x, p.gen_ox, p.W));   // world pos (torus)
+	float wz = float(world_coord(z, p.gen_oz, p.D));
 	for (uint y = low; y < topf; y++) {
 		uint raw = cells[cidx(x, y, z)];
 		uint m = MAT(raw);
 		if (m == AIR) { m = sm; raw = sraw; }
-		vec3 c = vec3(float(x) + wox + 0.5, float(y) + 0.5, float(z) + woz + 0.5);
+		vec3 c = vec3(wx + 0.5, float(y) + 0.5, wz + 0.5);
 		uint vid = x + z * p.W + y * p.W * p.D;   // stable per-voxel id for tint jitter
 		if (m == WATER) {
 			uint s = atomicAdd(n_water, 1u);
@@ -693,9 +718,15 @@ void do_gen() {
 	if (id >= p.W * p.D) { return; }
 	uint x = id % p.W;
 	uint z = id / p.W;
-	// world coordinates of this column = local index + this buffer's world
-	// origin. The seamless world-space noise makes chunk seams invisible.
-	vec2 w = vec2(float(int(x) + int(p.gen_ox)), float(int(z) + int(p.gen_oz)));
+	// toroidal edge regen: only fill the targeted buffer-slot strip (modular so
+	// it may wrap around the buffer); full regen has width == W / depth == D.
+	uint sx0 = p.strip_x & 0xFFFFu, sw = p.strip_x >> 16u;
+	uint sz0 = p.strip_z & 0xFFFFu, sd = p.strip_z >> 16u;
+	if (((x + p.W - sx0) % p.W) >= sw) { return; }
+	if (((z + p.D - sz0) % p.D) >= sd) { return; }
+	// world column of this buffer slot on the torus; the seamless world-space
+	// noise makes the joins invisible.
+	vec2 w = vec2(float(world_coord(x, p.gen_ox, p.W)), float(world_coord(z, p.gen_oz, p.D)));
 	float hgt = world_height(w);
 	// signed math throughout: with uint, top-4 underflows for shallow
 	// columns and fills them with stone to the sky
