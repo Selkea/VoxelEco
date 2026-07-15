@@ -38,6 +38,7 @@ var rules_mask := 0   # debug: bit0 gravity, 1 diagonal, 2 lateral, 3 evap, 4 er
 # (local + origin) so a chunk generates seamlessly at any world position.
 var gen_origin_x := 0
 var gen_origin_z := 0
+var gen_flags := 0        # bit0: 1 = terraced worldgen, 0 = blended
 
 ## grids past this size generate on the GPU instead of a GDScript loop
 const CPU_GEN_LIMIT := 400_000
@@ -101,6 +102,8 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	_cell_groups = ceili(W * D * H / 64.0)
 	_pack_groups = ceili(words / 64.0)
 	gpu_ok = true
+	if OS.get_environment("VOX_GENMODE") == "terraced":
+		gen_flags = 1
 	if _need_gpu_gen:
 		var cl := rd.compute_list_begin()
 		rd.compute_list_bind_compute_pipeline(cl, pipeline)
@@ -165,6 +168,7 @@ func _pc(mode: int, offset: int) -> PackedByteArray:
 	pc.encode_u32(40, cut_z)
 	pc.encode_s32(44, gen_origin_x)   # signed origin (two's complement); int(uint) in-shader
 	pc.encode_s32(48, gen_origin_z)
+	pc.encode_u32(52, gen_flags)
 	return pc
 
 func step() -> void:

@@ -33,7 +33,8 @@ layout(push_constant) uniform Params {
 	// world-space origin of this buffer, in voxels (chunk streaming): worldgen
 	// samples noise at (local + origin) so a chunk generated at any world
 	// position lines up seamlessly with its neighbours. int via bit-reinterpret.
-	uint gen_ox; uint gen_oz; uint _pad1;
+	uint gen_ox; uint gen_oz;
+	uint gen_flags;   // bit0: 1 = terraced (flat 1m plateaus), 0 = blended (smooth)
 } p;
 
 const uint CHUNK = 16u;
@@ -516,22 +517,47 @@ float fbm(vec2 q) {
 const float SUBCHUNK_VOX = 20.0;    // voxels per subchunk edge (1 m)
 const float CHUNK_VOX    = 400.0;   // voxels per chunk edge (20 subchunks, 20 m)
 
+// Terrain height sampled at a SUBCHUNK grid point (sc in subchunk units, i.e.
+// world voxels / 20). This is the base heightfield resolution — one value per
+// 1 m subchunk — so the world generates "as if 1 subchunk = 1 voxel". It sums
+// the CHUNK band (broad landforms, squared toward its tails so terrain spends
+// time as plains and peaks) and a per-subchunk variation band.
+float subchunk_height(vec2 sc, float H, vec2 s) {
+	// CHUNK band: 20 subchunks per chunk, so sc/20 == world/CHUNK_VOX
+	float cn = fbm(sc / 20.0 + s) - 0.5;
+	float chunk = cn * (1.0 + 2.4 * abs(cn));
+	// per-subchunk relief on the subchunk lattice
+	float sub = fbm(sc * 0.5 + s * 2.0 + 31.7) - 0.5;
+	return H * 0.42 + chunk * H * 1.35 + sub * H * 0.09;
+}
+
+// Surface height at a voxel column. The base terrain lives on the subchunk
+// (1 m) grid; the voxels fill between those samples one of two ways (gen_flags
+// bit0): BLENDED smoothly interpolates the 4 surrounding subchunk heights and
+// adds fine voxel roughness, or TERRACED gives each subchunk a flat plateau at
+// its own height (hard 1 m cliffs between subchunks). Both are pure functions
+// of world (x,z)+seed, and the subchunk grid aligns to chunk edges (20 per
+// chunk), so either mode tiles seamlessly across chunks.
 float world_height(vec2 w) {
 	float H = float(p.H);
-	// decorrelate the three bands per world seed
 	vec2 s = vec2(float(p.seedv & 0xFFFFu), float((p.seedv >> 16) & 0xFFFFu)) * 0.618;
-	// CHUNK band: broad landforms — hills and basins ~a chunk across, blended
-	// smoothly (fbm of value-noise) into cohesive continents. Squared toward its
-	// tails so the terrain spends time as plains and peaks rather than a uniform
-	// slope, and centred so basins fall well below the water line and fill as
-	// lakes. This band carries the bulk of the relief.
-	float cn = fbm(w / CHUNK_VOX + s) - 0.5;
-	float chunk = cn * (1.0 + 2.4 * abs(cn));      // gentle S-curve: flatten mids, exaggerate extremes
-	// SUBCHUNK band: metre-scale rolling relief layered within each chunk.
-	float sub = fbm(w / SUBCHUNK_VOX * 0.8 + s * 2.0 + 31.7) - 0.5;
-	// VOXEL band: a couple voxels of fine surface roughness — the finest blend.
+	if ((p.gen_flags & 1u) != 0u) {
+		// TERRACED: one flat height per subchunk footprint, quantised to voxels
+		vec2 sc = floor(w / SUBCHUNK_VOX);
+		return floor(subchunk_height(sc, H, s));
+	}
+	// BLENDED: bilinear (smoothstep) interpolation of the 4 surrounding subchunk
+	// heights, then a couple voxels of fine roughness for the finest blend
+	vec2 scf = w / SUBCHUNK_VOX;
+	vec2 i = floor(scf);
+	vec2 f = scf - i;
+	vec2 u = f * f * (3.0 - 2.0 * f);
+	float h = mix(
+		mix(subchunk_height(i, H, s),                subchunk_height(i + vec2(1.0, 0.0), H, s), u.x),
+		mix(subchunk_height(i + vec2(0.0, 1.0), H, s), subchunk_height(i + vec2(1.0, 1.0), H, s), u.x),
+		u.y);
 	float vox = vnoise(w * 0.13 + s * 4.0 + 91.3) - 0.5;
-	return H * 0.42 + chunk * H * 1.35 + sub * H * 0.07 + vox * H * 0.016;
+	return h + vox * H * 0.016;
 }
 
 // one thread per column: carve the whole column

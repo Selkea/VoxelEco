@@ -19,6 +19,7 @@ Vegetation and animals layer on top of this abiotic substrate later.
 | 1 – 7 | Speed: 1x / 2x / 4x / 8x / 16x / 32x / 64x (1x = real time) |
 | Q / E | Less / more rain (mm/hour) — the world starts **calm**; press E to make it rain |
 | C | Toggle a cross-section (see subsurface moisture / the water table) |
+| T | Toggle worldgen **blended** ↔ **terraced** (regenerates in place) |
 | R | Generate a fresh world |
 
 ## How it works
@@ -71,13 +72,17 @@ Vegetation and animals layer on top of this abiotic substrate later.
   voxels cost nothing.
 - **Hierarchical chunk-based worldgen** produces a finished landscape *at
   rest*. Voxels group 20x20 into a **subchunk** (1 m) and 20x20 subchunks into
-  a **chunk** (20 m); surface height is a pure function of world (x,z) + seed
-  that sums three blended noise bands — **chunk** landforms (hills, basins,
-  coastlines), **subchunk** rolling relief, and **voxel** roughness — for
-  cohesive topography at every scale. Because it only samples continuous
-  world-space noise (never the world size or a fixed centre) the terrain is
-  **seamless across any chunk boundary** and comes out identical however the
-  world is windowed — the groundwork for streaming. Land above the water line
+  a **chunk** (20 m). The base heightfield is generated **at subchunk (1 m)
+  resolution** — one height per subchunk, "as if 1 subchunk = 1 voxel" — from a
+  chunk-scale landform band plus per-subchunk relief. Voxels then fill between
+  those subchunk samples one of two ways (**T** toggles, title bar shows which):
+  **blended** smoothly interpolates the surrounding subchunk heights and adds
+  fine voxel roughness (smooth natural terrain), or **terraced** gives each
+  subchunk a flat 1 m plateau (hard-edged, built-from-1m-blocks look). Both are
+  pure functions of world (x,z) + seed sampling only continuous world-space
+  noise (never the world size or a fixed centre), so the terrain is **seamless
+  across any chunk boundary** and comes out identical however the world is
+  windowed — the groundwork for streaming. Land above the water line
   is **vegetated (grassy)**; basins fill with **lakes** on pre-saturated beds
   (so lakes sit on firm wet ground and don't seep or slump); the exposed
   shoreline stays firm soil and no loose sand is pre-placed, so nothing

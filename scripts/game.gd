@@ -27,6 +27,7 @@ func _init() -> void:
 	_add_action("rain_down", [KEY_Q])
 	_add_action("restart", [KEY_R])
 	_add_action("cut", [KEY_C])
+	_add_action("genmode", [KEY_T])   # toggle blended / terraced worldgen
 
 const CHUNK_VOX := 400   # 20 subchunks x 20 voxels = 20 m chunk edge
 
@@ -147,6 +148,13 @@ func _process(dt: float) -> void:
 		# toggle a cross-section to see subsurface moisture / the water table
 		world.cut_z = 0 if world.cut_z > 0 else world.D / 2
 		_refresh_view(true)
+	if Input.is_action_just_pressed("genmode") and world is GpuWorld:
+		# flip blended <-> terraced worldgen and regenerate this world in place
+		var gw := world as GpuWorld
+		gw.gen_flags ^= 1
+		gw.regen(gw.gen_origin_x, gw.gen_origin_z)
+		gw.reset_water_stats()
+		_refresh_view(true)
 	if Input.is_action_just_pressed("restart"):
 		world.free_gpu()
 		var wsz := _world_size()
@@ -175,8 +183,10 @@ func _process(dt: float) -> void:
 	if _title_acc > 0.5:
 		_title_acc = 0.0
 		var sim_s := int(world.tick_count / TICK_RATE)
-		DisplayServer.window_set_title("VoxelEco — %s | sim %02d:%02d:%02d | %s | rain %d mm/h | %d fps" % [
+		var genmode := "terraced" if (world is GpuWorld and (world as GpuWorld).gen_flags & 1) else "blended"
+		DisplayServer.window_set_title("VoxelEco — %s | %s | sim %02d:%02d:%02d | %s | rain %d mm/h | %d fps" % [
 			"GPU" if world.gpu_ok else "CPU",
+			genmode,
 			sim_s / 3600, (sim_s / 60) % 60, sim_s % 60,
 			"paused" if speed_mult == 0 else str(speed_mult) + "x",
 			int(world.rain_mm_hr),
