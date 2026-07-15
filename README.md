@@ -98,21 +98,25 @@ Vegetation and animals layer on top of this abiotic substrate later.
   RenderingDevice and the emit pass writes the MultiMesh instance buffers
   directly in VRAM (`multimesh_get_buffer_rd_rid`); the only per-frame
   readback is a 16-byte instance counter.
-- **Coarsened 1 m-block rendering**: the fine 5 cm sim is drawn as solid **1 m
-  cubes** — one thread per 20x20x20-voxel block emits a single cube (drawn if
-  the block is at least half full; coloured by its top-most material, so grass
-  caps the surface block over soil/stone, water where the block is mostly
-  water). This decouples draw cost from sim resolution — a huge world is a few
-  tens of thousands of cubes instead of millions of voxels — so the map can be
-  large while the detailed hydrology keeps running underneath. `VOX_RENDER=voxel`
-  falls back to the per-5 cm-voxel renderer (small worlds only).
-- **Scale**: the default world is **1600x1600x160 voxels at ~5 cm** = an
-  80 m x 80 m x 8 m plot rendered as **80x80x8 one-metre blocks** (~410M sim
-  cells), generated, stormed, and drawn on a 4090 without breaking a sweat.
-  `VOX_SIZE` picks other widths; `VOX_H` sets a fixed vertical extent
-  independent of width. The world is a single fixed window into the infinite
-  chunked terrain; **streaming chunks in/out around the camera is the next
-  milestone** (the gen is already chunk-local and seamless for it).
+- **Coarsened 1 m-block rendering**: the fine 5 cm sim is drawn as a **heightmap
+  of solid 1 m cubes** — one thread per 20x20-voxel block column scans its centre
+  for the surface, rounds the height to whole blocks, and stacks cubes from the
+  ground up. The **top** cube is always coloured by the true surface material
+  (grass cap / lake water), body cubes by the material at their own centre
+  (soil / stone / water). This decouples draw cost from sim resolution — a huge
+  world is tens of thousands of cubes, not billions of voxels — so the map can
+  be large while the detailed hydrology keeps running underneath.
+  `VOX_RENDER=voxel` falls back to the per-5 cm-voxel renderer (small worlds).
+- **Scale**: the default world is **2800x2800x128 voxels at ~5 cm** = a
+  140 m x 140 m x 6.4 m plot rendered as **140x140 one-metre blocks** (~1.0B
+  sim cells). That is right at a hard ceiling: **a single GPU storage buffer is
+  32-bit-sized in Godot**, so the cells buffer (4 bytes/cell) caps at ~4 GB ≈
+  **1.05B cells** no matter how much VRAM the card has — past that it silently
+  truncates, so oversized requests are clamped with a warning. `VOX_SIZE` /
+  `VOX_H` pick other dimensions within that budget. Breaking this ceiling for a
+  genuinely huge (10x+) world needs **chunk streaming** — a window of chunks
+  simulated around the camera — which is the next milestone (the gen is already
+  chunk-local and seamless for it).
 
 ## Physical scale & calibration
 

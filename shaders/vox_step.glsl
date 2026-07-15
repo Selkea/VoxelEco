@@ -481,52 +481,51 @@ void do_emit() {
 	if (slot < cap_solid) { write_inst(false, slot, origin, col, 1.0); }
 }
 
-// one thread per 1 m BLOCK (20x20x20 voxels): the fine 5 cm sim is rendered
-// coarsened to solid 1 m cubes. A block is drawn if it is at least half full;
-// its material is the top-most non-water voxel found (so grass caps the surface
-// block while the ground beneath reads as soil/stone), or water if the block is
-// mostly water. This decouples render cost from sim resolution, so the 5 cm
-// hydrology can cover a much larger map.
+// one thread per 1 m block COLUMN (20x20 voxels): render the fine 5 cm sim as a
+// heightmap of solid 1 m cubes. Scan the column's centre for the surface, round
+// its height to whole blocks, then stack cubes bottom-to-surface: the TOP cube
+// is always coloured by the true surface material (grass cap / lake water),
+// body cubes by the material at their own centre (soil / stone / water). This
+// decouples render cost from sim resolution, so the 5 cm hydrology can cover a
+// much larger map, and the surface never drops out or reads as bare stone.
 void do_block_emit() {
 	uint nbx = (p.W + 19u) / 20u;
-	uint nby = (p.H + 19u) / 20u;
 	uint nbz = (p.D + 19u) / 20u;
 	uint id = flat_id();
-	if (id >= nbx * nby * nbz) { return; }
-	uint by = id / (nbx * nbz);
-	uint r = id % (nbx * nbz);
-	uint bz = r / nbx;
-	uint bx = r % nbx;
-	uint x0 = bx * 20u, y0 = by * 20u, z0 = bz * 20u;
+	if (id >= nbx * nbz) { return; }
+	uint bz = id / nbx;
+	uint bx = id % nbx;
+	uint x0 = bx * 20u, z0 = bz * 20u;
 	if (z0 + 19u < p.cut_z) { return; }   // block-aligned cross-section
-	uint solidn = 0u, watern = 0u, samples = 0u;
-	uint topsolid = AIR; int topsolidy = -1;
-	// subsample the block (5x5x7 grid ~ every 4th/3rd voxel) — plenty for a
-	// coarse occupancy + surface-material estimate, cheap enough for a big map
-	for (uint dx = 2u; dx < 20u; dx += 4u)
-	for (uint dz = 2u; dz < 20u; dz += 4u)
-	for (uint dy = 1u; dy < 20u; dy += 3u) {
-		uint x = x0 + dx, y = y0 + dy, z = z0 + dz;
-		if (x >= p.W || y >= p.H || z >= p.D) { continue; }
-		samples++;
-		uint m = MAT(cells[cidx(x, y, z)]);
-		if (m == AIR) { continue; }
-		if (m == WATER) { watern++; }
-		else { solidn++; if (int(y) > topsolidy) { topsolidy = int(y); topsolid = m; } }
+	uint cx = min(x0 + 10u, p.W - 1u);
+	uint cz = min(z0 + 10u, p.D - 1u);
+	// surface = top-most non-air voxel in the centre column (full scan)
+	int surfy = -1;
+	uint surfmat = AIR;
+	for (uint yy = p.H; yy > 0u; ) {
+		yy--;
+		uint m = MAT(cells[cidx(cx, yy, cz)]);
+		if (m != AIR) { surfy = int(yy); surfmat = m; break; }
 	}
-	if (samples == 0u) { return; }
-	if ((solidn + watern) * 2u < samples) { return; }   // mostly air -> no cube
-	vec3 center = vec3(float(x0) + 10.0, float(y0) + 10.0, float(z0) + 10.0);
-	if (watern > solidn) {
-		uint slot = atomicAdd(n_water, 1u);
-		if (slot < cap_water) { write_inst(true, slot, center, vec4(1.0), 20.0); }
-		return;
+	if (surfy < 0) { return; }                       // empty column
+	uint ntop = max((uint(surfy) + 10u) / 20u, 1u);  // height rounded to whole blocks
+	for (uint by = 0u; by < ntop; by++) {
+		uint y0 = by * 20u;
+		uint m = surfmat;                            // top cube = surface material
+		if (by + 1u < ntop) {                        // body cube = its own centre
+			m = MAT(cells[cidx(cx, min(y0 + 10u, p.H - 1u), cz)]);
+			if (m == AIR) { m = SOIL; }
+		}
+		vec3 center = vec3(float(x0) + 10.0, float(y0) + 10.0, float(z0) + 10.0);
+		if (m == WATER) {
+			uint slot = atomicAdd(n_water, 1u);
+			if (slot < cap_water) { write_inst(true, slot, center, vec4(1.0), 20.0); }
+		} else {
+			float shade = 0.74 + 0.26 * clamp(float(y0) / float(p.H), 0.0, 1.0);
+			uint slot = atomicAdd(n_solid, 1u);
+			if (slot < cap_solid) { write_inst(false, slot, center, vec4(mat_color(m) * shade, 1.0), 20.0); }
+		}
 	}
-	uint mat = topsolid == AIR ? STONE : topsolid;
-	// gentle top-down shade so stacked cubes read (top brighter than deep ones)
-	float shade = 0.72 + 0.28 * clamp(float(y0) / float(p.H), 0.0, 1.0);
-	uint slot = atomicAdd(n_solid, 1u);
-	if (slot < cap_solid) { write_inst(false, slot, center, vec4(mat_color(mat) * shade, 1.0), 20.0); }
 }
 
 // ---- GPU worldgen: value-noise fbm heightfield, bowl basin, ridge ----

@@ -43,10 +43,24 @@ func _world_size() -> Vector3i:
 		return Vector3i(wv, wv, hh if hh > 0 else 128)
 	var sz := OS.get_environment("VOX_SIZE").to_int()
 	if sz > 0:
-		return Vector3i(sz, sz, hh if hh > 0 else maxi(24, sz * 3 / 8))
-	# big default map: 1600x1600x160 voxels (5cm) = 80x80x8 one-metre blocks,
-	# ~410M sim cells. The coarsened block renderer keeps this cheap to draw.
-	return Vector3i(1600, 1600, hh if hh > 0 else 160)
+		return _clamp_cells(Vector3i(sz, sz, hh if hh > 0 else maxi(24, sz * 3 / 8)))
+	# big default map: 2800x2800x128 voxels (5cm) = 140x140x6.4 one-metre blocks,
+	# ~1.0B sim cells — right at the single-buffer ceiling (see _clamp_cells).
+	return Vector3i(2800, 2800, hh if hh > 0 else 128)
+
+# A single GPU storage buffer's byte size is 32-bit in Godot, so the cells
+# buffer (4 bytes/cell) hard-caps at ~4 GB ≈ 1.05B cells no matter how much VRAM
+# the card has. Past that the buffer silently truncates and the world reads back
+# as garbage, so clamp the height and warn rather than generate a broken map.
+# (Breaking this ceiling for real needs chunk streaming — the next milestone.)
+func _clamp_cells(ws: Vector3i) -> Vector3i:
+	const MAX_CELLS := 1_040_000_000
+	var cells := ws.x * ws.y * ws.z
+	if cells <= MAX_CELLS:
+		return ws
+	var h := maxi(24, MAX_CELLS / (ws.x * ws.y))
+	push_warning("World %dx%dx%d = %.1fB cells exceeds the ~1.05B single-buffer limit; clamping height to %d." % [ws.x, ws.y, ws.z, cells / 1e9, h])
+	return Vector3i(ws.x, ws.y, h)
 
 func _ready() -> void:
 	var ws := _world_size()

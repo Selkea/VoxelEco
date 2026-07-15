@@ -40,6 +40,7 @@ var nbz := 0
 # voxels — decouples render cost from the fine sim so the map can be large.
 # VOX_RENDER=voxel forces the old per-voxel path (small worlds only).
 var block_render := true
+var _pack_full := false   # pack buffer grown to full size on first sync_cells
 
 var rules_mask := 0   # debug: bit0 gravity, 1 diagonal, 2 lateral, 3 evap, 4 erosion; 0 = all
 # world-space origin of this buffer in voxels — worldgen samples noise at
@@ -78,17 +79,21 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 
 	var n := cell.size()
 	if _need_gpu_gen:
-		var blank := PackedByteArray()
-		blank.resize(n * 4)          # all AIR; the gen kernel fills it
-		cells_buf = rd.storage_buffer_create(n * 4, blank)
+		# no CPU upload — the gen kernel writes every cell, so allocating a
+		# multi-GB zeroed CPU array just to upload it would blow out RAM on big
+		# worlds. Create the VRAM buffer uninitialised; do_gen fills it in _init.
+		cells_buf = rd.storage_buffer_create(n * 4)
 	else:
 		var ints := PackedInt32Array()
 		ints.resize(n)
 		for i in range(n):
 			ints[i] = cell[i]
 		cells_buf = rd.storage_buffer_create(n * 4, ints.to_byte_array())
-	var words := (n + 3) / 4
-	pack_buf = rd.storage_buffer_create(words * 4)
+	var words := (n + 3) / 4          # pack-dispatch thread count (see _pack_groups)
+	# pack buffer (~1 byte/cell) is only read by sync_cells (tests/analysis),
+	# never in the interactive/render path — allocate a stub and grow it on the
+	# first sync_cells so huge worlds don't pay for it.
+	pack_buf = rd.storage_buffer_create(64)
 	stats_buf = rd.storage_buffer_create(12, PackedByteArray([0,0,0,0,0,0,0,0,0,0,0,0]))
 	var zeros := PackedByteArray()
 	zeros.resize(chunk_w * chunk_d * 4)
@@ -118,7 +123,7 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	_col_groups = ceili(W * D / 64.0)
 	_cell_groups = ceili(W * D * H / 64.0)
 	_pack_groups = ceili(words / 64.0)
-	_block_groups = ceili(nbx * nby * nbz / 64.0)
+	_block_groups = ceili(nbx * nbz / 64.0)   # one thread per 1m block column
 	gpu_ok = true
 	if OS.get_environment("VOX_GENMODE") == "terraced":
 		gen_flags = 1
@@ -129,6 +134,9 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 		rd.compute_list_set_push_constant(cl, _pc(4, 0), PC_SIZE)
 		rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 		rd.compute_list_end()
+		# free the CPU-side cell mirror (VoxWorld allocated W*D*H bytes) — the sim
+		# lives entirely in VRAM now. sync_cells restores it on demand for tests.
+		cell = PackedByteArray()
 
 ## regenerate the whole buffer as if its lower corner sits at world (ox, oz).
 ## This is the chunk-streaming primitive: the same kernel fills any chunk at any
@@ -258,13 +266,20 @@ func dispatch_emit() -> PackedInt32Array:
 func sync_cells() -> void:
 	if not gpu_ok:
 		return
+	if not _pack_full:
+		# grow the stub pack buffer to full size on first use, rebind it
+		rd.free_rid(pack_buf)
+		var words := (W * D * H + 3) / 4
+		pack_buf = rd.storage_buffer_create(words * 4)
+		_pack_full = true
+		_rebuild_uniform_set()
 	var cl := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(cl, pipeline)
 	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
 	rd.compute_list_set_push_constant(cl, _pc(2, 0), PC_SIZE)          # pack
 	rd.compute_list_dispatch(cl, _pack_groups, 1, 1)
 	rd.compute_list_end()
-	cell = rd.buffer_get_data(pack_buf).slice(0, cell.size())
+	cell = rd.buffer_get_data(pack_buf).slice(0, W * D * H)
 	var st := rd.buffer_get_data(stats_buf).to_int32_array()
 	water_added = st[0]
 	water_evaporated = st[1]
