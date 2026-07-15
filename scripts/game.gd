@@ -35,6 +35,7 @@ func _init() -> void:
 	_add_action("restart", [KEY_R])
 	_add_action("cut", [KEY_C])
 	_add_action("genmode", [KEY_T])   # toggle blended / terraced worldgen
+	_add_action("render_toggle", [KEY_B])   # per-voxel <-> 1m blocks (voxel tops)
 	# creative fly controls (Minecraft-style): WASD move, Space/Shift up/down
 	_add_action("fly_fwd", [KEY_W])
 	_add_action("fly_back", [KEY_S])
@@ -254,6 +255,12 @@ func _process(dt: float) -> void:
 		gw.regen(gw.gen_origin_x, gw.gen_origin_z)
 		gw.reset_water_stats()
 		_refresh_view(true)
+	if Input.is_action_just_pressed("render_toggle") and world is GpuWorld \
+			and (world as GpuWorld).can_toggle_render:
+		# flip between full per-voxel and 1m-block (voxel-tinted tops) rendering
+		var gw := world as GpuWorld
+		gw.block_render = not gw.block_render
+		_refresh_view(true)
 	if Input.is_action_just_pressed("restart"):
 		world.free_gpu()
 		var wsz := _world_size()
@@ -287,9 +294,10 @@ func _process(dt: float) -> void:
 		_title_acc = 0.0
 		var sim_s := int(world.tick_count / TICK_RATE)
 		var genmode := "terraced" if (world is GpuWorld and (world as GpuWorld).gen_flags & 1) else "blended"
-		DisplayServer.window_set_title("VoxelEco — %s | %s | sim %02d:%02d:%02d | %s | rain %d mm/h | %d fps" % [
+		var rmode := "blocks" if (world is GpuWorld and (world as GpuWorld).block_render) else "voxels"
+		DisplayServer.window_set_title("VoxelEco — %s | %s | %s | sim %02d:%02d:%02d | %s | rain %d mm/h | %d fps" % [
 			"GPU" if world.gpu_ok else "CPU",
-			genmode,
+			rmode, genmode,
 			sim_s / 3600, (sim_s / 60) % 60, sim_s % 60,
 			"paused" if speed_mult == 0 else str(speed_mult) + "x",
 			int(world.rain_mm_hr),

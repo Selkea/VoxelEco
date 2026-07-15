@@ -40,6 +40,7 @@ var nbz := 0
 # voxels — decouples render cost from the fine sim so the map can be large.
 # VOX_RENDER=voxel forces the old per-voxel path (small worlds only).
 var block_render := true
+var can_toggle_render := false   # buffers sized for both render modes (live toggle)
 var _pack_full := false   # pack buffer grown to full size on first sync_cells
 
 var rules_mask := 0   # debug: bit0 gravity, 1 diagonal, 2 lateral, 3 evap, 4 erosion; 0 = all
@@ -102,15 +103,20 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	nby = (H + 19) / 20
 	nbz = (D + 19) / 20
 	# default: render ALL visible 5cm voxels; VOX_RENDER=block draws coarse 1m
-	# blocks with voxel-tinted tops (cheaper, for very large maps).
+	# blocks with voxel-tinted tops (cheaper, for very large maps). Allocate for
+	# BOTH modes (per-voxel is the larger) so the render can be toggled live with
+	# no reallocation — unless that's too many instances for one buffer, in which
+	# case lock to the block render.
 	block_render = OS.get_environment("VOX_RENDER") == "block"
-	if block_render:
-		# one 5cm skin tile per column + one chunky body cube per block
-		solid_cap = W * D + nbx * nby * nbz
-		water_cap = W * D + nbx * nby * nbz
-	else:
+	var skin_cap := W * D + nbx * nby * nbz
+	can_toggle_render = W * D * 4 <= 60_000_000
+	if can_toggle_render:
 		solid_cap = W * D * 4
 		water_cap = W * D * 2
+	else:
+		block_render = true
+		solid_cap = skin_cap
+		water_cap = skin_cap
 	var caps := PackedInt32Array([0, 0, solid_cap, water_cap]).to_byte_array()
 	inst_count_buf = rd.storage_buffer_create(16, caps)
 	# tiny placeholders until the view binds real multimesh buffers

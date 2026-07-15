@@ -24,6 +24,7 @@ Creative-mode free flight (no gravity / collision):
 | 1 – 7 | Speed: 1x / 2x / 4x / 8x / 16x / 32x / 64x (1x = real time) |
 | Q / E | Less / more rain (mm/hour) — the world starts **calm**; press E to make it rain |
 | C | Toggle a cross-section (see subsurface moisture / the water table) |
+| B | Toggle render: full **5cm voxels** ↔ **1m blocks** (voxel-tinted tops) |
 | T | Toggle worldgen **blended** ↔ **terraced** (regenerates in place) |
 | P | Pause / resume |
 | R | Generate a fresh world |
