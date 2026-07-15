@@ -1,0 +1,13 @@
+# Godot 4+ import cache & editor state (regenerated on open)
+.godot/
+
+# Godot export artifacts
+/build/
+/export/
+export_presets.cfg
+
+# OS / editor cruft
+Thumbs.db
+desktop.ini
+.DS_Store
+*.tmp

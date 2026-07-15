@@ -1,0 +1,21 @@
+; Engine configuration file.
+; VoxelEco — 3D voxel falling-sand ecosystem simulator (hydrology first)
+
+config_version=5
+
+[application]
+
+config/name="VoxelEco"
+run/main_scene="res://scenes/main.tscn"
+config/features=PackedStringArray("4.7")
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+
+[rendering]
+
+renderer/rendering_method="forward_plus"
+renderer/rendering_method.mobile="gl_compatibility"
+lights_and_shadows/directional_shadow/size=4096
