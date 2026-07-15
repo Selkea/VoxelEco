@@ -30,7 +30,12 @@ func _init() -> void:
 
 func _world_size() -> Vector3i:
 	var sz := OS.get_environment("VOX_SIZE").to_int()
-	return Vector3i(sz, sz, maxi(24, sz * 3 / 8)) if sz > 0 else Vector3i(512, 512, 192)
+	# height is a FIXED vertical extent (voxels), decoupled from horizontal span:
+	# a streamed world grows sideways in chunks, not upward. VOX_H overrides it.
+	var hh := OS.get_environment("VOX_H").to_int()
+	if sz > 0:
+		return Vector3i(sz, sz, hh if hh > 0 else maxi(24, sz * 3 / 8))
+	return Vector3i(512, 512, hh if hh > 0 else 192)
 
 func _ready() -> void:
 	var ws := _world_size()

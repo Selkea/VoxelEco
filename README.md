@@ -69,12 +69,19 @@ Vegetation and animals layer on top of this abiotic substrate later.
 - **Rendering**: each chunk builds two face-culled meshes — opaque
   vertex-coloured terrain and a translucent water surface — so interior
   voxels cost nothing.
-- **Worldgen** produces a finished landscape *at rest*: fbm-noise hills with a
-  central basin, **vegetated (grassy) land**, and **lakes** filling every basin
-  below a water line. Lake beds generate pre-saturated (so lakes sit on firm
-  wet ground and don't seep away or slump), while the exposed shoreline stays
-  firm soil — no loose sand is pre-placed, so nothing avalanches on the first
-  tick. Rain, flow, and erosion take it from there.
+- **Hierarchical chunk-based worldgen** produces a finished landscape *at
+  rest*. Voxels group 20x20 into a **subchunk** (1 m) and 20x20 subchunks into
+  a **chunk** (20 m); surface height is a pure function of world (x,z) + seed
+  that sums three blended noise bands — **chunk** landforms (hills, basins,
+  coastlines), **subchunk** rolling relief, and **voxel** roughness — for
+  cohesive topography at every scale. Because it only samples continuous
+  world-space noise (never the world size or a fixed centre) the terrain is
+  **seamless across any chunk boundary** and comes out identical however the
+  world is windowed — the groundwork for streaming. Land above the water line
+  is **vegetated (grassy)**; basins fill with **lakes** on pre-saturated beds
+  (so lakes sit on firm wet ground and don't seep or slump); the exposed
+  shoreline stays firm soil and no loose sand is pre-placed, so nothing
+  avalanches on the first tick. Rain, flow, and erosion take it from there.
 - **Fully GPU pipeline**: terrain generation (fbm noise), physics, and
   surface extraction all run in compute. The renderer is a MultiMesh of
   surface voxels whose instance buffer is written by a compute pass — the
@@ -85,10 +92,14 @@ Vegetation and animals layer on top of this abiotic substrate later.
   directly in VRAM (`multimesh_get_buffer_rd_rid`); the only per-frame
   readback is a 16-byte instance counter.
 - **Scale**: the default world is **512x512x192 = 50M cells at ~5 cm per
-  voxel** (a 25.6 m diorama) — generated, stormed, and rendered in under
-  2 seconds. `VOX_SIZE` (env var) picks other sizes. A uniform 1 cm grid at
-  this map size would be 6.3 BILLION cells — past any current GPU without
-  sparse/LOD world structures (future milestone).
+  voxel** (a 25.6 m window, ~1.3 chunks across) — generated, stormed, and
+  rendered in under 2 seconds. `VOX_SIZE` picks other widths; `VOX_H` sets a
+  fixed vertical extent independent of width (a streamed world grows sideways
+  in chunks, not upward). The world is currently a single fixed window into
+  the infinite chunked terrain; **streaming chunks in/out around the camera is
+  the next milestone** (the gen is already chunk-local and seamless for it). A
+  uniform 1 cm grid at this map size would be 6.3 BILLION cells — past any
+  current GPU without sparse/LOD structures.
 
 ## Physical scale & calibration
 

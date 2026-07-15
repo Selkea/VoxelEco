@@ -502,25 +502,49 @@ float fbm(vec2 q) {
 	return v;   // ~0..1
 }
 
+// ---------- hierarchical terrain: chunk -> subchunk -> voxel ----------
+// Voxels are grouped 20x20 into a SUBCHUNK (1 m) and 20x20 subchunks into a
+// CHUNK (20 m). Surface height is a pure function of world (x,z) + seed that
+// sums three bands of continuous value-noise, one per level of the hierarchy.
+// Because it only samples world-space noise — never the world size or a fixed
+// centre — the topography is seamless across every chunk boundary and comes
+// out identical however the world is windowed or streamed (streaming-ready).
+const float SUBCHUNK_VOX = 20.0;    // voxels per subchunk edge (1 m)
+const float CHUNK_VOX    = 400.0;   // voxels per chunk edge (20 subchunks, 20 m)
+
+float world_height(vec2 w) {
+	float H = float(p.H);
+	// decorrelate the three bands per world seed
+	vec2 s = vec2(float(p.seedv & 0xFFFFu), float((p.seedv >> 16) & 0xFFFFu)) * 0.618;
+	// CHUNK band: broad landforms — hills and basins ~a chunk across, blended
+	// smoothly (fbm of value-noise) into cohesive continents. Squared toward its
+	// tails so the terrain spends time as plains and peaks rather than a uniform
+	// slope, and centred so basins fall well below the water line and fill as
+	// lakes. This band carries the bulk of the relief.
+	float cn = fbm(w / CHUNK_VOX + s) - 0.5;
+	float chunk = cn * (1.0 + 2.4 * abs(cn));      // gentle S-curve: flatten mids, exaggerate extremes
+	// SUBCHUNK band: metre-scale rolling relief layered within each chunk.
+	float sub = fbm(w / SUBCHUNK_VOX * 0.8 + s * 2.0 + 31.7) - 0.5;
+	// VOXEL band: a couple voxels of fine surface roughness — the finest blend.
+	float vox = vnoise(w * 0.13 + s * 4.0 + 91.3) - 0.5;
+	return H * 0.42 + chunk * H * 1.35 + sub * H * 0.07 + vox * H * 0.016;
+}
+
 // one thread per column: carve the whole column
 void do_gen() {
 	uint id = flat_id();
 	if (id >= p.W * p.D) { return; }
 	uint x = id % p.W;
 	uint z = id / p.W;
-	vec2 pos = vec2(float(x), float(z));
-	float fscale = 5.0 / float(p.W);       // ~2-3 major hills across the map
-	float n = fbm(pos * fscale);
-	float hgt = 6.0 + n * float(p.H) * 0.55;
-	vec2 c = vec2(float(p.W), float(p.D)) * 0.5;
-	float r = length(pos - c) / (float(p.W) * 0.5);
-	float bowl = clamp(1.0 - r, 0.0, 1.0);
-	hgt -= bowl * bowl * float(p.H) * 0.32;
-	hgt += max(0.0, fbm(pos * fscale * 2.2 + 77.7) - 0.55) * float(p.H) * 0.30;
+	// world coordinates of this column. For the current single-window world this
+	// equals the local index; a chunk's world origin gets added here when the
+	// streaming runtime lands, and the seamless noise makes the seams invisible.
+	vec2 w = vec2(float(x), float(z));
+	float hgt = world_height(w);
 	// signed math throughout: with uint, top-4 underflows for shallow
 	// columns and fills them with stone to the sky
 	int top = clamp(int(hgt), 2, int(p.H) - 4);
-	int water_level = int(float(p.H) * 0.14);   // basins below this start as lakes
+	int water_level = int(float(p.H) * 0.26);   // basins below this start as lakes
 	for (uint y = 0u; y < p.H; y++) {
 		int yi = int(y);
 		uint m = AIR;
