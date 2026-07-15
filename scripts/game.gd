@@ -22,6 +22,7 @@ var _title_acc := 0.0
 var interactive := false
 var _freeze_cam := false   # non-interactive shots that set their own camera
 var _band_acc := 0.0       # throttle for the vertical-tracking band check
+var _env: Environment
 var fly_pos := Vector3()
 var fly_yaw := 0.0         # radians, mouse-look
 var fly_pitch := -0.5
@@ -116,6 +117,7 @@ func _ready() -> void:
 	e.fog_light_color = Color("#c3d9ea")
 	e.fog_density = 0.055 / (ws.x * 1.12)   # constant haze regardless of world size
 	env.environment = e
+	_env = e
 	add_child(env)
 
 	var sun := DirectionalLight3D.new()
@@ -394,6 +396,64 @@ func _add_action(action: String, keys: Array) -> void:
 ## Debug: run a full rain-then-drain cycle so water sheds off the hills and
 ## collects as a clean lake, then save a frame to review the 3D scene.
 func _take_screenshot() -> void:
+	if OS.get_environment("VOX_RELIEFSHOT") != "" and world is GpuWorld:
+		# terrain-shape PREVIEW: a single band view only shows a ~51 m slice, so to
+		# judge how mountainous the world is, draw a wide oblique overview of the true
+		# surface (surface_world_y) over ~2.5 km at true 1:1 scale. VOX_STEEP scales
+		# how tightly ridges/valleys are packed (1 = shipped/gentle).
+		var gw := world as GpuWorld
+		gw.terrain_steep = float(OS.get_environment("VOX_STEEP")) if OS.get_environment("VOX_STEEP") != "" else 1.0
+		_freeze_cam = true
+		speed_mult = 0
+		view.visible = false                               # hide the band's multimesh
+		_env.fog_enabled = false                           # fog washes out km-scale distance
+		var exag := 2.0                                     # vertical exaggeration (shape legibility)
+		var N := 180
+		var span := 50000.0                                # 2.5 km at 5 cm
+		var base := 100000.0
+		var cellw := span / N
+		var sea := float(gw.SEA_Y)
+		var relief := float(gw.RELIEF)
+		var col := func(h: float) -> Color:
+			if h <= sea + 1.0: return Color(0.16, 0.34, 0.58)          # water
+			var t: float = clampf((h - sea) / (relief - sea), 0.0, 1.0)
+			if t < 0.32: return Color(0.28, 0.5, 0.17).lerp(Color(0.46, 0.42, 0.24), t / 0.32)
+			elif t < 0.66: return Color(0.46, 0.42, 0.24).lerp(Color(0.55, 0.55, 0.58), (t - 0.32) / 0.34)
+			return Color(0.55, 0.55, 0.58).lerp(Color(0.96, 0.97, 1.0), (t - 0.66) / 0.34)
+		var hs := PackedFloat32Array()
+		hs.resize((N + 1) * (N + 1))
+		for j in range(N + 1):
+			for i in range(N + 1):
+				hs[j * (N + 1) + i] = gw.surface_world_y(base + i * cellw, base + j * cellw)
+		var st := SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_TRIANGLES)
+		var addv := func(i: int, j: int) -> void:
+			var h: float = hs[j * (N + 1) + i]
+			st.set_color(col.call(h))
+			st.add_vertex(Vector3(i * cellw, maxf(h, sea) * exag, j * cellw))
+		for j in range(N):
+			for i in range(N):
+				addv.call(i, j); addv.call(i + 1, j); addv.call(i + 1, j + 1)
+				addv.call(i, j); addv.call(i + 1, j + 1); addv.call(i, j + 1)
+		st.generate_normals()
+		var mi := MeshInstance3D.new()
+		mi.mesh = st.commit()
+		var mat := StandardMaterial3D.new()
+		mat.vertex_color_use_as_albedo = true
+		mat.roughness = 0.95
+		mi.material_override = mat
+		add_child(mi)
+		var hmax := 0.0
+		for h in hs: hmax = maxf(hmax, h)
+		var ctr := Vector3(span * 0.5, (sea + (hmax - sea) * 0.35) * exag, span * 0.5)
+		cam.position = Vector3(span * 0.5, hmax * exag + span * 0.16, -span * 0.42)
+		cam.look_at(ctr, Vector3.UP)
+		cam.far = span * 3.0
+		await get_tree().create_timer(0.5).timeout
+		get_viewport().get_texture().get_image().save_png("user://shot.png")
+		print("RELIEFSHOT steep=%.1f: max height %.0f m over %.1f km (vertical exag %.1fx)" % [gw.terrain_steep, hmax * 0.05, span * 0.05 / 1000.0, exag])
+		get_tree().quit()
+		return
 	if OS.get_environment("VOX_BANDSHOT") != "" and world is GpuWorld:
 		# vertical-tracking band: place the thin resident band under the terrain
 		# surface at the window centre (as the interactive view does), generate the

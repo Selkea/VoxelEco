@@ -697,10 +697,13 @@ float block_height(vec2 bc, float H, vec2 s) {
 	// Features are WIDE so 256 m of relief is a gentle slope inside a ~50 m window
 	// (fits the resident band) yet valleys-to-peaks span the full RELIEF as you fly.
 	// Kept within ~[0, RELIEF] so the trackable band can always reach the surface.
-	float cn = fbm(w / 32000.0 + s) - 0.5;                // ~1.6 km continental
+	// "gentle-plus" steepness (~1.5x the widest setting): a few hills & valleys per
+	// view, still well inside the resident band. Widths must match the gpu_world.gd
+	// CPU mirror (_block_height) exactly or the band mis-places.
+	float cn = fbm(w / 21000.0 + s) - 0.5;                // ~1.05 km continental
 	float chunk = cn * (1.0 + 2.0 * abs(cn));             // plains & peaks
-	float hill = fbm(w / 4000.0 + s * 2.0 + 31.7) - 0.5;  // ~200 m hills
-	float det = fbm(w / 900.0 + s * 4.0 + 91.3) - 0.5;    // ~45 m detail
+	float hill = fbm(w / 2700.0 + s * 2.0 + 31.7) - 0.5;  // ~135 m hills
+	float det = fbm(w / 600.0 + s * 4.0 + 91.3) - 0.5;    // ~30 m detail
 	return RELIEF * (0.5 + chunk * 0.44 + hill * 0.06 + det * 0.02);
 }
 

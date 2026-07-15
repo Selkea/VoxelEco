@@ -238,15 +238,23 @@ func _fbm(qx: float, qy: float) -> float:
 		amp *= 0.5
 	return v
 
+# terrain_steep multiplies steepness on top of the shipped baseline (1.0 = shipped
+# "gentle-plus"): higher packs ridges & valleys closer together = steeper per view.
+# At 1.0 the wavelengths below MUST match the shader's block_height exactly, or the
+# band mis-places; other values are PREVIEW ONLY (the CPU mirror draws the relief
+# overview, VOX_RELIEFSHOT — it does not change the shader gen).
+var terrain_steep := 1.0
+
 func _block_height(bcx: float, bcz: float) -> float:
 	var wx := bcx * 20.0
 	var wz := bcz * 20.0
 	var sx := float(seed_value & 0xFFFF) * 0.618
 	var sz := float((seed_value >> 16) & 0xFFFF) * 0.618
-	var cn := _fbm(wx / 32000.0 + sx, wz / 32000.0 + sz) - 0.5
+	var k := terrain_steep
+	var cn := _fbm(wx / (21000.0 / k) + sx, wz / (21000.0 / k) + sz) - 0.5
 	var chunk := cn * (1.0 + 2.0 * absf(cn))
-	var hill := _fbm(wx / 4000.0 + sx * 2.0 + 31.7, wz / 4000.0 + sz * 2.0 + 31.7) - 0.5
-	var det := _fbm(wx / 900.0 + sx * 4.0 + 91.3, wz / 900.0 + sz * 4.0 + 91.3) - 0.5
+	var hill := _fbm(wx / (2700.0 / k) + sx * 2.0 + 31.7, wz / (2700.0 / k) + sz * 2.0 + 31.7) - 0.5
+	var det := _fbm(wx / (600.0 / k) + sx * 4.0 + 91.3, wz / (600.0 / k) + sz * 4.0 + 91.3) - 0.5
 	return float(RELIEF) * (0.5 + chunk * 0.44 + hill * 0.06 + det * 0.02)
 
 ## terrain surface world-Y (voxels) at world column (wx, wz) — blended mode
