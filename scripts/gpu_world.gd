@@ -52,6 +52,15 @@ var gen_flags := 0        # bit0: 1 = terraced worldgen, 0 = blended
 # toroidal edge regen: packed x0|width<<16 buffer-slot strip (0 = full width)
 var gen_strip_x := 0
 var gen_strip_z := 0
+# vertical-tracking band: world-Y voxel of the buffer floor. The buffer stores
+# world-Y [gen_oy, gen_oy+H); gen/emit add it to map buffer y -> world y. Tracked
+# so the thin band rides the terrain surface through a 256 m-relief world.
+var gen_oy := 0
+
+# total vertical relief and sea level in voxels — MUST match the shader's RELIEF
+# and SEA_Y. The surface spans [0, RELIEF]; only a p.H-tall band is ever resident.
+const RELIEF := 5120        # 256 m at 5 cm/voxel
+const SEA_Y := 1536         # RELIEF * 0.30
 
 ## grids past this size generate on the GPU instead of a GDScript loop
 const CPU_GEN_LIMIT := 400_000
@@ -163,6 +172,13 @@ func regen(ox: int, oz: int) -> void:
 	rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 	rd.compute_list_end()
 
+## regenerate with the vertical band auto-placed under the terrain surface at the
+## window centre (band_oy_for). Convenience for spinning up a world whose surface
+## sits in a tall-relief world — the tests and headless spin-ups use it.
+func regen_tracked(ox: int, oz: int) -> void:
+	gen_oy = band_oy_for(ox + W * 0.5, oz + D * 0.5)
+	regen(ox, oz)
+
 ## toroidal streaming: shift the window's world origin without regenerating —
 ## the buffer keeps its live sim state; only regen_strip refills entered edges.
 func set_origin(ox: int, oz: int) -> void:
@@ -187,6 +203,87 @@ func regen_strip(x0: int, width: int, z0: int, depth: int) -> void:
 	gen_strip_x = 0   # restore full width for any later whole-buffer regen
 	gen_strip_z = 0
 
+# ---- CPU mirror of the shader's blended world_height, so the band can be placed
+# under the camera without a GPU readback. Must stay bit-compatible with the GLSL
+# (same pcg hash, same fbm, same bands) — see block_height/world_height in the
+# shader. Only the blended surface is mirrored; the band's margins absorb the tiny
+# terraced-vs-blended difference. All hashing emulates 32-bit unsigned wraparound.
+func _pcg(v: int) -> int:
+	v = (v * 747796405 + 2891336453) & 0xFFFFFFFF
+	v = (((v >> ((v >> 28) + 4)) ^ v) * 277803737) & 0xFFFFFFFF
+	return ((v >> 22) ^ v) & 0xFFFFFFFF
+
+func _vhash(qx: float, qy: float) -> float:
+	var a := (int(qx) * 374761393) & 0xFFFFFFFF
+	var b := (int(qy) * 668265263) & 0xFFFFFFFF
+	return float(_pcg(a ^ b ^ (seed_value & 0xFFFFFFFF))) * (1.0 / 4294967296.0)
+
+func _vnoise(qx: float, qy: float) -> float:
+	var ix := floorf(qx)
+	var iy := floorf(qy)
+	var fx := qx - ix
+	var fy := qy - iy
+	var ux := fx * fx * (3.0 - 2.0 * fx)
+	var uy := fy * fy * (3.0 - 2.0 * fy)
+	return lerpf(lerpf(_vhash(ix, iy), _vhash(ix + 1.0, iy), ux),
+			lerpf(_vhash(ix, iy + 1.0), _vhash(ix + 1.0, iy + 1.0), ux), uy)
+
+func _fbm(qx: float, qy: float) -> float:
+	var v := 0.0
+	var amp := 0.5
+	for o in range(4):
+		v += _vnoise(qx, qy) * amp
+		qx *= 2.03
+		qy *= 2.03
+		amp *= 0.5
+	return v
+
+func _block_height(bcx: float, bcz: float) -> float:
+	var wx := bcx * 20.0
+	var wz := bcz * 20.0
+	var sx := float(seed_value & 0xFFFF) * 0.618
+	var sz := float((seed_value >> 16) & 0xFFFF) * 0.618
+	var cn := _fbm(wx / 32000.0 + sx, wz / 32000.0 + sz) - 0.5
+	var chunk := cn * (1.0 + 2.0 * absf(cn))
+	var hill := _fbm(wx / 4000.0 + sx * 2.0 + 31.7, wz / 4000.0 + sz * 2.0 + 31.7) - 0.5
+	var det := _fbm(wx / 900.0 + sx * 4.0 + 91.3, wz / 900.0 + sz * 4.0 + 91.3) - 0.5
+	return float(RELIEF) * (0.5 + chunk * 0.44 + hill * 0.06 + det * 0.02)
+
+## terrain surface world-Y (voxels) at world column (wx, wz) — blended mode
+func surface_world_y(wx: float, wz: float) -> float:
+	var bcfx := wx / 20.0
+	var bcfz := wz / 20.0
+	var ix := floorf(bcfx)
+	var iz := floorf(bcfz)
+	var fx := bcfx - ix
+	var fz := bcfz - iz
+	var ux := fx * fx * (3.0 - 2.0 * fx)
+	var uz := fz * fz * (3.0 - 2.0 * fz)
+	return lerpf(lerpf(_block_height(ix, iz), _block_height(ix + 1.0, iz), ux),
+			lerpf(_block_height(ix, iz + 1.0), _block_height(ix + 1.0, iz + 1.0), ux), uz)
+
+## world-Y the band floor should sit at so the whole resident footprint's surface
+## fits inside the band, with a little subsurface below and air above. Samples the
+## surface across the window (centred on wx,wz) so the band covers the local relief
+## — not just the centre column — then centres the covered range in the band. This
+## is the tracker's target: it keeps this near-surface slice resident as the world
+## scrolls through the 256 m-relief world. Clamped so the band stays in [0, RELIEF].
+func band_oy_for(wx: float, wz: float) -> int:
+	var lo := 1e9
+	var hi := -1e9
+	var stepx := float(W) / 8.0
+	var stepz := float(D) / 8.0
+	for iz in range(-4, 5):
+		for ix in range(-4, 5):
+			var s := surface_world_y(wx + ix * stepx, wz + iz * stepz)
+			lo = minf(lo, s)
+			hi = maxf(hi, s)
+	# centre the [lo, hi] surface band in the buffer, biased slightly downward so a
+	# few metres of subsurface (soil / water table) are always resident below it
+	var mid := (lo + hi) * 0.5
+	var oy := int(round(mid - float(H) * 0.5 + float(H) * 0.08))
+	return clampi(oy, 0, maxi(RELIEF - H, 0))
+
 func _rebuild_uniform_set() -> void:
 	var bufs := [cells_buf, pack_buf, stats_buf, dirty_buf,
 			_solid_target, _water_target, inst_count_buf]
@@ -208,7 +305,7 @@ func bind_instance_buffers(solid_rid: RID, water_rid: RID) -> void:
 	_water_target = water_rid
 	_rebuild_uniform_set()
 
-const PC_SIZE := 64   # push constant byte size (must match the shader struct)
+const PC_SIZE := 68   # push constant byte size (must match the shader struct)
 
 func _pc(mode: int, offset: int) -> PackedByteArray:
 	# 64-byte push constant. rain is an integer threshold out of 2^24; evap/erode
@@ -232,6 +329,7 @@ func _pc(mode: int, offset: int) -> PackedByteArray:
 	pc.encode_u32(52, gen_flags)
 	pc.encode_u32(56, gen_strip_x if gen_strip_x != 0 else (W << 16))
 	pc.encode_u32(60, gen_strip_z if gen_strip_z != 0 else (D << 16))
+	pc.encode_u32(64, gen_oy)          # world-Y voxel of the buffer floor (band)
 	return pc
 
 func step() -> void:

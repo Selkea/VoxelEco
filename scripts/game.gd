@@ -20,6 +20,8 @@ var dragging := false
 var _title_acc := 0.0
 # creative-mode fly camera (interactive play): free-fly, no gravity/collision
 var interactive := false
+var _freeze_cam := false   # non-interactive shots that set their own camera
+var _band_acc := 0.0       # throttle for the vertical-tracking band check
 var fly_pos := Vector3()
 var fly_yaw := 0.0         # radians, mouse-look
 var fly_pitch := -0.5
@@ -59,11 +61,12 @@ func _world_size() -> Vector3i:
 	var sz := OS.get_environment("VOX_SIZE").to_int()
 	if sz > 0:
 		return _clamp_cells(Vector3i(sz, sz, hh if hh > 0 else maxi(24, sz * 3 / 8)))
-	# default map: 1280x1280x128 voxels (5cm) = 64 m x 64 m, ~210M sim cells.
-	# Sized so the full per-voxel renderer flies smoothly; chunk streaming
-	# (next) extends it without growing the resident window. VOX_RENDER=block +
-	# a larger VOX_SIZE draws bigger fixed maps as coarse blocks.
-	return Vector3i(1280, 1280, hh if hh > 0 else 128)
+	# default map: a 1024x1024 footprint (51 m) with a 768-voxel (38 m) resident
+	# BAND that vertically tracks the terrain surface (gen_oy). The world's true
+	# vertical relief is 256 m (GpuWorld.RELIEF) but only this thin near-surface
+	# band is ever stored, so the footprint stays wide while the world is tall —
+	# ~805M sim cells. VOX_H overrides the band height, not the relief.
+	return Vector3i(1024, 1024, hh if hh > 0 else 896)
 
 # A single GPU storage buffer's byte size is 32-bit in Godot, so the cells
 # buffer (4 bytes/cell) hard-caps at ~4 GB ≈ 1.05B cells no matter how much VRAM
@@ -134,10 +137,19 @@ func _ready() -> void:
 		# aligned) so the toroidal coordinate math — which is unsigned — stays
 		# valid whichever way you fly, with kilometres of room in every direction.
 		var base := 100000
+		var surf := float(world.H) * 0.45   # fallback (CPU world): mid-band
 		if world is GpuWorld:
-			(world as GpuWorld).regen(base, base)
+			var gw := world as GpuWorld
+			# place the resident band under the terrain surface at the window centre,
+			# then generate: the band rides the 256 m-relief world as a thin slice
+			var cx := base + world.W * 0.5
+			var cz := base + world.D * 0.5
+			surf = gw.surface_world_y(cx, cz)
+			gw.gen_oy = gw.band_oy_for(cx, cz)
+			gw.regen(base, base)
 			view.set_stream_origin(base, base)
-		fly_pos = Vector3(base + world.W * 0.5, world.H * 1.4, base + world.D * 0.5)
+		# camera hovers above the surface (world-Y), looking down over the vista
+		fly_pos = Vector3(base + world.W * 0.5, surf + world.H * 0.4, base + world.D * 0.5)
 		fly_yaw = 0.0
 		fly_pitch = -0.6
 		# faint distance fog so the streaming window's far edge fades into sky
@@ -217,6 +229,25 @@ func _stream() -> void:
 		if noz != oz:
 			gw.regen_strip(0, world.W, posmod(mini(oz, noz), world.D), dz)
 	view.set_stream_origin(nox, noz)
+	_refresh_view(true)
+
+## vertical-tracking band: keep the thin resident band centred on the terrain
+## surface under the camera as it flies through the 256 m-relief world. When the
+## surface drifts past a deadband, shift the band to re-centre and regenerate. The
+## band is a vertical slice (not a torus), so a shift is a full-window regen — but
+## it only fires when you change ELEVATION; flying at a roughly constant height
+## keeps the toroidal horizontal streaming's live water/erosion intact. Throttled
+## (band_oy_for samples the whole footprint, which is a bit of CPU noise work).
+func _track_band() -> void:
+	if not (world is GpuWorld) or not view.use_instances:
+		return
+	var gw := world as GpuWorld
+	var target := gw.band_oy_for(fly_pos.x, fly_pos.z)
+	if absi(target - gw.gen_oy) < int(world.H * 0.12):
+		return
+	gw.gen_oy = target
+	gw.regen(gw.gen_origin_x, gw.gen_origin_z)   # re-fill the window at the new band Y
+	gw.reset_water_stats()
 	_refresh_view(true)
 
 func _place_fly() -> void:
@@ -303,7 +334,11 @@ func _process(dt: float) -> void:
 	if interactive:
 		_fly(dt)
 		_stream()
-	else:
+		_band_acc += dt
+		if _band_acc > 0.2:
+			_band_acc = 0.0
+			_track_band()
+	elif not _freeze_cam:
 		_place_cam()
 	_title_acc += dt
 	if _title_acc > 0.5:
@@ -359,6 +394,50 @@ func _add_action(action: String, keys: Array) -> void:
 ## Debug: run a full rain-then-drain cycle so water sheds off the hills and
 ## collects as a clean lake, then save a frame to review the 3D scene.
 func _take_screenshot() -> void:
+	if OS.get_environment("VOX_BANDSHOT") != "" and world is GpuWorld:
+		# vertical-tracking band: place the thin resident band under the terrain
+		# surface at the window centre (as the interactive view does), generate the
+		# 256 m-relief world, and shoot an overview. Also sample the surface across a
+		# wide area to confirm the full relief exists (a single 51 m window only sees
+		# a gentle slice of it — the point of wide features).
+		var gw := world as GpuWorld
+		var base := OS.get_environment("VOX_BASE").to_int() if OS.get_environment("VOX_BASE") != "" else 100000
+		var cx := base + world.W * 0.5
+		var cz := base + world.D * 0.5
+		var surf := gw.surface_world_y(cx, cz)
+		gw.gen_oy = gw.band_oy_for(cx, cz)
+		gw.regen(base, base)
+		view.set_stream_origin(base, base)
+		_freeze_cam = true
+		world.set_rain_mm_hr(0.0)
+		world.run(90)
+		var cnt: PackedInt32Array = gw.dispatch_emit()
+		view.set_visible_counts(cnt[0], cnt[1])
+		var lo := 1e9
+		var hi := -1e9
+		for gz in range(0, 40000, 2000):
+			for gx in range(0, 40000, 2000):
+				var sy := gw.surface_world_y(base + gx, base + gz)
+				lo = minf(lo, sy); hi = maxf(hi, sy)
+		var wlo := 1e9
+		var whi := -1e9
+		for wz2 in range(0, world.D, 32):
+			for wx2 in range(0, world.W, 32):
+				var ws := gw.surface_world_y(base + wx2, base + wz2)
+				wlo = minf(wlo, ws); whi = maxf(whi, ws)
+		print("BANDSHOT: window surface relief = %.0f vox (%.1f m); band height = %d vox (%.1f m)" \
+			% [whi - wlo, (whi - wlo) * 0.05, world.H, world.H * 0.05])
+		print("BANDSHOT: centre surf=%.0f (%.1fm), band oy=%d..%d" % [surf, surf * 0.05, gw.gen_oy, gw.gen_oy + world.H])
+		print("BANDSHOT: relief over 2km sample = %.0f..%.0f vox (%.1f..%.1f m) = %.1f m span" \
+			% [lo, hi, lo * 0.05, hi * 0.05, (hi - lo) * 0.05])
+		print("BANDSHOT: emit solid=%d water=%d instances" % [cnt[0], cnt[1]])
+		cam.position = Vector3(cx - world.W * 0.35, surf + world.H * 0.85, cz - world.D * 0.35)
+		cam.look_at(Vector3(cx, surf, cz), Vector3.UP)
+		await get_tree().create_timer(0.4).timeout
+		get_viewport().get_texture().get_image().save_png("user://shot.png")
+		print("BANDSHOT saved: ", ProjectSettings.globalize_path("user://shot.png"))
+		get_tree().quit()
+		return
 	if OS.get_environment("VOX_STREAMSHOT") != "" and world is GpuWorld:
 		# streaming check: regenerate the window at a non-zero world origin and
 		# aim the camera there. If the terrain renders at that world position (not
@@ -465,13 +544,61 @@ func _run_sim_test() -> void:
 		w.prime()
 	w.rules_mask = OS.get_environment("VOX_RULES").to_int() if OS.get_environment("VOX_RULES") != "" else 0
 	print("backend: %s rules_mask=%d" % ["GPU compute" if w.gpu_ok else "CPU fallback", w.rules_mask])
+	if OS.get_environment("VOX_TRACKTEST") != "":
+		# vertical-tracking band: fly a long horizontal path across the 256 m-relief
+		# world, apply the same deadband band-shift the interactive tracker uses, and
+		# assert the terrain surface stays resident in the band the whole way (never
+		# clips out the top or bottom). gw is tiny — only its CPU noise (surface_world_y,
+		# seeded) is used; the band footprint/height are the real defaults.
+		var Wt := 1024.0
+		var Ht := 896
+		var gw := GpuWorld.new(777, 64, 64, 64)
+		var base := 100000.0
+		var band_target := func(cx: float, cz: float) -> int:
+			var blo := 1e9
+			var bhi := -1e9
+			for iz in range(-4, 5):
+				for ix in range(-4, 5):
+					var s: float = gw.surface_world_y(cx + ix * Wt / 8.0, cz + iz * Wt / 8.0)
+					blo = minf(blo, s); bhi = maxf(bhi, s)
+			return clampi(int(round((blo + bhi) * 0.5 - Ht * 0.5 + Ht * 0.08)), 0, maxi(GpuWorld.RELIEF - Ht, 0))
+		var oy: int = band_target.call(base + Wt * 0.5, base + Wt * 0.5)
+		var shifts := 0
+		var worst_bottom := 1e9   # min (surface - band floor): subsurface headroom
+		var worst_top := 1e9      # min (band top - surface): air/peak headroom
+		var lo := 1e9
+		var hi := -1e9
+		var steps := 70
+		var stride := 400.0                               # 400 vox/step -> 1.4 km flight
+		for i in range(steps):
+			var camx := base + Wt * 0.5 + i * stride
+			var camz := base + Wt * 0.5
+			var target: int = band_target.call(camx, camz)
+			if absi(target - oy) >= int(Ht * 0.12):
+				oy = target
+				shifts += 1
+			for jz in range(-1, 2):
+				for jx in range(-1, 2):
+					var s: float = gw.surface_world_y(camx + jx * Wt * 0.4, camz + jz * Wt * 0.4)
+					lo = minf(lo, s); hi = maxf(hi, s)
+					worst_bottom = minf(worst_bottom, s - oy)
+					worst_top = minf(worst_top, float(oy + Ht) - s)
+		print("TRACKTEST: flew %.0f m; surface spanned %.1f..%.1f m (%.1f m relief traversed)" \
+			% [steps * stride * 0.05, lo * 0.05, hi * 0.05, (hi - lo) * 0.05])
+		print("TRACKTEST: band shifts=%d; min subsurface headroom=%.1f m, min air/peak headroom=%.1f m" \
+			% [shifts, worst_bottom * 0.05, worst_top * 0.05])
+		print("SURFACE STAYED RESIDENT" if worst_bottom > 0.0 and worst_top > 0.0 else "SURFACE CLIPPED")
+		gw.free_gpu()
+		get_tree().quit()
+		return
 	if OS.get_environment("VOX_GENSTABLE") != "":
 		# is freshly generated terrain at rest, or does it landslide? count solid
 		# (non-water) cells whose material changes per tick — movement = slumping
-		var gw := GpuWorld.new(12345, 160, 160, 60)
+		var gw := GpuWorld.new(12345, 160, 160, 160)
 		gw.set_rain_mm_hr(0.0)
 		if not gw.gpu_ok:
 			print("GENSTABLE: no GPU"); get_tree().quit(); return
+		gw.regen_tracked(100000, 100000)   # place the band under the surface
 		var solid := func(m: int) -> bool:
 			return m == VoxWorld.SOIL or m == VoxWorld.SAND or m == VoxWorld.STONE \
 				or m == VoxWorld.MUD or m == VoxWorld.GRASS
@@ -503,12 +630,17 @@ func _run_sim_test() -> void:
 		# must be bit-identical to that same region generated inside a larger
 		# world. If so, chunks can be generated independently and still tile
 		# seamlessly — the core guarantee the streaming runtime relies on.
-		var Hh := 96
+		var Hh := 512
 		var big := GpuWorld.new(777, 800, 800, Hh)   # 2x2 chunks, generated whole
 		var one := GpuWorld.new(777, 400, 400, Hh)    # one chunk, standalone
-		one.regen(400, 0)                             # as world-chunk (1,0)
 		if not big.gpu_ok or not one.gpu_ok:
 			print("SEAMTEST: no GPU"); get_tree().quit(); return
+		# both worlds must use the SAME vertical band (gen_oy is a windowing choice,
+		# not part of the world), or the vertical slice differs; horizontal gen is
+		# seamless per world-coord. Share one oy computed for chunk (1,0)'s centre.
+		var soy := big.band_oy_for(600, 200)
+		big.gen_oy = soy; big.regen(0, 0)
+		one.gen_oy = soy; one.regen(400, 0)           # as world-chunk (1,0)
 		big.sync_cells(); one.sync_cells()
 		var mismatch := 0
 		var solid := 0
@@ -533,11 +665,11 @@ func _run_sim_test() -> void:
 		# sim state. Rain a while to build state, snapshot, advance, and confirm
 		# only the strip changed.
 		var Wt := 800
-		var gw := GpuWorld.new(555, Wt, Wt, 96)
+		var gw := GpuWorld.new(555, Wt, Wt, 512)
 		if not gw.gpu_ok:
 			print("TOROTEST: no GPU"); get_tree().quit(); return
 		var base := 100400                     # chunk-aligned positive origin
-		gw.regen(base, base)
+		gw.regen_tracked(base, base)           # band under the surface (constant during the shift)
 		gw.set_rain_mm_hr(80.0); gw.run(150)   # accumulate water + erosion state
 		gw.set_rain_mm_hr(0.0); gw.run(60)
 		gw.sync_cells()
@@ -798,6 +930,7 @@ func _run_sim_test() -> void:
 							x0, row, z0, wb, wa, pre, post])
 		get_tree().quit()
 		return
+	w.regen_tracked(100000, 100000)   # place the band under the tall-world surface
 	var t0 := Time.get_ticks_msec()
 	w.run(60)                  # settle terrain
 	var settle_ms := Time.get_ticks_msec() - t0

@@ -130,14 +130,28 @@ Creative-mode free flight (no gravity / collision):
   world coords with an all-unsigned wrap (this GPU miscomputes signed subtraction
   that goes negative), and the window rides in positive world space. Distance
   fog fades the far edge into sky.
-- **Scale**: the default fly window is **1280x1280x128 voxels at ~5 cm** = a
-  64 m x 64 m x 6.4 m plot (~210M sim cells), sized so the full per-voxel
+- **Vertical-tracking band (tall worlds)**: the world has **256 m of vertical
+  relief** (5120 voxels at 5 cm) but the resident sim buffer is only a thin
+  **height band** (default ~45 m) that **rides up and down with the terrain
+  surface** under the camera. Worldgen returns a true world-Y surface spanning the
+  full relief over **wide (hundreds-of-metres) features**, so 256 m of relief reads
+  as gentle mountains inside any one view rather than spikes — the peaks and
+  valleys reveal themselves as you fly. Only the near-surface slice is stored
+  (`gen_oy` = the band's world-Y floor); everything below the band is implicit deep
+  rock, everything above is implicit air, so a tall world costs the same cells as a
+  shallow one. As the surface drifts past a deadband the band re-centres and
+  regenerates; horizontal motion stays toroidal/state-preserving as long as you fly
+  at roughly constant elevation. This is what lets a 256 m-tall world keep a wide
+  (~50 m) footprint under the 1-billion-cell single-buffer ceiling.
+- **Scale**: the default fly window is a **1024x1024 footprint (51 m) with a
+  ~45 m resident band at 5 cm** (~805M sim cells), sized so the full per-voxel
   renderer flies smoothly. A single fixed (non-streamed) map is capped by a hard
   ceiling: **a single GPU storage buffer is 32-bit-sized in Godot**, so the
   cells buffer (4 bytes/cell) tops out at ~4 GB ≈ **1.05B cells** regardless of
   VRAM — past that it silently truncates, so oversized `VOX_SIZE` requests are
-  clamped with a warning. Streaming sidesteps this by keeping the resident
-  window small while the world itself is unbounded.
+  clamped with a warning. Toroidal streaming (horizontal) and the vertical-tracking
+  band (up/down) together keep the resident window small while the world itself is
+  unbounded sideways and 256 m tall.
 
 ## Physical scale & calibration
 

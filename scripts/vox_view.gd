@@ -6,6 +6,9 @@ extends Node3D
 ## costs nothing to keep on screen.
 
 const CHUNK := 16
+# Y extent of the instance culling AABB: the full 256 m relief (RELIEF=5120) plus
+# margin, so the vertical-tracking band is never culled wherever it rides.
+const AABB_Y := 5400.0
 
 var world: VoxWorld
 var solid_mat: StandardMaterial3D
@@ -77,9 +80,12 @@ func _make_mm(mat: StandardMaterial3D, cap: int) -> MultiMeshInstance3D:
 	mm.visible_instance_count = 0
 	mmi.multimesh = mm
 	mmi.material_override = mat
-	# a huge custom AABB so instances written GPU-side are never culled away
+	# a huge custom AABB so instances written GPU-side are never culled away. Y
+	# spans the full vertical relief (not just the band height): the vertical-
+	# tracking band places instances anywhere in world-Y [0, RELIEF], so a band-
+	# height Y bound would cull the terrain whenever the band rode up a mountain.
 	mmi.custom_aabb = AABB(Vector3(-16, -16, -16),
-			Vector3(world.W + 32, world.H + 32, world.D + 32))
+			Vector3(world.W + 32, AABB_Y, world.D + 32))
 	add_child(mmi)
 	return mmi
 
@@ -100,7 +106,7 @@ func set_stream_origin(ox: int, oz: int) -> void:
 	if not use_instances:
 		return
 	var a := AABB(Vector3(ox - 16, -16, oz - 16),
-			Vector3(world.W + 32, world.H + 32, world.D + 32))
+			Vector3(world.W + 32, AABB_Y, world.D + 32))
 	solid_mm.custom_aabb = a
 	water_mm.custom_aabb = a
 

@@ -39,6 +39,10 @@ layout(push_constant) uniform Params {
 	// [x0, x0+width) x [z0, z0+depth) (mod W/D) — the freshly-entered edge —
 	// packed lo|hi<<16. Full regen = width/depth == W/D.
 	uint strip_x; uint strip_z;
+	// vertical-tracking band: world-Y voxel of the buffer floor (buffer y 0). The
+	// buffer stores world-Y [gen_oy, gen_oy+H); gen/emit map buffer y -> world y by
+	// adding it. Below the band is implicit bedrock, above it is implicit air.
+	uint gen_oy;
 } p;
 
 const uint CHUNK = 16u;
@@ -487,7 +491,7 @@ void do_emit() {
 	// place the voxel at its WORLD position (toroidal buffer slot -> world) so a
 	// streamed window renders where the camera actually is
 	vec3 origin = vec3(float(world_coord(x, p.gen_ox, p.W)) + 0.5,
-			float(y) + 0.5, float(world_coord(z, p.gen_oz, p.D)) + 0.5);
+			float(int(y) + int(p.gen_oy)) + 0.5, float(world_coord(z, p.gen_oz, p.D)) + 0.5);
 	if (is_water) {
 		uint slot = atomicAdd(n_water, 1u);
 		if (slot < cap_water) { write_inst(true, slot, origin, vec4(1.0), 1.0); }
@@ -543,7 +547,8 @@ void do_block_emit() {
 			m = MAT(cells[cidx(cx, min(y0 + 10u, p.H - 1u), cz)]);
 			if (m == AIR) { m = SOIL; }
 		}
-		vec3 center = vec3(float(int(x0) + int(p.gen_ox)) + 10.0, float(y0) + 10.0,
+		vec3 center = vec3(float(int(x0) + int(p.gen_ox)) + 10.0,
+				float(int(y0) + int(p.gen_oy)) + 10.0,
 				float(int(z0) + int(p.gen_oz)) + 10.0);
 		if (m == WATER) {
 			uint slot = atomicAdd(n_water, 1u);
@@ -621,7 +626,7 @@ void do_skin_emit() {
 		uint raw = cells[cidx(x, y, z)];
 		uint m = MAT(raw);
 		if (m == AIR) { m = sm; raw = sraw; }
-		vec3 c = vec3(wx + 0.5, float(y) + 0.5, wz + 0.5);
+		vec3 c = vec3(wx + 0.5, float(int(y) + int(p.gen_oy)) + 0.5, wz + 0.5);
 		uint vid = x + z * p.W + y * p.W * p.D;   // stable per-voxel id for tint jitter
 		if (m == WATER) {
 			uint s = atomicAdd(n_water, 1u);
@@ -672,18 +677,31 @@ float fbm(vec2 q) {
 const float BLOCK_VOX = 20.0;       // voxels per block edge (1 m)
 const float CHUNK_VOX = 400.0;      // voxels per chunk edge (20 blocks, 20 m)
 
+// VERTICAL-TRACKING WORLD: the terrain surface is a world-Y value spanning the
+// full RELIEF (256 m), but the sim buffer is only a thin height BAND (p.H) that
+// rides up/down with the surface (gen_oy = band's world-Y floor). So the surface
+// amplitude is decoupled from the band height — it is this fixed RELIEF, not p.H.
+// Features are DELIBERATELY WIDE (hundreds of metres) so 256 m of relief reads as
+// gentle mountains within any small window, not spikes; only the near-surface is
+// stored, deep rock below the band is implicit bedrock, high air above is implicit.
+const float RELIEF = 5120.0;        // total vertical relief in voxels (256 m at 5 cm)
+const float SEA_Y  = RELIEF * 0.30; // fixed sea level, world-Y voxels
+
 // Terrain height sampled at a BLOCK grid point (bc in block units, i.e. world
-// voxels / 20). This is the base heightfield resolution — one value per 1 m
-// block — so the world generates "as if 1 block = 1 voxel". It sums the CHUNK
-// band (broad landforms, squared toward its tails so terrain spends time as
-// plains and peaks) and a per-block variation band.
+// voxels / 20), returned as a WORLD-Y voxel value in ~[0, RELIEF]. Wide bands:
+// a continental landform (~600 m, squared toward its tails so terrain spends time
+// as plains and peaks), hills (~120 m), and per-block detail (~25 m). All widths
+// are absolute world scales so relief is gentle regardless of the window size.
 float block_height(vec2 bc, float H, vec2 s) {
-	// CHUNK band: 20 blocks per chunk, so bc/20 == world/CHUNK_VOX
-	float cn = fbm(bc / 20.0 + s) - 0.5;
-	float chunk = cn * (1.0 + 2.4 * abs(cn));
-	// per-block relief on the block lattice
-	float blk = fbm(bc * 0.5 + s * 2.0 + 31.7) - 0.5;
-	return H * 0.42 + chunk * H * 1.35 + blk * H * 0.09;
+	vec2 w = bc * BLOCK_VOX;   // block lattice back to world voxels for wide sampling
+	// Features are WIDE so 256 m of relief is a gentle slope inside a ~50 m window
+	// (fits the resident band) yet valleys-to-peaks span the full RELIEF as you fly.
+	// Kept within ~[0, RELIEF] so the trackable band can always reach the surface.
+	float cn = fbm(w / 32000.0 + s) - 0.5;                // ~1.6 km continental
+	float chunk = cn * (1.0 + 2.0 * abs(cn));             // plains & peaks
+	float hill = fbm(w / 4000.0 + s * 2.0 + 31.7) - 0.5;  // ~200 m hills
+	float det = fbm(w / 900.0 + s * 4.0 + 91.3) - 0.5;    // ~45 m detail
+	return RELIEF * (0.5 + chunk * 0.44 + hill * 0.06 + det * 0.02);
 }
 
 // Surface height at a voxel column. BOTH modes read the SAME block (1 m)
@@ -727,34 +745,34 @@ void do_gen() {
 	// world column of this buffer slot on the torus; the seamless world-space
 	// noise makes the joins invisible.
 	vec2 w = vec2(float(world_coord(x, p.gen_ox, p.W)), float(world_coord(z, p.gen_oz, p.D)));
-	float hgt = world_height(w);
-	// signed math throughout: with uint, top-4 underflows for shallow
-	// columns and fills them with stone to the sky
-	int top = clamp(int(hgt), 2, int(p.H) - 4);
-	int water_level = int(float(p.H) * 0.26);   // basins below this start as lakes
+	// world-Y of the surface (0..RELIEF) and the fixed sea level. The buffer only
+	// covers the band [gen_oy, gen_oy+H); each cell's world-Y = gen_oy + y. Below
+	// the band is implicit deep rock (the buffer floor is a solid boundary), above
+	// is implicit air, so the sim rides a thin near-surface slice of a tall world.
+	int top = int(world_height(w));
+	int sea = int(SEA_Y);                        // basins below this start as lakes
+	int oy = int(p.gen_oy);
 	for (uint y = 0u; y < p.H; y++) {
-		int yi = int(y);
+		int wy = oy + int(y);                    // this cell's world-Y
 		uint m = AIR;
 		uint s0 = 0u;
-		if (yi == 0) { m = BEDROCK; }
-		else if (yi < top - 4) { m = STONE; }
-		else if (yi < top) { m = SOIL; s0 = 40u; }   // field-capacity moisture
+		if (wy == 0) { m = BEDROCK; }
+		else if (wy < top - 4) { m = STONE; }
+		else if (wy < top) { m = SOIL; s0 = 40u; }   // field-capacity moisture
 		// the land surface that stands above the water line starts vegetated;
 		// low ground stays firm soil (loose sand isn't pre-placed — it forms
 		// where water erodes, so freshly generated slopes don't avalanche)
-		if (m == SOIL && yi == top - 1 && top > water_level) { m = GRASS; s0 = 40u; }
+		if (m == SOIL && wy == top - 1 && top > sea) { m = GRASS; s0 = 40u; }
 		// submerged ground generates already SATURATED so the lakes sit on wet
 		// beds and don't seep away. The one exception is the ground's exposed
-		// SURFACE cell at the water's EDGE (a waterline column, top==water_level,
-		// so its top-1 surface has AIR above): saturated to capacity it would be
-		// over the mud threshold and instantly waterlog into sliding mud that
-		// avalanches into the lake. Under deep water (top<water_level) the surface
-		// keeps its cap — water above exempts it from mud, and a firm bed can't
-		// seep. So: cap everything submerged except that exposed shoreline layer.
-		if ((m == SOIL || m == SAND) && yi < water_level
-				&& (top < water_level || yi < top - 1)) { s0 = sat_cap(m); }
+		// SURFACE cell at the water's EDGE (a waterline column, top==sea, so its
+		// top-1 surface has AIR above): saturated to capacity it would be over the
+		// mud threshold and instantly waterlog into sliding mud that avalanches
+		// into the lake. Under deep water (top<sea) the surface keeps its cap.
+		if ((m == SOIL || m == SAND) && wy < sea
+				&& (top < sea || wy < top - 1)) { s0 = sat_cap(m); }
 		// fill low basins and valleys with standing water up to the water line
-		if (m == AIR && yi < water_level) { m = WATER; s0 = 0u; }
+		if (m == AIR && wy < sea) { m = WATER; s0 = 0u; }
 		cells[cidx(x, y, z)] = PACK(m, s0);
 	}
 }
