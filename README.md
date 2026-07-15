@@ -98,15 +98,16 @@ Vegetation and animals layer on top of this abiotic substrate later.
   RenderingDevice and the emit pass writes the MultiMesh instance buffers
   directly in VRAM (`multimesh_get_buffer_rd_rid`); the only per-frame
   readback is a 16-byte instance counter.
-- **Coarsened 1 m-block rendering**: the fine 5 cm sim is drawn as a **heightmap
-  of solid 1 m cubes** — one thread per 20x20-voxel block column scans its centre
-  for the surface, rounds the height to whole blocks, and stacks cubes from the
-  ground up. The **top** cube is always coloured by the true surface material
-  (grass cap / lake water), body cubes by the material at their own centre
-  (soil / stone / water). This decouples draw cost from sim resolution — a huge
-  world is tens of thousands of cubes, not billions of voxels — so the map can
-  be large while the detailed hydrology keeps running underneath.
-  `VOX_RENDER=voxel` falls back to the per-5 cm-voxel renderer (small worlds).
+- **1 m blocks with voxel-tinted tops**: the fine 5 cm sim is drawn as chunky
+  1 m blocks, but each block's **top is skinned with its real 5 cm surface
+  voxels**, so the blocky terrain still shows per-voxel colour detail. One
+  thread per 5 cm column lays a 5 cm tile at the block-rounded top height,
+  tinted by its own surface voxel (material + wet/dry saturation + per-voxel
+  jitter); the block bodies/sides stay solid 1 m cubes (one per 20x20x20 block,
+  coloured by their centre material — grass over soil over stone). Draw cost is
+  the surface area (a few million tiles), not the sim volume (billions of
+  voxels), so the map can be large while the detailed hydrology runs underneath.
+  `VOX_RENDER=voxel` falls back to the full per-5 cm-voxel renderer.
 - **Scale**: the default world is **2800x2800x128 voxels at ~5 cm** = a
   140 m x 140 m x 6.4 m plot rendered as **140x140 one-metre blocks** (~1.0B
   sim cells). That is right at a hard ceiling: **a single GPU storage buffer is

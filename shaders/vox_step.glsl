@@ -532,6 +532,76 @@ void do_block_emit() {
 	}
 }
 
+// full surface colour of one voxel, including per-voxel tint jitter and the
+// wet-darkening of saturated soil/sand (mirrors the fine per-voxel renderer)
+vec3 surf_color(uint raw, uint m, uint id) {
+	float jit = 1.0 + (float(pcg(id * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
+	vec3 base = mat_color(m);
+	if (m == SOIL || m == SAND) {
+		float wet = clamp(float(SAT(raw)) / float(sat_cap(m)), 0.0, 1.0);
+		base = mix(base, vec3(0.09, 0.05, 0.03), wet * 0.8);
+	}
+	return base * jit;
+}
+
+// 1 m blocks with voxel-tinted tops: one thread per 5 cm COLUMN. The block's
+// body/sides stay chunky 1 m cubes (emitted once per block, by the corner
+// thread), but the block TOP is skinned with the real 5 cm surface voxels —
+// each column lays a 5 cm tile at the block-rounded top height, tinted by its
+// own surface voxel (material + wet/dry + jitter). So the shape is blocky while
+// the surface shows the fine per-voxel detail of the 5 cm sim.
+void do_skin_emit() {
+	uint id = flat_id();
+	if (id >= p.W * p.D) { return; }
+	uint x = id % p.W;
+	uint z = id / p.W;
+	if (z < p.cut_z) { return; }
+	// this column's own surface voxel
+	int sy = -1; uint sm = AIR; uint sraw = 0u;
+	for (uint yy = p.H; yy > 0u; ) {
+		yy--; uint raw = cells[cidx(x, yy, z)];
+		if (MAT(raw) != AIR) { sy = int(yy); sm = MAT(raw); sraw = raw; break; }
+	}
+	if (sy < 0) { return; }
+	// the block's flat top height, from the block-centre column (so a whole
+	// 20x20 block shares one top -> chunky, not the bumpy 5 cm surface)
+	uint bx = x / 20u, bz = z / 20u;
+	uint cx = min(bx * 20u + 10u, p.W - 1u), cz = min(bz * 20u + 10u, p.D - 1u);
+	int csy = -1;
+	for (uint yy = p.H; yy > 0u; ) {
+		yy--; if (MAT(cells[cidx(cx, yy, cz)]) != AIR) { csy = int(yy); break; }
+	}
+	if (csy < 0) { csy = sy; }
+	uint ntop = max((uint(csy) + 10u) / 20u, 1u);
+	float topf = float(ntop * 20u);
+	// skin tile (5 cm) sitting on the block top, tinted by this column's surface
+	vec3 sc = vec3(float(x) + 0.5, topf + 0.5, float(z) + 0.5);
+	if (sm == WATER) {
+		uint slot = atomicAdd(n_water, 1u);
+		if (slot < cap_water) { write_inst(true, slot, sc, vec4(1.0), 1.0); }
+	} else {
+		uint slot = atomicAdd(n_solid, 1u);
+		if (slot < cap_solid) { write_inst(false, slot, sc, vec4(surf_color(sraw, sm, id), 1.0), 1.0); }
+	}
+	// one thread per block emits the chunky body/sides beneath the skin
+	if (x % 20u == 0u && z % 20u == 0u) {
+		for (uint by = 0u; by < ntop; by++) {
+			uint y0 = by * 20u;
+			uint m = MAT(cells[cidx(cx, min(y0 + 10u, p.H - 1u), cz)]);
+			if (m == AIR) { m = SOIL; }
+			vec3 center = vec3(float(bx * 20u) + 10.0, float(y0) + 10.0, float(bz * 20u) + 10.0);
+			if (m == WATER) {
+				uint s = atomicAdd(n_water, 1u);
+				if (s < cap_water) { write_inst(true, s, center, vec4(1.0), 20.0); }
+			} else {
+				float shade = 0.74 + 0.26 * clamp(float(y0) / float(p.H), 0.0, 1.0);
+				uint s = atomicAdd(n_solid, 1u);
+				if (s < cap_solid) { write_inst(false, s, center, vec4(mat_color(m) * shade, 1.0), 20.0); }
+			}
+		}
+	}
+}
+
 // ---- GPU worldgen: value-noise fbm heightfield, bowl basin, ridge ----
 
 float vhash(vec2 q) {
@@ -659,5 +729,6 @@ void main() {
 	else if (mode == 3u) { do_emit(); }
 	else if (mode == 4u) { do_gen(); }
 	else if (mode == 5u) { do_block_emit(); }
+	else if (mode == 6u) { do_skin_emit(); }
 	else { do_step(); }
 }

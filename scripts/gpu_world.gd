@@ -103,9 +103,9 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	nbz = (D + 19) / 20
 	block_render = OS.get_environment("VOX_RENDER") != "voxel"
 	if block_render:
-		# at most one 1m cube per block; tiny buffers even for a huge sim
-		solid_cap = nbx * nby * nbz
-		water_cap = nbx * nby * nbz
+		# one 5cm skin tile per column + one chunky body cube per block
+		solid_cap = W * D + nbx * nby * nbz
+		water_cap = W * D + nbx * nby * nbz
 	else:
 		solid_cap = W * D * 4
 		water_cap = W * D * 2
@@ -252,8 +252,8 @@ func dispatch_emit() -> PackedInt32Array:
 	rd.compute_list_bind_compute_pipeline(cl, pipeline)
 	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
 	if block_render:
-		rd.compute_list_set_push_constant(cl, _pc(5, 0), PC_SIZE)   # coarsened 1m blocks
-		rd.compute_list_dispatch(cl, _block_groups, 1, 1)
+		rd.compute_list_set_push_constant(cl, _pc(6, 0), PC_SIZE)   # 1m blocks + voxel-tinted tops
+		rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 	else:
 		rd.compute_list_set_push_constant(cl, _pc(3, 0), PC_SIZE)   # per-voxel
 		rd.compute_list_dispatch(cl, _cell_groups, 1, 1)
