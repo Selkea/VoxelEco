@@ -134,8 +134,8 @@ func _ready() -> void:
 		fly_pos = Vector3(world.W * 0.5, world.H * 1.4, world.D * 0.5)
 		fly_yaw = 0.0
 		fly_pitch = -0.6
-		# fog out the streaming window's far edge so it fades into sky, not a wall
-		e.fog_density = 4.2 / float(world.W)
+		# light distance fog so the streaming window's far edge fades into sky
+		e.fog_density = 1.8 / float(world.W)
 		view.set_stream_origin(0, 0)
 		_capture_mouse(true)
 		_place_fly()

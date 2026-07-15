@@ -105,18 +105,19 @@ Creative-mode free flight (no gravity / collision):
   RenderingDevice and the emit pass writes the MultiMesh instance buffers
   directly in VRAM (`multimesh_get_buffer_rd_rid`); the only per-frame
   readback is a 16-byte instance counter.
-- **1 m blocks with voxel-tinted tops** (default): the fine 5 cm sim is drawn as
-  chunky 1 m blocks, but each block's **top is skinned with its real 5 cm surface
-  voxels**, so the blocky terrain still shows per-voxel colour detail. One
-  thread per 5 cm column lays a 5 cm tile at the block-rounded top height,
-  tinted by its own surface voxel (material + wet/dry saturation + per-voxel
-  jitter); the block bodies/sides stay solid 1 m cubes (one per 20x20x20 block,
-  coloured by their centre material — grass over soil over stone). Draw cost is
-  the surface area (a few million tiles), not the sim volume (billions of
-  voxels), so the map can be large while the detailed hydrology runs underneath.
-  Press **B** (or `VOX_RENDER=voxel`) for the full per-5 cm-voxel renderer — the
-  finest detail, all faces, but many more instances. Instance buffers are sized
-  for both, so **B** flips modes live with no reallocation.
+- **1 m blocks with voxel-skinned faces** (default): the fine 5 cm sim is drawn
+  as chunky 1 m blocks (flat 1 m tops, 1 m-aligned steps), but **every visible
+  face is skinned with its real 5 cm voxels** — so cliff sides show the strata
+  (grass on top, soil, then stone) at full per-voxel detail, not flat colour.
+  One thread per 5 cm column emits a shell of 5 cm voxel-cubes for the block-
+  snapped terrain: the top voxel plus, where a neighbouring block is shorter,
+  the side voxels down to it, each tinted by its own voxel (material + wet/dry
+  saturation + jitter). Interior voxels are occluded so none are emitted; draw
+  cost is the (block-snapped) surface area, not the sim volume, so the map can
+  be large while the detailed hydrology runs underneath. Press **B** (or
+  `VOX_RENDER=voxel`) for the full per-5 cm-voxel renderer — the true 5 cm shape
+  (fine steps) rather than chunky blocks. Instance buffers are sized for both,
+  so **B** flips modes live with no reallocation.
 - **Streaming (endless world)**: the sim buffer is a **window that follows the
   camera**. As you fly near an edge, the window recenters on you and regenerates
   at the new world origin; because worldgen is deterministic per world-coordinate
