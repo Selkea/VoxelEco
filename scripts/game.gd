@@ -28,11 +28,19 @@ func _init() -> void:
 	_add_action("restart", [KEY_R])
 	_add_action("cut", [KEY_C])
 
+const CHUNK_VOX := 400   # 20 subchunks x 20 voxels = 20 m chunk edge
+
 func _world_size() -> Vector3i:
-	var sz := OS.get_environment("VOX_SIZE").to_int()
 	# height is a FIXED vertical extent (voxels), decoupled from horizontal span:
 	# a streamed world grows sideways in chunks, not upward. VOX_H overrides it.
 	var hh := OS.get_environment("VOX_H").to_int()
+	# VOX_CHUNKS=n makes an n x n grid of whole 20 m chunks (a fixed multi-chunk
+	# world); VOX_SIZE=n makes an arbitrary n-voxel-wide world.
+	var nc := OS.get_environment("VOX_CHUNKS").to_int()
+	if nc > 0:
+		var wv := nc * CHUNK_VOX
+		return Vector3i(wv, wv, hh if hh > 0 else 128)
+	var sz := OS.get_environment("VOX_SIZE").to_int()
 	if sz > 0:
 		return Vector3i(sz, sz, hh if hh > 0 else maxi(24, sz * 3 / 8))
 	return Vector3i(512, 512, hh if hh > 0 else 192)
@@ -326,6 +334,35 @@ func _run_sim_test() -> void:
 				parts.append("%s:%d" % [k, by[k]])
 			print("  tick %d: %s" % [t + 1, ", ".join(parts)])
 			prev = gw.cell.duplicate()
+		get_tree().quit()
+		return
+	if OS.get_environment("VOX_SEAMTEST") != "":
+		# streaming seam check: a chunk generated STANDALONE at its world origin
+		# must be bit-identical to that same region generated inside a larger
+		# world. If so, chunks can be generated independently and still tile
+		# seamlessly — the core guarantee the streaming runtime relies on.
+		var Hh := 96
+		var big := GpuWorld.new(777, 800, 800, Hh)   # 2x2 chunks, generated whole
+		var one := GpuWorld.new(777, 400, 400, Hh)    # one chunk, standalone
+		one.regen(400, 0)                             # as world-chunk (1,0)
+		if not big.gpu_ok or not one.gpu_ok:
+			print("SEAMTEST: no GPU"); get_tree().quit(); return
+		big.sync_cells(); one.sync_cells()
+		var mismatch := 0
+		var solid := 0
+		for z in range(400):
+			for y in range(Hh):
+				var brow := (400) + z * 800 + y * 800 * 800
+				var orow := z * 400 + y * 400 * 400
+				for x in range(400):
+					var a: int = one.cell[orow + x]
+					var b: int = big.cell[brow + x]
+					if a != VoxWorld.AIR: solid += 1
+					if a != b: mismatch += 1
+		print("SEAMTEST: chunk(1,0) standalone vs in-context: %d of %d cells differ (%d non-air)" \
+			% [mismatch, 400 * 400 * Hh, solid])
+		print("SEAMLESS" if mismatch == 0 else "SEAM MISMATCH")
+		big.free_gpu(); one.free_gpu()
 		get_tree().quit()
 		return
 	if OS.get_environment("VOX_SHORETEST") != "":

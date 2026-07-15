@@ -29,7 +29,11 @@ layout(push_constant) uniform Params {
 	uint seedv; uint rain_thr; uint mode; uint offset;
 	// calibrated per-tick probabilities (rain is an integer threshold out of
 	// 2^24 for finer resolution than a float32 near zero)
-	float evap_prob; float erode_prob; uint cut_z; uint _pad1;
+	float evap_prob; float erode_prob; uint cut_z;
+	// world-space origin of this buffer, in voxels (chunk streaming): worldgen
+	// samples noise at (local + origin) so a chunk generated at any world
+	// position lines up seamlessly with its neighbours. int via bit-reinterpret.
+	uint gen_ox; uint gen_oz; uint _pad1;
 } p;
 
 const uint CHUNK = 16u;
@@ -536,10 +540,9 @@ void do_gen() {
 	if (id >= p.W * p.D) { return; }
 	uint x = id % p.W;
 	uint z = id / p.W;
-	// world coordinates of this column. For the current single-window world this
-	// equals the local index; a chunk's world origin gets added here when the
-	// streaming runtime lands, and the seamless noise makes the seams invisible.
-	vec2 w = vec2(float(x), float(z));
+	// world coordinates of this column = local index + this buffer's world
+	// origin. The seamless world-space noise makes chunk seams invisible.
+	vec2 w = vec2(float(int(x) + int(p.gen_ox)), float(int(z) + int(p.gen_oz)));
 	float hgt = world_height(w);
 	// signed math throughout: with uint, top-4 underflows for shallow
 	// columns and fills them with stone to the sky

@@ -34,6 +34,10 @@ var _cell_groups := 0     # one thread per cell (emit)
 var _pack_groups := 0
 
 var rules_mask := 0   # debug: bit0 gravity, 1 diagonal, 2 lateral, 3 evap, 4 erosion; 0 = all
+# world-space origin of this buffer in voxels — worldgen samples noise at
+# (local + origin) so a chunk generates seamlessly at any world position.
+var gen_origin_x := 0
+var gen_origin_z := 0
 
 ## grids past this size generate on the GPU instead of a GDScript loop
 const CPU_GEN_LIMIT := 400_000
@@ -101,9 +105,24 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 		var cl := rd.compute_list_begin()
 		rd.compute_list_bind_compute_pipeline(cl, pipeline)
 		rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
-		rd.compute_list_set_push_constant(cl, _pc(4, 0), 48)
+		rd.compute_list_set_push_constant(cl, _pc(4, 0), PC_SIZE)
 		rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 		rd.compute_list_end()
+
+## regenerate the whole buffer as if its lower corner sits at world (ox, oz).
+## This is the chunk-streaming primitive: the same kernel fills any chunk at any
+## world position, and the seamless world-space noise makes the joins invisible.
+func regen(ox: int, oz: int) -> void:
+	gen_origin_x = ox
+	gen_origin_z = oz
+	if not gpu_ok:
+		return
+	var cl := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(cl, pipeline)
+	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
+	rd.compute_list_set_push_constant(cl, _pc(4, 0), PC_SIZE)
+	rd.compute_list_dispatch(cl, _col_groups, 1, 1)
+	rd.compute_list_end()
 
 func _rebuild_uniform_set() -> void:
 	var bufs := [cells_buf, pack_buf, stats_buf, dirty_buf,
@@ -126,11 +145,13 @@ func bind_instance_buffers(solid_rid: RID, water_rid: RID) -> void:
 	_water_target = water_rid
 	_rebuild_uniform_set()
 
+const PC_SIZE := 56   # push constant byte size (must match the shader struct)
+
 func _pc(mode: int, offset: int) -> PackedByteArray:
-	# 48-byte push constant: 8 uints + 2 floats + 2 pad. rain is an integer
-	# threshold out of 2^24; evap/erode are float probabilities.
+	# 56-byte push constant: 11 uints + 2 floats + gen origin (2) + 1 pad. rain
+	# is an integer threshold out of 2^24; evap/erode are float probabilities.
 	var pc := PackedByteArray()
-	pc.resize(48)
+	pc.resize(PC_SIZE)
 	pc.encode_u32(0, W)
 	pc.encode_u32(4, H)
 	pc.encode_u32(8, D)
@@ -142,6 +163,8 @@ func _pc(mode: int, offset: int) -> PackedByteArray:
 	pc.encode_float(32, evap_prob)
 	pc.encode_float(36, erode_prob)
 	pc.encode_u32(40, cut_z)
+	pc.encode_s32(44, gen_origin_x)   # signed origin (two's complement); int(uint) in-shader
+	pc.encode_s32(48, gen_origin_z)
 	return pc
 
 func step() -> void:
@@ -162,10 +185,10 @@ func run(n: int) -> void:
 	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
 	for k in range(n):
 		tick_count += 1
-		rd.compute_list_set_push_constant(cl, _pc(1, 0), 48)      # rain
+		rd.compute_list_set_push_constant(cl, _pc(1, 0), PC_SIZE)      # rain
 		rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 		rd.compute_list_add_barrier(cl)
-		rd.compute_list_set_push_constant(cl, _pc(0, tick_count & 1), 48)  # physics
+		rd.compute_list_set_push_constant(cl, _pc(0, tick_count & 1), PC_SIZE)  # physics
 		rd.compute_list_dispatch(cl, _step_groups.x, _step_groups.y, _step_groups.z)
 		rd.compute_list_add_barrier(cl)
 	rd.compute_list_end()
@@ -198,7 +221,7 @@ func dispatch_emit() -> PackedInt32Array:
 	var cl := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(cl, pipeline)
 	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
-	rd.compute_list_set_push_constant(cl, _pc(3, 0), 48)
+	rd.compute_list_set_push_constant(cl, _pc(3, 0), PC_SIZE)
 	rd.compute_list_dispatch(cl, _cell_groups, 1, 1)
 	rd.compute_list_end()
 	var counts := rd.buffer_get_data(inst_count_buf, 0, 8).to_int32_array()
@@ -212,7 +235,7 @@ func sync_cells() -> void:
 	var cl := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(cl, pipeline)
 	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
-	rd.compute_list_set_push_constant(cl, _pc(2, 0), 48)          # pack
+	rd.compute_list_set_push_constant(cl, _pc(2, 0), PC_SIZE)          # pack
 	rd.compute_list_dispatch(cl, _pack_groups, 1, 1)
 	rd.compute_list_end()
 	cell = rd.buffer_get_data(pack_buf).slice(0, cell.size())
