@@ -77,8 +77,10 @@ Vegetation and animals layer on top of this abiotic substrate later.
   chunk-scale landform band plus per-subchunk relief. Voxels then fill between
   those subchunk samples one of two ways (**T** toggles, title bar shows which):
   **blended** smoothly interpolates the surrounding subchunk heights and adds
-  fine voxel roughness (smooth natural terrain), or **terraced** gives each
-  subchunk a flat 1 m plateau (hard-edged, built-from-1m-blocks look). Both are
+  fine voxel roughness (smooth natural terrain), or **terraced** snaps each
+  subchunk to a flat 1 m plateau at a 1 m-quantised height so the world reads as
+  clean **1 m voxel-cubes** (a subchunk resembles a voxel) — while the
+  physics/water/erosion keep simulating on the 5 cm grid underneath. Both are
   pure functions of world (x,z) + seed sampling only continuous world-space
   noise (never the world size or a fixed centre), so the terrain is **seamless
   across any chunk boundary** and comes out identical however the world is

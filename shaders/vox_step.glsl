@@ -116,9 +116,12 @@ float erosion_mult(uint m) {
 float repose(uint m) {
 	if (m == SAND) return 0.55;
 	if (m == MUD) return 0.5;
-	if (m == SOIL) return 0.03;
-	return 0.0;                       // GRASS: rooted, never slumps sideways
-	                                  // (still falls straight down if undercut)
+	// SOIL and GRASS are fully cohesive: they hold any slope (even the sharp 1 m
+	// cliffs of terraced worldgen) and never slump grain-by-grain. They still
+	// fall straight down when undercut, and erosion loosens soil into SAND —
+	// which is the material that actually slumps. Loose/wet material flows;
+	// intact ground holds.
+	return 0.0;                       // SOIL + GRASS
 }
 
 const uint ABSORB = 34u;   // pore-fill added when a water voxel soaks in (~3 to saturate)
@@ -463,8 +466,14 @@ void do_emit() {
 		if (slot < cap_water) { write_inst(true, slot, origin, vec4(1.0)); }
 		return;
 	}
-	// per-voxel tint jitter + crude AO from buried-ness
-	float jit = 1.0 + (float(pcg(id * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
+	// tint jitter + crude AO from buried-ness. Per-voxel normally (natural
+	// texture on smooth terrain), but per-SUBCHUNK in terraced mode so each 1 m
+	// cube stays a uniform colour and reads as a clean block, not 5 cm speckle.
+	uint jit_seed = id;
+	if ((p.gen_flags & 1u) != 0u) {
+		jit_seed = ((x / 20u) * 73856093u) ^ ((z / 20u) * 19349663u) ^ ((y / 20u) * 83492791u);
+	}
+	float jit = 1.0 + (float(pcg(jit_seed * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
 	float ao = 1.0 - float(solid_n) * 0.05;
 	vec3 base = mat_color(m);
 	// darken the dry-able ground (soil/sand) toward wet earth as it saturates;
@@ -542,9 +551,11 @@ float world_height(vec2 w) {
 	float H = float(p.H);
 	vec2 s = vec2(float(p.seedv & 0xFFFFu), float((p.seedv >> 16) & 0xFFFFu)) * 0.618;
 	if ((p.gen_flags & 1u) != 0u) {
-		// TERRACED: one flat height per subchunk footprint, quantised to voxels
+		// TERRACED as 1 m voxel-cubes: flat per-subchunk footprint AND the height
+		// snapped to 1 m (SUBCHUNK_VOX) steps, so every subchunk reads as a clean
+		// 1 m cube. The physics/water/erosion below still run at the 5 cm grid.
 		vec2 sc = floor(w / SUBCHUNK_VOX);
-		return floor(subchunk_height(sc, H, s));
+		return floor(subchunk_height(sc, H, s) / SUBCHUNK_VOX) * SUBCHUNK_VOX;
 	}
 	// BLENDED: bilinear (smoothstep) interpolation of the 4 surrounding subchunk
 	// heights, then a couple voxels of fine roughness for the finest blend
