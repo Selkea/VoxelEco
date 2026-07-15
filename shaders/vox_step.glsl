@@ -522,8 +522,12 @@ void do_block_emit() {
 			if (slot < cap_water) { write_inst(true, slot, center, vec4(1.0), 20.0); }
 		} else {
 			float shade = 0.74 + 0.26 * clamp(float(y0) / float(p.H), 0.0, 1.0);
+			// per-cube tint jitter (hash of block position) so each 1m block
+			// varies individually, like the per-voxel tint of the fine renderer
+			uint h = pcg((x0 * 73856093u) ^ (y0 * 19349663u) ^ (z0 * 83492791u));
+			float jit = 1.0 + (float(h & 255u) / 255.0 * 0.24 - 0.12);
 			uint slot = atomicAdd(n_solid, 1u);
-			if (slot < cap_solid) { write_inst(false, slot, center, vec4(mat_color(m) * shade, 1.0), 20.0); }
+			if (slot < cap_solid) { write_inst(false, slot, center, vec4(mat_color(m) * shade * jit, 1.0), 20.0); }
 		}
 	}
 }
