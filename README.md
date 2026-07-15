@@ -105,8 +105,8 @@ Creative-mode free flight (no gravity / collision):
   RenderingDevice and the emit pass writes the MultiMesh instance buffers
   directly in VRAM (`multimesh_get_buffer_rd_rid`); the only per-frame
   readback is a 16-byte instance counter.
-- **1 m blocks with voxel-tinted tops**: the fine 5 cm sim is drawn as chunky
-  1 m blocks, but each block's **top is skinned with its real 5 cm surface
+- **1 m blocks with voxel-tinted tops** (default): the fine 5 cm sim is drawn as
+  chunky 1 m blocks, but each block's **top is skinned with its real 5 cm surface
   voxels**, so the blocky terrain still shows per-voxel colour detail. One
   thread per 5 cm column lays a 5 cm tile at the block-rounded top height,
   tinted by its own surface voxel (material + wet/dry saturation + per-voxel
@@ -114,7 +114,9 @@ Creative-mode free flight (no gravity / collision):
   coloured by their centre material — grass over soil over stone). Draw cost is
   the surface area (a few million tiles), not the sim volume (billions of
   voxels), so the map can be large while the detailed hydrology runs underneath.
-  `VOX_RENDER=block` draws the coarser 1 m-block-with-voxel-tinted-tops path.
+  Press **B** (or `VOX_RENDER=voxel`) for the full per-5 cm-voxel renderer — the
+  finest detail, all faces, but many more instances. Instance buffers are sized
+  for both, so **B** flips modes live with no reallocation.
 - **Streaming (endless world)**: the sim buffer is a **window that follows the
   camera**. As you fly near an edge, the window recenters on you and regenerates
   at the new world origin; because worldgen is deterministic per world-coordinate
