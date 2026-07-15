@@ -13,14 +13,21 @@ const MAX_TICKS_PER_FRAME := 96   # keeps extreme speeds from death-spiraling
 var speed_mult := 1               # 0 = paused
 var time_acc := 0.0
 var mesh_acc := 0.0
-var orbit := 0.7            # camera yaw
+var orbit := 0.7            # camera yaw (screenshot/diorama camera only)
 var pitch := 0.42          # lower angle reads the terrain relief
 var dist := 92.0   # scaled to world size in _ready
 var dragging := false
 var _title_acc := 0.0
+# creative-mode fly camera (interactive play): free-fly, no gravity/collision
+var interactive := false
+var fly_pos := Vector3()
+var fly_yaw := 0.0         # radians, mouse-look
+var fly_pitch := -0.5
+var fly_speed := 30.0      # metres... voxels / second (scroll to change)
+var mouse_captured := false
 
 func _init() -> void:
-	_add_action("pause", [KEY_SPACE])
+	_add_action("pause", [KEY_P])
 	for i in range(SPEEDS.size()):
 		_add_action("speed_%d" % (i + 1), [KEY_1 + i])
 	_add_action("rain_up", [KEY_E])
@@ -28,6 +35,13 @@ func _init() -> void:
 	_add_action("restart", [KEY_R])
 	_add_action("cut", [KEY_C])
 	_add_action("genmode", [KEY_T])   # toggle blended / terraced worldgen
+	# creative fly controls (Minecraft-style): WASD move, Space/Shift up/down
+	_add_action("fly_fwd", [KEY_W])
+	_add_action("fly_back", [KEY_S])
+	_add_action("fly_left", [KEY_A])
+	_add_action("fly_right", [KEY_D])
+	_add_action("fly_up", [KEY_SPACE])
+	_add_action("fly_down", [KEY_SHIFT])
 
 const CHUNK_VOX := 400   # 20 blocks x 20 voxels = 20 m chunk edge
 
@@ -44,9 +58,11 @@ func _world_size() -> Vector3i:
 	var sz := OS.get_environment("VOX_SIZE").to_int()
 	if sz > 0:
 		return _clamp_cells(Vector3i(sz, sz, hh if hh > 0 else maxi(24, sz * 3 / 8)))
-	# big default map: 2800x2800x128 voxels (5cm) = 140x140x6.4 one-metre blocks,
-	# ~1.0B sim cells — right at the single-buffer ceiling (see _clamp_cells).
-	return Vector3i(2800, 2800, hh if hh > 0 else 128)
+	# default map: 1280x1280x128 voxels (5cm) = 64 m x 64 m, ~210M sim cells.
+	# Sized so the full per-voxel renderer flies smoothly; chunk streaming
+	# (next) extends it without growing the resident window. VOX_RENDER=block +
+	# a larger VOX_SIZE draws bigger fixed maps as coarse blocks.
+	return Vector3i(1280, 1280, hh if hh > 0 else 128)
 
 # A single GPU storage buffer's byte size is 32-bit in Godot, so the cells
 # buffer (4 bytes/cell) hard-caps at ~4 GB ≈ 1.05B cells no matter how much VRAM
@@ -108,9 +124,19 @@ func _ready() -> void:
 	add_child(sun)
 
 	cam = Camera3D.new()
+	cam.far = maxf(2000.0, world.W * 1.6)   # see across a big world
 	add_child(cam)
 	dist = world.W * 1.12
-	_place_cam()
+	interactive = not ("--sim" in OS.get_cmdline_user_args() or "--shot" in OS.get_cmdline_user_args())
+	if interactive:
+		# creative fly: start high over the middle, looking down into the world
+		fly_pos = Vector3(world.W * 0.5, world.H * 1.4, world.D * 0.5)
+		fly_yaw = 0.0
+		fly_pitch = -0.6
+		_capture_mouse(true)
+		_place_fly()
+	else:
+		_place_cam()
 
 	if OS.get_environment("VOX_GENPROBE") != "":
 		world.sync_cells()
@@ -139,6 +165,31 @@ func _ready() -> void:
 		_run_sim_test()
 	if "--shot" in OS.get_cmdline_user_args():
 		_take_screenshot()
+
+func _capture_mouse(on: bool) -> void:
+	mouse_captured = on
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED if on else Input.MOUSE_MODE_VISIBLE
+
+func _place_fly() -> void:
+	cam.position = fly_pos
+	cam.basis = Basis(Vector3.UP, fly_yaw) * Basis(Vector3.RIGHT, fly_pitch)
+
+## creative-mode free flight: WASD in the look direction, Space/Shift straight
+## up/down, Ctrl to sprint, scroll to change speed. No gravity, no collision.
+func _fly(dt: float) -> void:
+	if mouse_captured:
+		var basis := Basis(Vector3.UP, fly_yaw) * Basis(Vector3.RIGHT, fly_pitch)
+		var move := Vector3.ZERO
+		if Input.is_action_pressed("fly_fwd"): move -= basis.z
+		if Input.is_action_pressed("fly_back"): move += basis.z
+		if Input.is_action_pressed("fly_right"): move += basis.x
+		if Input.is_action_pressed("fly_left"): move -= basis.x
+		if Input.is_action_pressed("fly_up"): move += Vector3.UP
+		if Input.is_action_pressed("fly_down"): move -= Vector3.UP
+		if move.length() > 0.001:
+			var speed := fly_speed * (4.0 if Input.is_key_pressed(KEY_CTRL) else 1.0)
+			fly_pos += move.normalized() * speed * dt
+	_place_fly()
 
 func _place_cam() -> void:
 	var c := Vector3(world.W * 0.5, world.H * 0.22, world.D * 0.5)
@@ -194,7 +245,10 @@ func _process(dt: float) -> void:
 	if mesh_acc >= 0.07:       # refresh the render ~14 Hz
 		mesh_acc = 0.0
 		_refresh_view()
-	_place_cam()
+	if interactive:
+		_fly(dt)
+	else:
+		_place_cam()
 	_title_acc += dt
 	if _title_acc > 0.5:
 		_title_acc = 0.0
@@ -221,16 +275,20 @@ func _refresh_view(force := false) -> void:
 		view.rebuild(world.dirty_chunks)
 
 func _unhandled_input(event: InputEvent) -> void:
-	if event is InputEventMouseButton:
-		if event.button_index == MOUSE_BUTTON_LEFT:
-			dragging = event.pressed
+	if not interactive:
+		return
+	if event is InputEventMouseButton and event.pressed:
+		if event.button_index == MOUSE_BUTTON_LEFT and not mouse_captured:
+			_capture_mouse(true)                                  # click to re-grab
 		elif event.button_index == MOUSE_BUTTON_WHEEL_UP:
-			dist = maxf(30.0, dist - 6.0)
+			fly_speed = minf(fly_speed * 1.25, 500.0)             # faster
 		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-			dist = minf(220.0, dist + 6.0)
-	elif event is InputEventMouseMotion and dragging:
-		orbit -= event.relative.x * 0.007
-		pitch = clampf(pitch - event.relative.y * 0.007, 0.12, 1.45)
+			fly_speed = maxf(fly_speed / 1.25, 2.0)               # slower
+	elif event is InputEventMouseMotion and mouse_captured:
+		fly_yaw -= event.relative.x * 0.005
+		fly_pitch = clampf(fly_pitch - event.relative.y * 0.005, -1.55, 1.55)
+	elif event is InputEventKey and event.pressed and event.keycode == KEY_ESCAPE:
+		_capture_mouse(not mouse_captured)                        # Esc frees/grabs cursor
 
 func _add_action(action: String, keys: Array) -> void:
 	if InputMap.has_action(action):

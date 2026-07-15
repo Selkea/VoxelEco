@@ -101,7 +101,9 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	nbx = (W + 19) / 20
 	nby = (H + 19) / 20
 	nbz = (D + 19) / 20
-	block_render = OS.get_environment("VOX_RENDER") != "voxel"
+	# default: render ALL visible 5cm voxels; VOX_RENDER=block draws coarse 1m
+	# blocks with voxel-tinted tops (cheaper, for very large maps).
+	block_render = OS.get_environment("VOX_RENDER") == "block"
 	if block_render:
 		# one 5cm skin tile per column + one chunky body cube per block
 		solid_cap = W * D + nbx * nby * nbz

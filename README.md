@@ -11,15 +11,21 @@ Vegetation and animals layer on top of this abiotic substrate later.
 
 ## Controls
 
+Creative-mode free flight (no gravity / collision):
+
 | Input | Action |
 |---|---|
-| drag left mouse | Orbit the camera |
-| mouse wheel | Zoom |
-| Space | Pause / resume |
+| mouse | Look around |
+| W A S D | Fly forward / left / back / right (in the look direction) |
+| Space / Shift | Fly up / down |
+| Ctrl (hold) | Sprint (4x) |
+| mouse wheel | Fly speed down / up |
+| Esc | Release / re-grab the mouse cursor |
 | 1 – 7 | Speed: 1x / 2x / 4x / 8x / 16x / 32x / 64x (1x = real time) |
 | Q / E | Less / more rain (mm/hour) — the world starts **calm**; press E to make it rain |
 | C | Toggle a cross-section (see subsurface moisture / the water table) |
 | T | Toggle worldgen **blended** ↔ **terraced** (regenerates in place) |
+| P | Pause / resume |
 | R | Generate a fresh world |
 
 ## How it works
