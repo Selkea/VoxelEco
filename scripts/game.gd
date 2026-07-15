@@ -29,7 +29,7 @@ func _init() -> void:
 	_add_action("cut", [KEY_C])
 	_add_action("genmode", [KEY_T])   # toggle blended / terraced worldgen
 
-const CHUNK_VOX := 400   # 20 subchunks x 20 voxels = 20 m chunk edge
+const CHUNK_VOX := 400   # 20 blocks x 20 voxels = 20 m chunk edge
 
 func _world_size() -> Vector3i:
 	# height is a FIXED vertical extent (voxels), decoupled from horizontal span:

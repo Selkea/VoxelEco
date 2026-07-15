@@ -71,15 +71,15 @@ Vegetation and animals layer on top of this abiotic substrate later.
   vertex-coloured terrain and a translucent water surface — so interior
   voxels cost nothing.
 - **Hierarchical chunk-based worldgen** produces a finished landscape *at
-  rest*. Voxels group 20x20 into a **subchunk** (1 m) and 20x20 subchunks into
-  a **chunk** (20 m). The base heightfield is generated **at subchunk (1 m)
-  resolution** — one height per subchunk, "as if 1 subchunk = 1 voxel" — from a
-  chunk-scale landform band plus per-subchunk relief. Voxels then fill between
-  those subchunk samples one of two ways (**T** toggles, title bar shows which):
-  **blended** smoothly interpolates the surrounding subchunk heights and adds
-  fine voxel roughness (smooth natural terrain), or **terraced** snaps each
-  subchunk to a flat 1 m plateau at a 1 m-quantised height so the world reads as
-  clean **1 m voxel-cubes** (a subchunk resembles a voxel) — while the
+  rest*. Voxels group 20x20 into a **block** (1 m) and 20x20 blocks into a
+  **chunk** (20 m). The base heightfield is generated **at block (1 m)
+  resolution** — one height per block, "as if 1 block = 1 voxel" — from a
+  chunk-scale landform band plus per-block relief. The 5 cm voxels then fill
+  between those block heights one of two ways (**T** toggles, title bar shows
+  which), from the **same** heightfield: **blended** smooth-interpolates the
+  surrounding block heights (smooth natural terrain), or **terraced** snaps each
+  block to a flat 1 m plateau at a 1 m-quantised height so the world reads as
+  clean **1 m voxel-cubes** (a block resembles a voxel) — while the
   physics/water/erosion keep simulating on the 5 cm grid underneath. Both are
   pure functions of world (x,z) + seed sampling only continuous world-space
   noise (never the world size or a fixed centre), so the terrain is **seamless

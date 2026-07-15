@@ -466,14 +466,8 @@ void do_emit() {
 		if (slot < cap_water) { write_inst(true, slot, origin, vec4(1.0)); }
 		return;
 	}
-	// tint jitter + crude AO from buried-ness. Per-voxel normally (natural
-	// texture on smooth terrain), but per-SUBCHUNK in terraced mode so each 1 m
-	// cube stays a uniform colour and reads as a clean block, not 5 cm speckle.
-	uint jit_seed = id;
-	if ((p.gen_flags & 1u) != 0u) {
-		jit_seed = ((x / 20u) * 73856093u) ^ ((z / 20u) * 19349663u) ^ ((y / 20u) * 83492791u);
-	}
-	float jit = 1.0 + (float(pcg(jit_seed * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
+	// per-voxel tint jitter + crude AO from buried-ness
+	float jit = 1.0 + (float(pcg(id * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
 	float ao = 1.0 - float(solid_n) * 0.05;
 	vec3 base = mat_color(m);
 	// darken the dry-able ground (soil/sand) toward wet earth as it saturates;
@@ -516,59 +510,54 @@ float fbm(vec2 q) {
 	return v;   // ~0..1
 }
 
-// ---------- hierarchical terrain: chunk -> subchunk -> voxel ----------
-// Voxels are grouped 20x20 into a SUBCHUNK (1 m) and 20x20 subchunks into a
-// CHUNK (20 m). Surface height is a pure function of world (x,z) + seed that
-// sums three bands of continuous value-noise, one per level of the hierarchy.
-// Because it only samples world-space noise — never the world size or a fixed
-// centre — the topography is seamless across every chunk boundary and comes
-// out identical however the world is windowed or streamed (streaming-ready).
-const float SUBCHUNK_VOX = 20.0;    // voxels per subchunk edge (1 m)
-const float CHUNK_VOX    = 400.0;   // voxels per chunk edge (20 subchunks, 20 m)
+// ---------- hierarchical terrain: chunk -> block -> voxel ----------
+// Voxels are grouped 20x20 into a BLOCK (1 m) and 20x20 blocks into a CHUNK
+// (20 m). Surface height is a pure function of world (x,z) + seed that sums
+// bands of continuous value-noise per level of the hierarchy. Because it only
+// samples world-space noise — never the world size or a fixed centre — the
+// topography is seamless across every chunk boundary and comes out identical
+// however the world is windowed or streamed (streaming-ready).
+const float BLOCK_VOX = 20.0;       // voxels per block edge (1 m)
+const float CHUNK_VOX = 400.0;      // voxels per chunk edge (20 blocks, 20 m)
 
-// Terrain height sampled at a SUBCHUNK grid point (sc in subchunk units, i.e.
-// world voxels / 20). This is the base heightfield resolution — one value per
-// 1 m subchunk — so the world generates "as if 1 subchunk = 1 voxel". It sums
-// the CHUNK band (broad landforms, squared toward its tails so terrain spends
-// time as plains and peaks) and a per-subchunk variation band.
-float subchunk_height(vec2 sc, float H, vec2 s) {
-	// CHUNK band: 20 subchunks per chunk, so sc/20 == world/CHUNK_VOX
-	float cn = fbm(sc / 20.0 + s) - 0.5;
+// Terrain height sampled at a BLOCK grid point (bc in block units, i.e. world
+// voxels / 20). This is the base heightfield resolution — one value per 1 m
+// block — so the world generates "as if 1 block = 1 voxel". It sums the CHUNK
+// band (broad landforms, squared toward its tails so terrain spends time as
+// plains and peaks) and a per-block variation band.
+float block_height(vec2 bc, float H, vec2 s) {
+	// CHUNK band: 20 blocks per chunk, so bc/20 == world/CHUNK_VOX
+	float cn = fbm(bc / 20.0 + s) - 0.5;
 	float chunk = cn * (1.0 + 2.4 * abs(cn));
-	// per-subchunk relief on the subchunk lattice
-	float sub = fbm(sc * 0.5 + s * 2.0 + 31.7) - 0.5;
-	return H * 0.42 + chunk * H * 1.35 + sub * H * 0.09;
+	// per-block relief on the block lattice
+	float blk = fbm(bc * 0.5 + s * 2.0 + 31.7) - 0.5;
+	return H * 0.42 + chunk * H * 1.35 + blk * H * 0.09;
 }
 
-// Surface height at a voxel column. The base terrain lives on the subchunk
-// (1 m) grid; the voxels fill between those samples one of two ways (gen_flags
-// bit0): BLENDED smoothly interpolates the 4 surrounding subchunk heights and
-// adds fine voxel roughness, or TERRACED gives each subchunk a flat plateau at
-// its own height (hard 1 m cliffs between subchunks). Both are pure functions
-// of world (x,z)+seed, and the subchunk grid aligns to chunk edges (20 per
-// chunk), so either mode tiles seamlessly across chunks.
+// Surface height at a voxel column. BOTH modes read the SAME block (1 m)
+// heightfield — they differ only in how the 5 cm voxels fill between block
+// samples (gen_flags bit0): TERRACED gives each block a flat plateau snapped to
+// 1 m steps (clean 1 m voxel-cubes), BLENDED smooth-interpolates the 4
+// surrounding block heights (the same terrain, just smoothed — no extra bands).
+// Both are pure functions of world (x,z)+seed and the block grid aligns to
+// chunk edges (20 per chunk), so either tiles seamlessly.
 float world_height(vec2 w) {
 	float H = float(p.H);
 	vec2 s = vec2(float(p.seedv & 0xFFFFu), float((p.seedv >> 16) & 0xFFFFu)) * 0.618;
 	if ((p.gen_flags & 1u) != 0u) {
-		// TERRACED as 1 m voxel-cubes: flat per-subchunk footprint AND the height
-		// snapped to 1 m (SUBCHUNK_VOX) steps, so every subchunk reads as a clean
-		// 1 m cube. The physics/water/erosion below still run at the 5 cm grid.
-		vec2 sc = floor(w / SUBCHUNK_VOX);
-		return floor(subchunk_height(sc, H, s) / SUBCHUNK_VOX) * SUBCHUNK_VOX;
+		// TERRACED: flat per-block footprint, height snapped to 1 m steps
+		vec2 bc = floor(w / BLOCK_VOX);
+		return floor(block_height(bc, H, s) / BLOCK_VOX) * BLOCK_VOX;
 	}
-	// BLENDED: bilinear (smoothstep) interpolation of the 4 surrounding subchunk
-	// heights, then a couple voxels of fine roughness for the finest blend
-	vec2 scf = w / SUBCHUNK_VOX;
-	vec2 i = floor(scf);
-	vec2 f = scf - i;
+	// BLENDED: bilinear (smoothstep) interpolation of the same 4 block heights
+	vec2 bcf = w / BLOCK_VOX;
+	vec2 i = floor(bcf);
+	vec2 f = bcf - i;
 	vec2 u = f * f * (3.0 - 2.0 * f);
-	float h = mix(
-		mix(subchunk_height(i, H, s),                subchunk_height(i + vec2(1.0, 0.0), H, s), u.x),
-		mix(subchunk_height(i + vec2(0.0, 1.0), H, s), subchunk_height(i + vec2(1.0, 1.0), H, s), u.x),
+	return mix(
+		mix(block_height(i, H, s),                block_height(i + vec2(1.0, 0.0), H, s), u.x),
+		mix(block_height(i + vec2(0.0, 1.0), H, s), block_height(i + vec2(1.0, 1.0), H, s), u.x),
 		u.y);
-	float vox = vnoise(w * 0.13 + s * 4.0 + 91.3) - 0.5;
-	return h + vox * H * 0.016;
 }
 
 // one thread per column: carve the whole column
