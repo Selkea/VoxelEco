@@ -460,7 +460,10 @@ void do_emit() {
 		if (is_water ? (nm == AIR) : (nm == AIR || nm == WATER)) { exposed = true; }
 	}
 	if (!exposed) { return; }
-	vec3 origin = vec3(float(x) + 0.5, float(y) + 0.5, float(z) + 0.5);
+	// place the voxel at its WORLD position (buffer + this window's origin) so a
+	// streamed window renders where the camera actually is
+	vec3 origin = vec3(float(int(x) + int(p.gen_ox)) + 0.5, float(y) + 0.5,
+			float(int(z) + int(p.gen_oz)) + 0.5);
 	if (is_water) {
 		uint slot = atomicAdd(n_water, 1u);
 		if (slot < cap_water) { write_inst(true, slot, origin, vec4(1.0), 1.0); }
@@ -516,7 +519,8 @@ void do_block_emit() {
 			m = MAT(cells[cidx(cx, min(y0 + 10u, p.H - 1u), cz)]);
 			if (m == AIR) { m = SOIL; }
 		}
-		vec3 center = vec3(float(x0) + 10.0, float(y0) + 10.0, float(z0) + 10.0);
+		vec3 center = vec3(float(int(x0) + int(p.gen_ox)) + 10.0, float(y0) + 10.0,
+				float(int(z0) + int(p.gen_oz)) + 10.0);
 		if (m == WATER) {
 			uint slot = atomicAdd(n_water, 1u);
 			if (slot < cap_water) { write_inst(true, slot, center, vec4(1.0), 20.0); }
@@ -574,8 +578,9 @@ void do_skin_emit() {
 	if (csy < 0) { csy = sy; }
 	uint ntop = max((uint(csy) + 10u) / 20u, 1u);
 	float topf = float(ntop * 20u);
+	float wox = float(int(p.gen_ox)), woz = float(int(p.gen_oz));   // window world origin
 	// skin tile (5 cm) sitting on the block top, tinted by this column's surface
-	vec3 sc = vec3(float(x) + 0.5, topf + 0.5, float(z) + 0.5);
+	vec3 sc = vec3(float(x) + wox + 0.5, topf + 0.5, float(z) + woz + 0.5);
 	if (sm == WATER) {
 		uint slot = atomicAdd(n_water, 1u);
 		if (slot < cap_water) { write_inst(true, slot, sc, vec4(1.0), 1.0); }
@@ -589,7 +594,7 @@ void do_skin_emit() {
 			uint y0 = by * 20u;
 			uint m = MAT(cells[cidx(cx, min(y0 + 10u, p.H - 1u), cz)]);
 			if (m == AIR) { m = SOIL; }
-			vec3 center = vec3(float(bx * 20u) + 10.0, float(y0) + 10.0, float(bz * 20u) + 10.0);
+			vec3 center = vec3(float(bx * 20u) + wox + 10.0, float(y0) + 10.0, float(bz * 20u) + woz + 10.0);
 			if (m == WATER) {
 				uint s = atomicAdd(n_water, 1u);
 				if (s < cap_water) { write_inst(true, s, center, vec4(1.0), 20.0); }

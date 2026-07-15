@@ -17,8 +17,8 @@ Creative-mode free flight (no gravity / collision):
 |---|---|
 | mouse | Look around |
 | W A S D | Fly forward / left / back / right (in the look direction) |
-| Space / Shift | Fly up / down |
-| Ctrl (hold) | Sprint (4x) |
+| Space / Ctrl | Fly up / down |
+| Shift (hold) | Sprint (4x) |
 | mouse wheel | Fly speed down / up |
 | Esc | Release / re-grab the mouse cursor |
 | 1 – 7 | Speed: 1x / 2x / 4x / 8x / 16x / 32x / 64x (1x = real time) |
@@ -113,17 +113,24 @@ Creative-mode free flight (no gravity / collision):
   coloured by their centre material — grass over soil over stone). Draw cost is
   the surface area (a few million tiles), not the sim volume (billions of
   voxels), so the map can be large while the detailed hydrology runs underneath.
-  `VOX_RENDER=voxel` falls back to the full per-5 cm-voxel renderer.
-- **Scale**: the default world is **2800x2800x128 voxels at ~5 cm** = a
-  140 m x 140 m x 6.4 m plot rendered as **140x140 one-metre blocks** (~1.0B
-  sim cells). That is right at a hard ceiling: **a single GPU storage buffer is
-  32-bit-sized in Godot**, so the cells buffer (4 bytes/cell) caps at ~4 GB ≈
-  **1.05B cells** no matter how much VRAM the card has — past that it silently
-  truncates, so oversized requests are clamped with a warning. `VOX_SIZE` /
-  `VOX_H` pick other dimensions within that budget. Breaking this ceiling for a
-  genuinely huge (10x+) world needs **chunk streaming** — a window of chunks
-  simulated around the camera — which is the next milestone (the gen is already
-  chunk-local and seamless for it).
+  `VOX_RENDER=block` draws the coarser 1 m-block-with-voxel-tinted-tops path.
+- **Streaming (endless world)**: the sim buffer is a **window that follows the
+  camera**. As you fly near an edge, the window recenters on you and regenerates
+  at the new world origin; because worldgen is deterministic per world-coordinate
+  (verified bit-exact seamless), the overlapping terrain is identical, so the
+  world scrolls seamlessly and extends forever. The emit writes voxels at their
+  **world** positions (buffer + window origin) so the render lands where the
+  camera is. Distance fog fades the window's far edge into sky. *(The window's
+  live sim state resets on recenter — a full-window regen; state-preserving
+  toroidal streaming is a future refinement.)*
+- **Scale**: the default fly window is **1280x1280x128 voxels at ~5 cm** = a
+  64 m x 64 m x 6.4 m plot (~210M sim cells), sized so the full per-voxel
+  renderer flies smoothly. A single fixed (non-streamed) map is capped by a hard
+  ceiling: **a single GPU storage buffer is 32-bit-sized in Godot**, so the
+  cells buffer (4 bytes/cell) tops out at ~4 GB ≈ **1.05B cells** regardless of
+  VRAM — past that it silently truncates, so oversized `VOX_SIZE` requests are
+  clamped with a warning. Streaming sidesteps this by keeping the resident
+  window small while the world itself is unbounded.
 
 ## Physical scale & calibration
 

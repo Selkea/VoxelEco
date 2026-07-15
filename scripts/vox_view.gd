@@ -94,6 +94,16 @@ func set_visible_counts(ns: int, nw: int) -> void:
 	solid_mm.multimesh.visible_instance_count = ns
 	water_mm.multimesh.visible_instance_count = nw
 
+## streaming: the emit writes voxels at world coords [origin, origin+W); move the
+## instance AABBs there so the GPU-written instances aren't frustum-culled away
+func set_stream_origin(ox: int, oz: int) -> void:
+	if not use_instances:
+		return
+	var a := AABB(Vector3(ox - 16, -16, oz - 16),
+			Vector3(world.W + 32, world.H + 32, world.D + 32))
+	solid_mm.custom_aabb = a
+	water_mm.custom_aabb = a
+
 func _alloc_chunks() -> void:
 	for mi in solid_chunks + water_chunks:
 		mi.queue_free()

@@ -41,7 +41,7 @@ func _init() -> void:
 	_add_action("fly_left", [KEY_A])
 	_add_action("fly_right", [KEY_D])
 	_add_action("fly_up", [KEY_SPACE])
-	_add_action("fly_down", [KEY_SHIFT])
+	_add_action("fly_down", [KEY_CTRL])
 
 const CHUNK_VOX := 400   # 20 blocks x 20 voxels = 20 m chunk edge
 
@@ -133,6 +133,9 @@ func _ready() -> void:
 		fly_pos = Vector3(world.W * 0.5, world.H * 1.4, world.D * 0.5)
 		fly_yaw = 0.0
 		fly_pitch = -0.6
+		# fog out the streaming window's far edge so it fades into sky, not a wall
+		e.fog_density = 4.2 / float(world.W)
+		view.set_stream_origin(0, 0)
 		_capture_mouse(true)
 		_place_fly()
 	else:
@@ -170,6 +173,35 @@ func _capture_mouse(on: bool) -> void:
 	mouse_captured = on
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED if on else Input.MOUSE_MODE_VISIBLE
 
+func _chunk_snap(v: float) -> int:
+	return int(floor(v / CHUNK_VOX)) * CHUNK_VOX
+
+## chunk streaming: the sim buffer is a window that follows the camera. When the
+## camera drifts near an edge, recenter the window on it and regenerate at the
+## new world origin. Because worldgen is deterministic per world-coordinate, the
+## overlapping terrain is identical, so the world scrolls seamlessly and extends
+## forever. (The window's live sim state resets on recenter — a full-window
+## regen; state-preserving toroidal streaming is a later refinement.)
+func _stream() -> void:
+	if not (world is GpuWorld) or not view.use_instances:
+		return
+	var gw := world as GpuWorld
+	var margin := world.W * 0.16
+	var ox := gw.gen_origin_x
+	var oz := gw.gen_origin_z
+	var moved := false
+	if fly_pos.x - ox < margin or fly_pos.x - ox > world.W - margin:
+		ox = _chunk_snap(fly_pos.x - world.W * 0.5)
+		moved = true
+	if fly_pos.z - oz < margin or fly_pos.z - oz > world.D - margin:
+		oz = _chunk_snap(fly_pos.z - world.D * 0.5)
+		moved = true
+	if moved:
+		gw.regen(ox, oz)
+		gw.reset_water_stats()
+		view.set_stream_origin(ox, oz)
+		_refresh_view(true)
+
 func _place_fly() -> void:
 	cam.position = fly_pos
 	cam.basis = Basis(Vector3.UP, fly_yaw) * Basis(Vector3.RIGHT, fly_pitch)
@@ -187,7 +219,7 @@ func _fly(dt: float) -> void:
 		if Input.is_action_pressed("fly_up"): move += Vector3.UP
 		if Input.is_action_pressed("fly_down"): move -= Vector3.UP
 		if move.length() > 0.001:
-			var speed := fly_speed * (4.0 if Input.is_key_pressed(KEY_CTRL) else 1.0)
+			var speed := fly_speed * (4.0 if Input.is_key_pressed(KEY_SHIFT) else 1.0)
 			fly_pos += move.normalized() * speed * dt
 	_place_fly()
 
@@ -247,6 +279,7 @@ func _process(dt: float) -> void:
 		_refresh_view()
 	if interactive:
 		_fly(dt)
+		_stream()
 	else:
 		_place_cam()
 	_title_acc += dt
@@ -302,6 +335,27 @@ func _add_action(action: String, keys: Array) -> void:
 ## Debug: run a full rain-then-drain cycle so water sheds off the hills and
 ## collects as a clean lake, then save a frame to review the 3D scene.
 func _take_screenshot() -> void:
+	if OS.get_environment("VOX_STREAMSHOT") != "" and world is GpuWorld:
+		# streaming check: regenerate the window at a non-zero world origin and
+		# aim the camera there. If the terrain renders at that world position (not
+		# back at origin 0), the emit's world-offset — the core of streaming — works.
+		var gw := world as GpuWorld
+		var soff := 1200
+		gw.regen(soff, soff)
+		view.set_stream_origin(soff, soff)
+		world.set_rain_mm_hr(0.0)
+		world.run(60)
+		var scnt: PackedInt32Array = gw.dispatch_emit()
+		view.set_visible_counts(scnt[0], scnt[1])
+		print("STREAM emit at origin %d: solid=%d water=%d instances" % [soff, scnt[0], scnt[1]])
+		var wc := Vector3(soff + world.W * 0.5, world.H * 0.3, soff + world.D * 0.5)
+		cam.position = Vector3(wc.x, world.W * 0.95, wc.z + 1.0)   # near top-down
+		cam.look_at(wc, Vector3.FORWARD)
+		await get_tree().create_timer(0.4).timeout
+		get_viewport().get_texture().get_image().save_png("user://shot.png")
+		print("STREAMSHOT saved (world origin %d,%d): " % [soff, soff], ProjectSettings.globalize_path("user://shot.png"))
+		get_tree().quit()
+		return
 	if OS.get_environment("VOX_CUBETEST") != "":
 		# winding probe: a single floating cube, no sim
 		for i in range(world.cell.size()):
