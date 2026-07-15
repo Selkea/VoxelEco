@@ -44,7 +44,9 @@ func _world_size() -> Vector3i:
 	var sz := OS.get_environment("VOX_SIZE").to_int()
 	if sz > 0:
 		return Vector3i(sz, sz, hh if hh > 0 else maxi(24, sz * 3 / 8))
-	return Vector3i(512, 512, hh if hh > 0 else 192)
+	# big default map: 1600x1600x160 voxels (5cm) = 80x80x8 one-metre blocks,
+	# ~410M sim cells. The coarsened block renderer keeps this cheap to draw.
+	return Vector3i(1600, 1600, hh if hh > 0 else 160)
 
 func _ready() -> void:
 	var ws := _world_size()

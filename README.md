@@ -98,15 +98,21 @@ Vegetation and animals layer on top of this abiotic substrate later.
   RenderingDevice and the emit pass writes the MultiMesh instance buffers
   directly in VRAM (`multimesh_get_buffer_rd_rid`); the only per-frame
   readback is a 16-byte instance counter.
-- **Scale**: the default world is **512x512x192 = 50M cells at ~5 cm per
-  voxel** (a 25.6 m window, ~1.3 chunks across) — generated, stormed, and
-  rendered in under 2 seconds. `VOX_SIZE` picks other widths; `VOX_H` sets a
-  fixed vertical extent independent of width (a streamed world grows sideways
-  in chunks, not upward). The world is currently a single fixed window into
-  the infinite chunked terrain; **streaming chunks in/out around the camera is
-  the next milestone** (the gen is already chunk-local and seamless for it). A
-  uniform 1 cm grid at this map size would be 6.3 BILLION cells — past any
-  current GPU without sparse/LOD structures.
+- **Coarsened 1 m-block rendering**: the fine 5 cm sim is drawn as solid **1 m
+  cubes** — one thread per 20x20x20-voxel block emits a single cube (drawn if
+  the block is at least half full; coloured by its top-most material, so grass
+  caps the surface block over soil/stone, water where the block is mostly
+  water). This decouples draw cost from sim resolution — a huge world is a few
+  tens of thousands of cubes instead of millions of voxels — so the map can be
+  large while the detailed hydrology keeps running underneath. `VOX_RENDER=voxel`
+  falls back to the per-5 cm-voxel renderer (small worlds only).
+- **Scale**: the default world is **1600x1600x160 voxels at ~5 cm** = an
+  80 m x 80 m x 8 m plot rendered as **80x80x8 one-metre blocks** (~410M sim
+  cells), generated, stormed, and drawn on a 4090 without breaking a sweat.
+  `VOX_SIZE` picks other widths; `VOX_H` sets a fixed vertical extent
+  independent of width. The world is a single fixed window into the infinite
+  chunked terrain; **streaming chunks in/out around the camera is the next
+  milestone** (the gen is already chunk-local and seamless for it).
 
 ## Physical scale & calibration
 

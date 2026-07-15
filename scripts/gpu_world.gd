@@ -30,8 +30,16 @@ var _need_gpu_gen := false
 
 var _step_groups := Vector3i()
 var _col_groups := 0      # one thread per column (rain / worldgen)
-var _cell_groups := 0     # one thread per cell (emit)
+var _cell_groups := 0     # one thread per cell (voxel emit)
 var _pack_groups := 0
+var _block_groups := 0    # one thread per 1m block (block emit)
+var nbx := 0
+var nby := 0
+var nbz := 0
+# render coarsened 1m blocks (one cube per 20x20x20 voxels) rather than 5cm
+# voxels — decouples render cost from the fine sim so the map can be large.
+# VOX_RENDER=voxel forces the old per-voxel path (small worlds only).
+var block_render := true
 
 var rules_mask := 0   # debug: bit0 gravity, 1 diagonal, 2 lateral, 3 evap, 4 erosion; 0 = all
 # world-space origin of this buffer in voxels — worldgen samples noise at
@@ -85,8 +93,17 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	var zeros := PackedByteArray()
 	zeros.resize(chunk_w * chunk_d * 4)
 	dirty_buf = rd.storage_buffer_create(zeros.size(), zeros)
-	solid_cap = W * D * 4
-	water_cap = W * D * 2
+	nbx = (W + 19) / 20
+	nby = (H + 19) / 20
+	nbz = (D + 19) / 20
+	block_render = OS.get_environment("VOX_RENDER") != "voxel"
+	if block_render:
+		# at most one 1m cube per block; tiny buffers even for a huge sim
+		solid_cap = nbx * nby * nbz
+		water_cap = nbx * nby * nbz
+	else:
+		solid_cap = W * D * 4
+		water_cap = W * D * 2
 	var caps := PackedInt32Array([0, 0, solid_cap, water_cap]).to_byte_array()
 	inst_count_buf = rd.storage_buffer_create(16, caps)
 	# tiny placeholders until the view binds real multimesh buffers
@@ -101,6 +118,7 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	_col_groups = ceili(W * D / 64.0)
 	_cell_groups = ceili(W * D * H / 64.0)
 	_pack_groups = ceili(words / 64.0)
+	_block_groups = ceili(nbx * nby * nbz / 64.0)
 	gpu_ok = true
 	if OS.get_environment("VOX_GENMODE") == "terraced":
 		gen_flags = 1
@@ -225,8 +243,12 @@ func dispatch_emit() -> PackedInt32Array:
 	var cl := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(cl, pipeline)
 	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
-	rd.compute_list_set_push_constant(cl, _pc(3, 0), PC_SIZE)
-	rd.compute_list_dispatch(cl, _cell_groups, 1, 1)
+	if block_render:
+		rd.compute_list_set_push_constant(cl, _pc(5, 0), PC_SIZE)   # coarsened 1m blocks
+		rd.compute_list_dispatch(cl, _block_groups, 1, 1)
+	else:
+		rd.compute_list_set_push_constant(cl, _pc(3, 0), PC_SIZE)   # per-voxel
+		rd.compute_list_dispatch(cl, _cell_groups, 1, 1)
 	rd.compute_list_end()
 	var counts := rd.buffer_get_data(inst_count_buf, 0, 8).to_int32_array()
 	return PackedInt32Array([mini(counts[0], solid_cap), mini(counts[1], water_cap)])
