@@ -277,7 +277,16 @@ func _stream() -> void:
 		return
 	var dx := absi(nox - ox)
 	var dz := absi(noz - oz)
-	if dx >= world.W or dz >= world.D:
+	# check the vertical band BEFORE cutting strips: strips generate at the
+	# CURRENT gen_oy, and if the entered terrain has drifted past the band's
+	# deadband they'd come out clipped or empty (the "missing chunk" bug). A
+	# band move needs a full-window regen anyway, so do that instead.
+	var noy := gw.band_oy_for(nox + world.W * 0.5, noz + world.D * 0.5)
+	if absi(noy - gw.gen_oy) >= int(world.H * 0.12):
+		gw.gen_oy = noy
+		gw.regen(nox, noz)
+		gw.reset_water_stats()
+	elif dx >= world.W or dz >= world.D:
 		gw.regen(nox, noz)          # teleport: whole window is new
 		gw.reset_water_stats()
 	else:
@@ -811,6 +820,55 @@ func _run_sim_test() -> void:
 		print("PERF physics/tick: settled %.2f ms | raining %.2f ms  (30 ticks = 1 s sim)" % [settled_us / 1000.0, active_us / 1000.0])
 		print("PERF emit: per-voxel %.2f ms (%d inst) | block shell %.2f ms (%d inst)" % [vox_us / 1000.0, vcnt[0] + vcnt[1], blk_us / 1000.0, bcnt[0] + bcnt[1]])
 		print("PERF budget: at 60 fps a frame is 16.7 ms; at 1x sim that's ~2 physics ticks + 1 emit")
+		gw.free_gpu()
+		get_tree().quit()
+		return
+	if OS.get_environment("VOX_HOLETEST") != "":
+		# holes = columns whose surface fell outside the resident band (they render
+		# as missing chunks). Walk the world in window-sized steps, place the band
+		# exactly as the game does, and count empty columns at each stop.
+		speed_mult = 0
+		(world as GpuWorld).free_gpu()
+		for i in range(8):
+			await get_tree().process_frame
+		var ws := _world_size()
+		var gw := GpuWorld.new(12345, ws.x, ws.y, ws.z)
+		if not gw.gpu_ok:
+			print("HOLETEST: no GPU"); get_tree().quit(); return
+		var total := 0
+		for k in range(10):
+			var ox := 100000 + k * 4000          # 200 m steps across the world
+			gw.regen_tracked(ox, 100000 + k * 2000)
+			var holes := gw.count_holes()
+			total += holes
+			print("HOLETEST @(%d,%d): oy=%d holes=%d" % [ox, 100000 + k * 2000, gw.gen_oy, holes])
+		# STREAMING pass: advance the window one chunk at a time exactly like
+		# _stream() does (strips at the current band unless the band target has
+		# drifted past the deadband). This is where the missing chunks came from:
+		# strips generated at a stale band height as the terrain descends.
+		var stream_mode := OS.get_environment("VOX_HOLESTREAM")
+		for dirv: Vector2i in [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1)]:
+			gw.regen_tracked(100000, 100000)
+			var o := Vector2i(100000, 100000)
+			var worst := 0
+			for k in range(100):
+				var no := o + dirv * CHUNK_VOX
+				var noy := gw.band_oy_for(no.x + world.W * 0.5, no.y + world.D * 0.5)
+				if stream_mode != "old" and absi(noy - gw.gen_oy) >= int(gw.H * 0.12):
+					gw.gen_oy = noy
+					gw.regen(no.x, no.y)         # band moved: full regen (like _stream)
+				else:
+					gw.set_origin(no.x, no.y)
+					if dirv.x != 0:
+						gw.regen_strip(posmod(mini(o.x, no.x), gw.W), CHUNK_VOX, 0, gw.D)
+					else:
+						gw.regen_strip(0, gw.W, posmod(mini(o.y, no.y), gw.D), CHUNK_VOX)
+				o = no
+				var h2 := gw.count_holes()
+				worst = maxi(worst, h2)
+				total += h2
+			print("HOLETEST stream dir %s: 100 chunks (2 km), worst step holes=%d" % [dirv, worst])
+		print("HOLES TOTAL %d — %s" % [total, "CLEAN" if total == 0 else "WORLD HAS HOLES"])
 		gw.free_gpu()
 		get_tree().quit()
 		return

@@ -1037,6 +1037,11 @@ void do_gen() {
 	int top = int(world_height(w));
 	int sea = int(SEA_Y);                        // basins below this start as lakes
 	int oy = int(p.gen_oy);
+	// NEVER generate an empty column: if the surface falls below the band floor
+	// (stale band during streaming, or a narrow dip the tracker's sampling
+	// missed), clamp it to a thin floor — a sunken pit renders and simulates
+	// fine, where an empty column was a hole clean through the world.
+	if (top < oy + 2) { top = oy + 2; }
 	for (uint y = 0u; y < p.H; y++) {
 		int wy = oy + int(y);                    // this cell's world-Y
 		uint m = AIR;
@@ -1151,6 +1156,15 @@ void do_far_emit() {
 	}
 }
 
+// diagnostic (mode 13): count EMPTY columns — a column with no cells at all is a
+// hole in the world (its surface fell outside the resident band), which renders
+// as a missing chunk. Counts into the stats 'rained' slot.
+void do_holes() {
+	uint id = flat_id();
+	if (id >= p.W * p.D) { return; }
+	if (col_top(id % p.W, id / p.W) == 0u) { atomicAdd(rained, 1u); }
+}
+
 void main() {
 	uint mode = p.mode & 0xFFu;      // high bits carry the debug rules mask
 	if (mode == 1u) { do_rain(); }
@@ -1163,5 +1177,6 @@ void main() {
 	else if (mode == 8u) { do_face_emit(); }
 	else if (mode == 11u) { do_lod_emit(); }
 	else if (mode == 12u) { do_far_emit(); }
+	else if (mode == 13u) { do_holes(); }
 	else { do_step(); }
 }

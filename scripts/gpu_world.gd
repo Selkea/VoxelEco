@@ -511,6 +511,23 @@ func upload_cells() -> void:
 	if n > cells_split2:
 		rd.buffer_update(cells_buf3, 0, (n - cells_split2) * 4, bytes.slice(cells_split2 * 4))
 
+## diagnostic: how many columns are completely EMPTY (holes — surface outside
+## the band). Reuses the stats buffer's first slot; restores it after.
+func count_holes() -> int:
+	if not gpu_ok:
+		return 0
+	var saved := rd.buffer_get_data(stats_buf)
+	rd.buffer_update(stats_buf, 0, 4, PackedByteArray([0, 0, 0, 0]))
+	var cl := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(cl, pipeline)
+	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
+	rd.compute_list_set_push_constant(cl, _pc(13, 0), PC_SIZE)
+	rd.compute_list_dispatch(cl, _col_groups, 1, 1)
+	rd.compute_list_end()
+	var n := rd.buffer_get_data(stats_buf, 0, 4).to_int32_array()[0]
+	rd.buffer_update(stats_buf, 0, saved.size(), saved)
+	return n
+
 func reset_water_stats() -> void:
 	super.reset_water_stats()
 	if gpu_ok:
