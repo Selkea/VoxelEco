@@ -622,6 +622,48 @@ func _run_sim_test() -> void:
 		w.prime()
 	w.rules_mask = OS.get_environment("VOX_RULES").to_int() if OS.get_environment("VOX_RULES") != "" else 0
 	print("backend: %s rules_mask=%d" % ["GPU compute" if w.gpu_ok else "CPU fallback", w.rules_mask])
+	if OS.get_environment("VOX_PERF") != "":
+		# profile the default-size world: physics step (settled vs raining) and the
+		# emit pass (per-voxel vs block shell). GPU compute on the main device is
+		# async; a tiny buffer read flushes + syncs the queue, so timing run()/emit
+		# followed by that read captures the GPU time.
+		var ws := _world_size()
+		var gw := GpuWorld.new(999, ws.x, ws.y, ws.z)
+		if not gw.gpu_ok:
+			print("PERF: no GPU"); get_tree().quit(); return
+		gw.regen_tracked(100000, 100000)
+		var cells := ws.x * ws.y * ws.z
+		# dummy instance buffers (64 B/instance: 12-float xform + 4-float colour) so
+		# the emit can write; bind them as the emit targets
+		var sbuf := gw.rd.storage_buffer_create(gw.solid_cap * 64)
+		var wbuf := gw.rd.storage_buffer_create(gw.water_cap * 64)
+		gw.bind_instance_buffers(sbuf, wbuf)
+		var sync := func() -> void: gw.rd.buffer_get_data(gw.stats_buf)
+		gw.run(4); sync.call()                                   # warm up
+		var t0 := Time.get_ticks_usec()
+		gw.run(60); sync.call()
+		var settled_us := (Time.get_ticks_usec() - t0) / 60.0
+		gw.set_rain_mm_hr(60.0); gw.run(120); sync.call()        # build live water/erosion
+		t0 = Time.get_ticks_usec()
+		gw.run(60); sync.call()
+		var active_us := (Time.get_ticks_usec() - t0) / 60.0
+		gw.block_render = false
+		t0 = Time.get_ticks_usec()
+		for i in range(20): gw.dispatch_emit()
+		var vox_us := (Time.get_ticks_usec() - t0) / 20.0
+		var vcnt: PackedInt32Array = gw.dispatch_emit()
+		gw.block_render = true
+		t0 = Time.get_ticks_usec()
+		for i in range(20): gw.dispatch_emit()
+		var blk_us := (Time.get_ticks_usec() - t0) / 20.0
+		var bcnt: PackedInt32Array = gw.dispatch_emit()
+		print("PERF world %dx%dx%d = %.0fM cells" % [ws.x, ws.y, ws.z, cells / 1e6])
+		print("PERF physics/tick: settled %.2f ms | raining %.2f ms  (30 ticks = 1 s sim)" % [settled_us / 1000.0, active_us / 1000.0])
+		print("PERF emit: per-voxel %.2f ms (%d inst) | block shell %.2f ms (%d inst)" % [vox_us / 1000.0, vcnt[0] + vcnt[1], blk_us / 1000.0, bcnt[0] + bcnt[1]])
+		print("PERF budget: at 60 fps a frame is 16.7 ms; at 1x sim that's ~2 physics ticks + 1 emit")
+		gw.free_gpu()
+		get_tree().quit()
+		return
 	if OS.get_environment("VOX_TRACKTEST") != "":
 		# vertical-tracking band: fly a long horizontal path across the 256 m-relief
 		# world, apply the same deadband band-shift the interactive tracker uses, and
