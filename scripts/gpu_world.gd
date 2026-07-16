@@ -114,11 +114,12 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	nbx = (W + 19) / 20
 	nby = (H + 19) / 20
 	nbz = (D + 19) / 20
-	# default: render 1m blocks with voxel-tinted tops; VOX_RENDER=voxel draws all
-	# 5cm voxels (finer, heavier). Allocate for BOTH modes (per-voxel is the
-	# larger) so the render can be toggled live (B key) with no reallocation —
-	# unless that's too many instances for one buffer, then lock to blocks.
-	block_render = OS.get_environment("VOX_RENDER") != "voxel"
+	# default: draw all 5cm voxels (the true fine surface); VOX_RENDER=block draws
+	# the coarser 1m block shell instead (fewer instances, chunky look). Allocate
+	# for BOTH modes (per-voxel is the larger) so the render can be toggled live
+	# (B key) with no reallocation — unless the per-voxel count is too many for one
+	# buffer, then lock to the block shell.
+	block_render = OS.get_environment("VOX_RENDER") == "block"
 	var skin_cap := W * D + nbx * nby * nbz
 	can_toggle_render = W * D * 4 <= 60_000_000
 	if can_toggle_render:

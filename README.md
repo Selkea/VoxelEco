@@ -24,7 +24,7 @@ Creative-mode free flight (no gravity / collision):
 | 1 – 7 | Speed: 1x / 2x / 4x / 8x / 16x / 32x / 64x (1x = real time) |
 | Q / E | Less / more rain (mm/hour) — the world starts **calm**; press E to make it rain |
 | C | Toggle a cross-section (see subsurface moisture / the water table) |
-| B | Toggle render: full **5cm voxels** ↔ **1m blocks** (voxel-tinted tops) |
+| B | Toggle render: full **5cm voxels** (default) ↔ **1m blocks** (voxel-tinted tops) |
 | T | Toggle worldgen **blended** ↔ **terraced** (regenerates in place) |
 | P | Pause / resume |
 | R | Generate a fresh world |
@@ -114,19 +114,16 @@ Creative-mode free flight (no gravity / collision):
   plane (far:near ~7000:1, not 40000:1), 4x MSAA, and a ~2% cube inflation (so
   neighbouring voxels overlap and seal the hairline junctions between them and
   between Y levels — same-material overlaps are invisible) finish the job.
-- **1 m blocks with voxel-skinned faces** (default): the fine 5 cm sim is drawn
-  as chunky 1 m blocks (flat 1 m tops, 1 m-aligned steps), but **every visible
-  face is skinned with its real 5 cm voxels** — so cliff sides show the strata
-  (grass on top, soil, then stone) at full per-voxel detail, not flat colour.
-  One thread per 5 cm column emits a shell of 5 cm voxel-cubes for the block-
-  snapped terrain: the top voxel plus, where a neighbouring block is shorter,
-  the side voxels down to it, each tinted by its own voxel (material + wet/dry
-  saturation + jitter). Interior voxels are occluded so none are emitted; draw
-  cost is the (block-snapped) surface area, not the sim volume, so the map can
-  be large while the detailed hydrology runs underneath. Press **B** (or
-  `VOX_RENDER=voxel`) for the full per-5 cm-voxel renderer — the true 5 cm shape
-  (fine steps) rather than chunky blocks. Instance buffers are sized for both,
-  so **B** flips modes live with no reallocation.
+- **Full per-5 cm-voxel render** (default): every exposed 5 cm voxel is drawn as
+  its own cube (tinted by material + wet/dry saturation + per-voxel jitter), so the
+  surface shows its true fine shape and every stratum on a cliff. Press **B** (or
+  `VOX_RENDER=block`) for the coarser **1 m block shell**: the sim is drawn as
+  chunky 1 m blocks (flat 1 m tops, 1 m-aligned steps) whose every visible face is
+  still skinned with real 5 cm voxels, so cliffs keep their per-voxel strata while
+  draw cost drops to the (block-snapped) surface area rather than the full voxel
+  surface — the way to draw a much larger map. Instance buffers are sized for both,
+  so **B** flips modes live with no reallocation. Cubes are inflated ~2 % so
+  neighbours overlap and no hairline seams show between voxels or Y levels.
 - **Toroidal streaming (endless, state-preserving world)**: the sim buffer is a
   **torus that follows the camera**. Buffer slot = world column mod W, so as you
   fly, only the freshly-entered edge strip regenerates (one thin `regen_strip`)
@@ -137,8 +134,7 @@ Creative-mode free flight (no gravity / collision):
   is deterministic and bit-exact seamless per world-coordinate, so the terrain
   scrolls without a ripple and extends forever. Gen + emit map buffer slots to
   world coords with an all-unsigned wrap (this GPU miscomputes signed subtraction
-  that goes negative), and the window rides in positive world space. Distance
-  fog fades the far edge into sky.
+  that goes negative), and the window rides in positive world space.
 - **Vertical-tracking band (tall worlds)**: the world has **256 m of vertical
   relief** (5120 voxels at 5 cm) but the resident sim buffer is only a thin
   **height band** (default ~45 m) that **rides up and down with the terrain

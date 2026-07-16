@@ -113,9 +113,7 @@ func _ready() -> void:
 	e.tonemap_exposure = 0.92
 	e.ssao_enabled = true
 	e.ssao_intensity = 2.2
-	e.fog_enabled = true
-	e.fog_light_color = Color("#c3d9ea")
-	e.fog_density = 0.055 / (ws.x * 1.12)   # constant haze regardless of world size
+	e.fog_enabled = false   # no distance fog (the streaming window's far edge is a hard cut)
 	env.environment = e
 	_env = e
 	add_child(env)
@@ -160,8 +158,6 @@ func _ready() -> void:
 		fly_pos = Vector3(base + world.W * 0.5, surf + world.H * 0.4, base + world.D * 0.5)
 		fly_yaw = 0.0
 		fly_pitch = -0.6
-		# faint distance fog so the streaming window's far edge fades into sky
-		e.fog_density = 0.9 / float(world.W)
 		_capture_mouse(true)
 		_place_fly()
 	else:
