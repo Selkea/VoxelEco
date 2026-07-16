@@ -31,6 +31,7 @@ var active_buf: RID    # per-chunk physics keepalive (active-block skipping)
 var step_args_buf: RID
 var awake_list_buf: RID
 var step_mode := "indirect"   # "grid" | "bounded" (diagnostic) | "indirect"
+var topmark_buf: RID          # per-column top watermark (fast emit column walks)
 var inst_count_buf: RID
 var uniform_set: RID
 var _solid_target: RID    # multimesh buffers (bound by the view) or placeholders
@@ -163,6 +164,12 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	step_args_buf = rd.storage_buffer_create(12,
 			PackedInt32Array([0, 1, 1]).to_byte_array(),
 			RenderingDevice.STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT)
+	# per-column top watermark (see the shader's TopMarkBuf): start at H-1
+	# (valid upper bound everywhere); gen and the first walks tighten it.
+	var marks := PackedInt32Array()
+	marks.resize(W * D)
+	marks.fill(H - 1)
+	topmark_buf = rd.storage_buffer_create(W * D * 4, marks.to_byte_array())
 	heights_buf = rd.storage_buffer_create(W * D * 4)            # ray renderer: column heights
 	hmax_buf = rd.storage_buffer_create(zeros.size(), zeros)     # ray renderer: tile max heights
 	cam_buf = rd.storage_buffer_create(80)                       # ray renderer: camera/sun
@@ -425,11 +432,12 @@ func _rebuild_uniform_set() -> void:
 	iu.binding = 13
 	iu.add_id(ray_tex)
 	us.append(iu)
-	var lu := RDUniform.new()
-	lu.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	lu.binding = 14
-	lu.add_id(awake_list_buf)
-	us.append(lu)
+	for pair: Array in [[14, awake_list_buf], [15, topmark_buf]]:
+		var bu := RDUniform.new()
+		bu.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+		bu.binding = pair[0]
+		bu.add_id(pair[1])
+		us.append(bu)
 	uniform_set = rd.uniform_set_create(us, shader, 0)
 
 ## the view hands us its MultiMesh storage buffers: the emit pass writes
@@ -668,7 +676,7 @@ func free_gpu() -> void:
 		return
 	# free our resources, never the shared main device
 	for r in [uniform_set, pipeline, shader, cells_buf, cells_buf2, cells_buf3, pack_buf,
-			stats_buf, dirty_buf, active_buf, step_args_buf, awake_list_buf,
+			stats_buf, dirty_buf, active_buf, step_args_buf, awake_list_buf, topmark_buf,
 			inst_count_buf, _placeholder_a, _placeholder_b,
 			heights_buf, hmax_buf, cam_buf, ray_tex]:
 		if r.is_valid():

@@ -94,6 +94,11 @@ VOX_LEVELS=6 VOX_DITHERSTR=1`.
   ground beneath. On the 3.2B-cell world a physics tick went from 3.3 ms
   settled / 10.7 ms raining to **0.07 / 0.8 ms** (47x / 13x); the indirect
   path is bit-exact with the full-grid gated dispatch (`VOX_LISTTEST`).
+- **Per-column top watermark**: emit passes used to scan ~half a band of sky
+  per column before reaching ground (~800M wasted reads per refresh). A
+  per-column watermark bounds the highest non-air cell — worldgen writes it
+  exactly, the physics raises it when cells change, and the walkers tighten
+  it back — so column walks start at the surface. Emit: 12.3 → **2.0 ms**.
 - **Rendering**: each chunk builds two face-culled meshes — opaque
   vertex-coloured terrain and a translucent water surface — so interior
   voxels cost nothing.

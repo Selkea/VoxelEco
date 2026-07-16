@@ -66,6 +66,14 @@ const uint KEEPALIVE = 4u;
 // (LISTTEST=ll caught a 6-cell self-race; transfer-write -> indirect-read is
 // the tracked pattern).
 layout(set = 0, binding = 14, std430) restrict buffer AwakeListBuf { uint awake_list[]; };
+// per-column TOP WATERMARK (buffer-slot indexed, z*W+x): an upper bound on the
+// highest non-air cell's local y. Column walks (emit/col_top) start here instead
+// of scanning ~half a band of sky from p.H — that scan was ~800M wasted cell
+// reads per emit at a 2048^2 window. gen writes the exact top; physics
+// atomicMax()es changed cells in; rain pins rained columns to H-1; the walkers
+// tighten it back to exact when they run. Never below the true top = never a
+// missed voxel; too high just costs the old scan.
+layout(set = 0, binding = 15, std430) restrict buffer TopMarkBuf { uint topmark[]; };
 
 layout(push_constant) uniform Params {
 	uint W; uint H; uint D; uint tick;
@@ -270,6 +278,7 @@ void do_rain() {
 		if (MAT(cget(i)) == AIR) {
 			cset(i, WATER);
 			atomicAdd(rained, 1u);
+			topmark[z * p.W + x] = p.H - 1u;   // one rain thread per column
 			mark_dirty(x, p.H - 1u, z);
 		}
 	}
@@ -506,6 +515,11 @@ void do_step_at(uvec3 base) {
 		if (ib[l] && cget(ids[l]) != c[l]) {
 			cset(ids[l], c[l]);
 			changed = true;
+			// raise the column's top watermark: this cell may now be non-air
+			uvec3 pp = base + uvec3(l & 1u, (l >> 1u) & 1u, (l >> 2u) & 1u);
+			pp.x %= p.W;
+			pp.z %= p.D;
+			atomicMax(topmark[pp.z * p.W + pp.x], pp.y);
 		}
 	}
 	if (changed) {
@@ -644,13 +658,15 @@ void do_face_emit() {
 		if (ddx * ddx + ddz * ddz > float(p.lod_r) * float(p.lod_r)) { return; }
 	}
 	uint buried = 0u;
-	uint yy = p.H;
+	uint yy = min(topmark[id] + 1u, p.H);   // start just above the column top
+	bool found = false;
 	while (yy > 0u) {
 		yy--;
 		uint cid = cidx(x, yy, z);
 		uint raw = cget(cid);
 		uint m = MAT(raw);
 		if (m == AIR) { buried = 0u; continue; }
+		if (!found) { found = true; topmark[id] = yy; }   // tighten to exact
 		bool is_water = m == WATER;
 		float Y = float(int(yy) + int(p.gen_oy));
 		uint nbr[6];
@@ -692,6 +708,7 @@ void do_face_emit() {
 		if (solid_n == 6) { buried += 1u; if (buried >= 2u) { break; } }
 		else { buried = 0u; }
 	}
+	if (!found) { topmark[id] = 0u; }   // all-air column (can't happen post-gen)
 }
 
 // one thread per COLUMN: walk it top-down and emit every exposed voxel, then stop
@@ -707,13 +724,15 @@ void do_emit() {
 	uint z = id / p.W;
 	if (z < p.cut_z) { return; }   // whole column hidden behind the cross-section
 	uint buried = 0u;
-	uint yy = p.H;
+	uint yy = min(topmark[id] + 1u, p.H);   // start just above the column top
+	bool found = false;
 	while (yy > 0u) {
 		yy--;
 		uint cid = cidx(x, yy, z);
 		uint raw = cget(cid);
 		uint m = MAT(raw);
 		if (m == AIR) { buried = 0u; continue; }
+		if (!found) { found = true; topmark[id] = yy; }   // tighten to exact
 		bool is_water = m == WATER;
 		// exposure test mirrors the face-cull rules: solids show against
 		// AIR/WATER, water only against AIR; OOB sides count as exposed
@@ -908,10 +927,13 @@ void do_skin_emit() {
 
 // exact surface top (buffer y of the top solid/water cell + 1) of one column
 uint col_top(uint x, uint z) {
-	uint yy = p.H;
+	uint yy = min(topmark[z * p.W + x] + 1u, p.H);   // start just above the top
 	while (yy > 0u) {
 		yy--;
-		if (MAT(cget(cidx(x, yy, z))) != AIR) { return yy + 1u; }
+		if (MAT(cget(cidx(x, yy, z))) != AIR) {
+			topmark[z * p.W + x] = yy;   // tighten (callers sample disjoint columns)
+			return yy + 1u;
+		}
 	}
 	return 0u;
 }
@@ -1129,6 +1151,7 @@ void do_gen() {
 	// missed), clamp it to a thin floor — a sunken pit renders and simulates
 	// fine, where an empty column was a hole clean through the world.
 	if (top < oy + 2) { top = oy + 2; }
+	uint hi = 0u;   // highest non-air cell written (column top watermark)
 	for (uint y = 0u; y < p.H; y++) {
 		int wy = oy + int(y);                    // this cell's world-Y
 		uint m = AIR;
@@ -1151,7 +1174,9 @@ void do_gen() {
 		// fill low basins and valleys with standing water up to the water line
 		if (m == AIR && wy < sea) { m = WATER; s0 = 0u; }
 		cset(cidx(x, y, z), PACK(m, s0));
+		if (m != AIR) { hi = y; }
 	}
+	topmark[z * p.W + x] = hi;   // exact top for this freshly generated column
 	// wake the freshly generated column's chunks so the physics settles them
 	// (then they sleep). All y-chunks: the whole column is new material.
 	uint cw = (p.W + CHUNK - 1u) / CHUNK;
