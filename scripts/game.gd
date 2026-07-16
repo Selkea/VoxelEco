@@ -141,6 +141,30 @@ func _ready() -> void:
 	sun.directional_shadow_max_distance = 340.0
 	add_child(sun)
 
+	# --- shader-look experiments (env-gated; nothing changes unless set) ---
+	# VOX_TOON=1: cel-shaded terrain — instance colours lit by a hard-banded sun
+	if OS.get_environment("VOX_TOON") != "" and view.use_instances:
+		var tm := ShaderMaterial.new()
+		tm.shader = load("res://shaders/toon_terrain.gdshader")
+		tm.set_shader_parameter("sun_dir", -sun.global_transform.basis.z)
+		view.solid_mm.material_override = tm
+	# VOX_PIXEL=n: pixel-art post over the whole frame (n screen px per art px);
+	# VOX_LEVELS=k palette steps, VOX_DITHER=0 disables the Bayer dither
+	if OS.get_environment("VOX_PIXEL") != "":
+		var pm := ShaderMaterial.new()
+		pm.shader = load("res://shaders/pixel_post.gdshader")
+		pm.set_shader_parameter("pixel_size", maxi(1, OS.get_environment("VOX_PIXEL").to_int()))
+		if OS.get_environment("VOX_LEVELS") != "":
+			pm.set_shader_parameter("levels", maxi(2, OS.get_environment("VOX_LEVELS").to_int()))
+		pm.set_shader_parameter("dither", OS.get_environment("VOX_DITHER") != "0")
+		var lay := CanvasLayer.new()
+		var rect := ColorRect.new()
+		rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+		rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		rect.material = pm
+		lay.add_child(rect)
+		add_child(lay)
+
 	cam = Camera3D.new()
 	# far plane covers the whole far-field vista (8 km rings + square corners)
 	var far_on := world is GpuWorld and (world as GpuWorld).far_field

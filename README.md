@@ -29,6 +29,11 @@ Creative-mode free flight (no gravity / collision):
 | P | Pause / resume |
 | R | Generate a fresh world |
 
+**Shader looks** (env vars, composable; default render unchanged without them):
+`VOX_PIXEL=n` pixel-art post-process (n screen px per art px) with `VOX_LEVELS=k`
+palette steps and Bayer dithering (`VOX_DITHER=0` disables); `VOX_TOON=1`
+cel-shades the terrain with hard-banded sunlight. All cost ~nothing (<0.5 ms).
+
 ## How it works
 
 - **The world** is a 3D grid of material cells (`bedrock, stone, soil, sand,
