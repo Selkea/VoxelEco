@@ -62,12 +62,15 @@ func _world_size() -> Vector3i:
 	var sz := OS.get_environment("VOX_SIZE").to_int()
 	if sz > 0:
 		return _clamp_cells(Vector3i(sz, sz, hh if hh > 0 else maxi(24, sz * 3 / 8)))
-	# default map: a 1024x1024 footprint (51 m) with a 768-voxel (38 m) resident
+	# default map: a 1280x1280 footprint (64 m) with a 630-voxel (31.5 m) resident
 	# BAND that vertically tracks the terrain surface (gen_oy). The world's true
 	# vertical relief is 256 m (GpuWorld.RELIEF) but only this thin near-surface
 	# band is ever stored, so the footprint stays wide while the world is tall —
-	# ~805M sim cells. VOX_H overrides the band height, not the relief.
-	return Vector3i(1024, 1024, hh if hh > 0 else 896)
+	# ~1.03B sim cells (just under the single-buffer ceiling). The face-quad
+	# renderer draws this window at ~14 ms (was 64 ms for a SMALLER window as
+	# cubes), and the band still has ~20 m of margin over the ~12 m local relief.
+	# VOX_H overrides the band height, not the relief.
+	return Vector3i(1280, 1280, hh if hh > 0 else 630)
 
 # A single GPU storage buffer's byte size is 32-bit in Godot, so the cells
 # buffer (4 bytes/cell) hard-caps at ~4 GB ≈ 1.05B cells no matter how much VRAM
@@ -709,8 +712,8 @@ func _run_sim_test() -> void:
 		# assert the terrain surface stays resident in the band the whole way (never
 		# clips out the top or bottom). gw is tiny — only its CPU noise (surface_world_y,
 		# seeded) is used; the band footprint/height are the real defaults.
-		var Wt := 1024.0
-		var Ht := 896
+		var Wt := 1280.0
+		var Ht := 630
 		var gw := GpuWorld.new(777, 64, 64, 64)
 		var base := 100000.0
 		var band_target := func(cx: float, cz: float) -> int:
