@@ -43,11 +43,15 @@ layout(set = 0, binding = 3, std430) restrict buffer DirtyBuf { uint dirty[]; };
 layout(set = 0, binding = 4, std430) restrict buffer SolidInst { float solid_inst[]; };
 layout(set = 0, binding = 5, std430) restrict buffer WaterInst { float water_inst[]; };
 layout(set = 0, binding = 6, std430) restrict buffer InstCount { uint n_solid; uint n_water; uint cap_solid; uint cap_water; };
-// active-block gating (per 16x16-column chunk, same grid as dirty): the physics
-// only steps chunks with recent activity, and settled regions sleep. A change
-// wakes a chunk (+1-chunk margin) to KEEPALIVE; do_decay counts it back down, so a
-// chunk stays awake for KEEPALIVE ticks after its last change (covers both Margolus
-// offsets). This skips the cell READS for inert regions, which is the whole cost.
+// active-block gating (per 16x16x16 chunk — 3D, unlike the 2D per-column dirty
+// grid): the physics only steps chunks with recent activity, and settled regions
+// sleep. A change wakes its chunk (+1-cell margin in all axes) to KEEPALIVE;
+// do_decay counts it back down, so a chunk stays awake for KEEPALIVE ticks after
+// its last change (covers both Margolus offsets). This skips the cell READS for
+// inert regions, which is the whole cost. The 3D grid matters for rain: a drop
+// falling through a column wakes only the chunks along its path, not the whole
+// ~750-voxel column of settled ground beneath it.
+// Index layout: (cy * cd + cz) * cw + cx.
 layout(set = 0, binding = 7, std430) restrict buffer ActiveBuf { uint awake[]; };
 const uint KEEPALIVE = 4u;
 
@@ -97,20 +101,31 @@ void cset(uint i, uint v) {
 
 const uint CHUNK = 16u;
 
-// flag the chunks around (x, z) — a border cell change alters the visible
-// faces of cells in the adjacent chunk, so flag with a 1-cell margin
-void mark_dirty(uint x, uint z) {
+// flag the chunks around (x, y, z) — a border cell change alters the visible
+// faces of cells in the adjacent chunk, so flag with a 1-cell margin. The margin
+// also wakes neighbours so material can flow across a sleep boundary.
+void mark_dirty(uint x, uint y, uint z) {
 	uint cw = (p.W + CHUNK - 1u) / CHUNK;
+	uint cd = (p.D + CHUNK - 1u) / CHUNK;
 	uint x0 = (x > 0u ? x - 1u : 0u) / CHUNK;
 	uint x1 = min(x + 1u, p.W - 1u) / CHUNK;
 	uint z0 = (z > 0u ? z - 1u : 0u) / CHUNK;
 	uint z1 = min(z + 1u, p.D - 1u) / CHUNK;
-	// mark for remeshing (dirty) AND wake the chunk for physics (active). The
-	// 1-chunk margin wakes neighbours so material can flow across a sleep boundary.
-	uint i0 = z0 * cw + x0;              dirty[i0] = 1u; awake[i0] = KEEPALIVE;
-	if (x1 != x0) { uint i = z0 * cw + x1; dirty[i] = 1u; awake[i] = KEEPALIVE; }
-	if (z1 != z0) { uint i = z1 * cw + x0; dirty[i] = 1u; awake[i] = KEEPALIVE; }
-	if (x1 != x0 && z1 != z0) { uint i = z1 * cw + x1; dirty[i] = 1u; awake[i] = KEEPALIVE; }
+	uint y0 = (y > 0u ? y - 1u : 0u) / CHUNK;
+	uint y1 = min(y + 1u, p.H - 1u) / CHUNK;
+	// remesh flags stay per-COLUMN (the emit passes walk whole columns)
+	dirty[z0 * cw + x0] = 1u;
+	if (x1 != x0) { dirty[z0 * cw + x1] = 1u; }
+	if (z1 != z0) { dirty[z1 * cw + x0] = 1u; }
+	if (x1 != x0 && z1 != z0) { dirty[z1 * cw + x1] = 1u; }
+	// physics wake flags are per 16^3 chunk (3D) — see ActiveBuf
+	for (uint cy = y0; cy <= y1; cy++) {
+		uint row = cy * cd;
+		awake[(row + z0) * cw + x0] = KEEPALIVE;
+		if (x1 != x0) { awake[(row + z0) * cw + x1] = KEEPALIVE; }
+		if (z1 != z0) { awake[(row + z1) * cw + x0] = KEEPALIVE; }
+		if (x1 != x0 && z1 != z0) { awake[(row + z1) * cw + x1] = KEEPALIVE; }
+	}
 }
 
 const uint AIR = 0u;
@@ -243,7 +258,7 @@ void do_rain() {
 		if (MAT(cget(i)) == AIR) {
 			cset(i, WATER);
 			atomicAdd(rained, 1u);
-			mark_dirty(x, z);
+			mark_dirty(x, p.H - 1u, z);
 		}
 	}
 }
@@ -288,9 +303,11 @@ void do_step() {
 	if ((base.x + 1u) % p.W == sx || (base.z + 1u) % p.D == sz) { return; }
 	// ACTIVE-BLOCK GATE: skip inert chunks BEFORE touching any cells — the cell
 	// reads are the cost, so gating here (one tiny flag read, cached per workgroup)
-	// is what actually saves time. Chunk index matches mark_dirty / dirty.
+	// is what actually saves time. Chunk index matches mark_dirty's awake layout.
 	uint cw = (p.W + CHUNK - 1u) / CHUNK;
-	if (awake[(min(base.z, p.D - 1u) / CHUNK) * cw + (min(base.x, p.W - 1u) / CHUNK)] == 0u) { return; }
+	uint cd = (p.D + CHUNK - 1u) / CHUNK;
+	if (awake[((min(base.y, p.H - 1u) / CHUNK) * cd + (min(base.z, p.D - 1u) / CHUNK)) * cw
+			+ (min(base.x, p.W - 1u) / CHUNK)] == 0u) { return; }
 	uint c[8];
 	bool ib[8];
 	uint ids[8];
@@ -483,7 +500,10 @@ void do_step() {
 			changed = true;
 		}
 	}
-	if (changed) { mark_dirty(base.x, base.z); mark_dirty(base.x + 1u, base.z + 1u); }
+	if (changed) {
+		mark_dirty(base.x, base.y, base.z);
+		mark_dirty(base.x + 1u, base.y + 1u, base.z + 1u);
+	}
 }
 
 // material albedo in LINEAR space (vertex/instance colors skip sRGB conversion)
@@ -1079,9 +1099,14 @@ void do_gen() {
 		if (m == AIR && wy < sea) { m = WATER; s0 = 0u; }
 		cset(cidx(x, y, z), PACK(m, s0));
 	}
-	// wake the freshly generated chunk so the physics settles it (then it sleeps)
+	// wake the freshly generated column's chunks so the physics settles them
+	// (then they sleep). All y-chunks: the whole column is new material.
 	uint cw = (p.W + CHUNK - 1u) / CHUNK;
-	awake[(z / CHUNK) * cw + (x / CHUNK)] = KEEPALIVE;
+	uint cd = (p.D + CHUNK - 1u) / CHUNK;
+	uint chy = (p.H + CHUNK - 1u) / CHUNK;
+	for (uint cy = 0u; cy < chy; cy++) {
+		awake[(cy * cd + (z / CHUNK)) * cw + (x / CHUNK)] = KEEPALIVE;
+	}
 }
 
 // one thread per chunk: count the active flag down. A chunk woken by mark_dirty is
@@ -1090,8 +1115,9 @@ void do_gen() {
 void do_decay() {
 	uint cw = (p.W + CHUNK - 1u) / CHUNK;
 	uint cd = (p.D + CHUNK - 1u) / CHUNK;
+	uint chy = (p.H + CHUNK - 1u) / CHUNK;
 	uint id = flat_id();
-	if (id >= cw * cd) { return; }
+	if (id >= cw * cd * chy) { return; }
 	if (awake[id] > 0u) { awake[id] -= 1u; }
 }
 

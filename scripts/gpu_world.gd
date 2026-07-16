@@ -33,6 +33,7 @@ var _placeholder_b: RID
 
 var chunk_w := 0
 var chunk_d := 0
+var chunk_h := 0    # y-chunks: the physics awake grid is 3D (16^3 chunks)
 var solid_cap := 0
 var water_cap := 0
 var _need_gpu_gen := false
@@ -86,6 +87,7 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	super(seed_v, w, d, h)
 	chunk_w = (W + 15) / 16
 	chunk_d = (D + 15) / 16
+	chunk_h = (H + 15) / 16
 	rd = RenderingServer.get_rendering_device()
 	if rd == null:
 		push_warning("GpuWorld: no RenderingDevice — falling back to CPU stepping")
@@ -140,7 +142,9 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	var zeros := PackedByteArray()
 	zeros.resize(chunk_w * chunk_d * 4)
 	dirty_buf = rd.storage_buffer_create(zeros.size(), zeros)
-	active_buf = rd.storage_buffer_create(zeros.size(), zeros)   # all asleep until gen wakes
+	var zeros3 := PackedByteArray()
+	zeros3.resize(chunk_w * chunk_d * chunk_h * 4)   # 3D awake grid (16^3 chunks)
+	active_buf = rd.storage_buffer_create(zeros3.size(), zeros3)   # all asleep until gen wakes
 	heights_buf = rd.storage_buffer_create(W * D * 4)            # ray renderer: column heights
 	hmax_buf = rd.storage_buffer_create(zeros.size(), zeros)     # ray renderer: tile max heights
 	cam_buf = rd.storage_buffer_create(80)                       # ray renderer: camera/sun
@@ -178,7 +182,7 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	_cell_groups = ceili(W * D * H / 64.0)
 	_pack_groups = ceili(words / 64.0)
 	_block_groups = ceili(nbx * nbz / 64.0)   # one thread per 1m block column
-	_decay_groups = ceili(chunk_w * chunk_d / 64.0)   # one thread per 16x16 chunk
+	_decay_groups = ceili(chunk_w * chunk_d * chunk_h / 64.0)   # one thread per 16^3 chunk
 	gpu_ok = true
 	if OS.get_environment("VOX_GENMODE") == "terraced":
 		gen_flags = 1

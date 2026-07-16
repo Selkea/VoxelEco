@@ -84,6 +84,12 @@ VOX_LEVELS=6 VOX_DITHERSTR=1`.
 - **Noita-style dirty chunks**: the shader flags 16x16-column regions whose
   cells changed; only those chunks get remeshed. A settled landscape costs
   nothing to keep on screen.
+- **3D sleep grid for physics**: a separate per-16³-chunk `awake` grid gates
+  the Margolus step before any cell is read; a change wakes its chunk (+1-cell
+  margin, so material flows across sleep boundaries) for a few ticks. Because
+  the grid is 3D, a raindrop falling through a column wakes only the chunks on
+  its path — not the ~750 voxels of settled ground beneath — so a storm ticks
+  3x faster (10.7 → 3.5 ms on the 3.2B-cell world) and a settled world ~6x.
 - **Rendering**: each chunk builds two face-culled meshes — opaque
   vertex-coloured terrain and a translucent water surface — so interior
   voxels cost nothing.
