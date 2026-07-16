@@ -32,10 +32,10 @@ Creative-mode free flight (no gravity / collision):
 
 **Shader looks** — press **V** to cycle standard → pixel-art → toon → retro
 (the title bar shows the current look). Env vars tune the pixel-art post and
-pick the starting look: `VOX_PIXEL=n` (art-pixel size, default 3),
-`VOX_LEVELS=k` palette steps (default 12), `VOX_DITHERSTR=0..1` dither strength
-(default 0.5; `VOX_DITHER=0` off), `VOX_TOON=1` / `VOX_LOOK=0..3` choose the
-look at launch. All ~free (<0.5 ms). For the old hard retro: `VOX_PIXEL=4
+pick the starting look: `VOX_PIXEL=n` (art-pixel size, default 2),
+`VOX_LEVELS=k` palette steps (default 16), `VOX_DITHERSTR=0..1` dither strength
+(default 0.35; `VOX_DITHER=0` off), `VOX_TOON=1` / `VOX_LOOK=0..3` choose the
+look at launch. All ~free (<0.5 ms). For the hard retro: `VOX_PIXEL=4
 VOX_LEVELS=6 VOX_DITHERSTR=1`.
 
 ## How it works

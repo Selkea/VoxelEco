@@ -4,10 +4,10 @@ shader_type canvas_item;
 // the classic retro look, applied over the whole 3D render.
 
 uniform sampler2D screen_tex : hint_screen_texture, filter_nearest;
-uniform int pixel_size : hint_range(1, 12) = 3;   // screen pixels per art pixel
-uniform int levels : hint_range(2, 24) = 12;      // colour steps per channel
+uniform int pixel_size : hint_range(1, 12) = 2;   // screen pixels per art pixel
+uniform int levels : hint_range(2, 24) = 16;      // colour steps per channel
 uniform bool dither = true;
-uniform float dither_strength : hint_range(0.0, 1.0) = 0.5;   // 1 = full band width
+uniform float dither_strength : hint_range(0.0, 1.0) = 0.35;  // 1 = full band width
 
 // 4x4 Bayer matrix, normalized to [0, 1)
 const mat4 BAYER = mat4(

@@ -1,5 +1,8 @@
 shader_type spatial;
-render_mode cull_back, unshaded;
+// cull_disabled to match the standard material: the quad instances' winding
+// varies per face direction, so back-face culling drops the side faces (risers)
+// — they vanished in the toon/retro looks until this matched.
+render_mode cull_disabled, unshaded;
 // Toon / cel terrain: the per-instance voxel colour lit by a hard-banded sun —
 // three flat lighting steps and a touch of sky ambient instead of the smooth
 // PBR response. Normals come from the quad instances (world space via MODEL).
