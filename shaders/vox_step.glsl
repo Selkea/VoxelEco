@@ -14,10 +14,13 @@ layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
 layout(set = 0, binding = 0, std430) restrict buffer CellsBuf { uint cells[]; };
 // MULTI-BUFFER CELLS: Godot caps a single storage buffer at 4 GB (32-bit byte
-// size), so worlds past ~1.07B cells split across TWO buffers at a linear index
-// boundary (p.cells_split, a whole y-slab). cget/cset route every access; smaller
-// worlds set cells_split = cell count so everything stays in buffer A.
+// size), so bigger worlds split across up to THREE buffers at linear index
+// boundaries (p.cells_split / p.cells_split2, whole y-slabs). cget/cset route
+// every access; smaller worlds set the unused splits to the cell count so the
+// spare buffers (64-byte stubs) are never touched. uint32 indexing caps the
+// total at ~4.29B cells.
 layout(set = 0, binding = 8, std430) restrict buffer CellsBuf2 { uint cells2[]; };
+layout(set = 0, binding = 9, std430) restrict buffer CellsBuf3 { uint cells3[]; };
 layout(set = 0, binding = 1, std430) restrict buffer PackBuf { uint packed_out[]; };
 layout(set = 0, binding = 2, std430) restrict buffer StatsBuf { uint rained; uint evaporated; uint absorbed; };
 // Noita-style dirty tracking, one flag per 16x16-column mesh chunk: settled
@@ -55,16 +58,27 @@ layout(push_constant) uniform Params {
 	// buffer stores world-Y [gen_oy, gen_oy+H); gen/emit map buffer y -> world y by
 	// adding it. Below the band is implicit bedrock, above it is implicit air.
 	uint gen_oy;
-	// first linear cell index stored in cells2 (multi-buffer split; = total cell
-	// count when the world fits one buffer, so buffer B is never touched)
-	uint cells_split;
+	// first linear cell index stored in cells2 / cells3 (multi-buffer splits;
+	// unused splits = total cell count, so the spare buffers are never touched)
+	uint cells_split; uint cells_split2;
+	// distance LOD: camera position in the LOCAL render frame (voxels) and the
+	// near radius. Columns within lod_r of the camera render as fine 5 cm faces
+	// (do_face_emit); farther terrain as coarse 1 m block quads (do_lod_emit).
+	// lod_r == 0 disables LOD (everything fine) — tests and small worlds.
+	uint lod_cx; uint lod_cz; uint lod_r;
 } p;
 
-// route a linear cell index to its buffer (see CellsBuf2). Spatially adjacent
-// cells share a buffer (the split is a whole y-slab), so the branch is coherent.
-uint cget(uint i) { return i < p.cells_split ? cells[i] : cells2[i - p.cells_split]; }
+// route a linear cell index to its buffer (see CellsBuf2/3). Spatially adjacent
+// cells share a buffer (splits are whole y-slabs), so the branch is coherent.
+uint cget(uint i) {
+	if (i < p.cells_split) { return cells[i]; }
+	if (i < p.cells_split2) { return cells2[i - p.cells_split]; }
+	return cells3[i - p.cells_split2];
+}
 void cset(uint i, uint v) {
-	if (i < p.cells_split) { cells[i] = v; } else { cells2[i - p.cells_split] = v; }
+	if (i < p.cells_split) { cells[i] = v; }
+	else if (i < p.cells_split2) { cells2[i - p.cells_split] = v; }
+	else { cells3[i - p.cells_split2] = v; }
 }
 
 const uint CHUNK = 16u;
@@ -283,7 +297,8 @@ void do_step() {
 			if (ib[l]) {
 				uint ai = ids[l];   // routed atomic (partition self-test only)
 				if (ai < p.cells_split) { atomicAdd(cells[ai], 1u); }
-				else { atomicAdd(cells2[ai - p.cells_split], 1u); }
+				else if (ai < p.cells_split2) { atomicAdd(cells2[ai - p.cells_split], 1u); }
+				else { atomicAdd(cells3[ai - p.cells_split2], 1u); }
 			}
 		}
 		return;
@@ -534,6 +549,13 @@ void do_face_emit() {
 	if (z < p.cut_z) { return; }
 	float wx = float(world_coord(x, p.gen_ox, p.W) - p.gen_ox);
 	float wz = float(world_coord(z, p.gen_oz, p.D) - p.gen_oz);
+	// distance LOD: fine 5 cm faces only within lod_r of the camera (local frame);
+	// the far terrain comes from do_lod_emit's coarse block quads. lod_r 0 = all fine.
+	if (p.lod_r > 0u) {
+		float ddx = wx - float(p.lod_cx);
+		float ddz = wz - float(p.lod_cz);
+		if (ddx * ddx + ddz * ddz > float(p.lod_r) * float(p.lod_r)) { return; }
+	}
 	uint buried = 0u;
 	uint yy = p.H;
 	while (yy > 0u) {
@@ -795,6 +817,109 @@ void do_skin_emit() {
 	}
 }
 
+// ---- distance LOD: coarse far terrain (mode 11) ----
+
+// exact surface top (buffer y of the top solid/water cell + 1) of one column
+uint col_top(uint x, uint z) {
+	uint yy = p.H;
+	while (yy > 0u) {
+		yy--;
+		if (MAT(cget(cidx(x, yy, z))) != AIR) { return yy + 1u; }
+	}
+	return 0u;
+}
+
+// representative top of a 1 m block: the MIN of its centre + 4 corner columns,
+// returned as (top, column x, column z) — the COLUMN MATTERS: the surface
+// material must be sampled from the column that set the min (sampling another
+// column at that height reads its subsoil and paints far terrain brown/grey).
+// Using the min means the far quad never pokes above the fine near geometry in
+// the LOD-boundary overlap ring — worst case it sits slightly recessed, hidden
+// behind the skirts, which reads fine at distance.
+uvec3 lod_top(uint bx, uint bz) {
+	uint x0 = bx * 20u, z0 = bz * 20u;
+	uint x1 = min(x0 + 19u, p.W - 1u), z1 = min(z0 + 19u, p.D - 1u);
+	uint cx = min(x0 + 10u, p.W - 1u), cz = min(z0 + 10u, p.D - 1u);
+	uvec3 best = uvec3(col_top(cx, cz), cx, cz);
+	uint t = col_top(x0, z0); if (t < best.x) { best = uvec3(t, x0, z0); }
+	t = col_top(x1, z0); if (t < best.x) { best = uvec3(t, x1, z0); }
+	t = col_top(x0, z1); if (t < best.x) { best = uvec3(t, x0, z1); }
+	t = col_top(x1, z1); if (t < best.x) { best = uvec3(t, x1, z1); }
+	return best;
+}
+
+// FAR LOD: one thread per 1 m block (20x20 columns). Beyond the near radius,
+// emit ONE top quad per block plus side skirts down to each lower neighbour —
+// the correct silhouette at distance for ~1/400th the instances of fine columns.
+// Overlaps the fine region by one block so the boundary ring can't gap open.
+void do_lod_emit() {
+	if (p.lod_r == 0u) { return; }
+	uint nbxl = (p.W + 19u) / 20u;
+	uint nbzl = (p.D + 19u) / 20u;
+	uint id = flat_id();
+	if (id >= nbxl * nbzl) { return; }
+	uint bx = id % nbxl;
+	uint bz = id / nbxl;
+	uint x0 = bx * 20u, z0 = bz * 20u;
+	if (z0 + 19u < p.cut_z) { return; }
+	// skip blocks straddling the toroidal seam (their columns are world-far apart)
+	uint xe = min(x0 + 19u, p.W - 1u), ze = min(z0 + 19u, p.D - 1u);
+	float wx0 = float(world_coord(x0, p.gen_ox, p.W) - p.gen_ox);
+	float wz0 = float(world_coord(z0, p.gen_oz, p.D) - p.gen_oz);
+	if (float(world_coord(xe, p.gen_ox, p.W) - p.gen_ox) - wx0 != float(xe - x0)) { return; }
+	if (float(world_coord(ze, p.gen_oz, p.D) - p.gen_oz) - wz0 != float(ze - z0)) { return; }
+	// the fine pass owns the near disc; keep blocks whose centre is beyond
+	// lod_r - 28 (one block + margin of overlap into the fine region)
+	float ddx = (wx0 + 10.0) - float(p.lod_cx);
+	float ddz = (wz0 + 10.0) - float(p.lod_cz);
+	float rr = max(float(p.lod_r) - 28.0, 0.0);
+	if (ddx * ddx + ddz * ddz < rr * rr) { return; }
+	uvec3 bt = lod_top(bx, bz);
+	uint top = bt.x;
+	if (top == 0u) { return; }
+	uint ccx = bt.y, ccz = bt.z;   // sample material at the min column's own surface
+	uint traw = cget(cidx(ccx, top - 1u, ccz));
+	uint tm = MAT(traw);
+	bool iw = tm == WATER;
+	float Y = float(int(top) + int(p.gen_oy));
+	// per-block tint id keeps the coarse quads from reading as one flat colour
+	uint bid = x0 + z0 * p.W;
+	vec4 tcol = iw ? vec4(1.0) : vec4(surf_color(traw, tm, bid), 1.0);
+	if (iw) {
+		uint sl = atomicAdd(n_water, 1u);
+		if (sl < cap_water) { write_quad(true, sl, vec3(20,0,0), vec3(0,1,0), vec3(0,0,20), vec3(wx0, Y, wz0), tcol); }
+	} else {
+		uint sl = atomicAdd(n_solid, 1u);
+		if (sl < cap_solid) { write_quad(false, sl, vec3(20,0,0), vec3(0,1,0), vec3(0,0,20), vec3(wx0, Y, wz0), tcol); }
+	}
+	// skirt colour: the SURFACE material. A skirt mostly stands in for a run of
+	// gentle steps whose visible faces are grass tops and 1-voxel grass risers —
+	// colouring it subsoil brown painted every distant ridge brown. The side
+	// normal's lighting darkens it naturally, like the fine render's risers.
+	vec4 scol = tcol;
+	for (uint k = 0u; k < 4u; k++) {
+		int nx = int(bx) + (k == 0u ? 1 : (k == 1u ? -1 : 0));
+		int nz = int(bz) + (k == 2u ? 1 : (k == 3u ? -1 : 0));
+		if (nx < 0 || nx >= int(nbxl) || nz < 0 || nz >= int(nbzl)) { continue; }
+		uint nt = lod_top(uint(nx), uint(nz)).x;
+		if (nt >= top || nt == 0u) { continue; }
+		float h0 = float(int(nt) + int(p.gen_oy));
+		float hh = float(top - nt);
+		vec3 ax, ay, az, org;
+		if (k == 0u)      { ax = vec3(0,hh,0); az = vec3(0,0,20); ay = vec3( 1,0,0); org = vec3(wx0+20.0, h0, wz0); }
+		else if (k == 1u) { ax = vec3(0,hh,0); az = vec3(0,0,20); ay = vec3(-1,0,0); org = vec3(wx0, h0, wz0); }
+		else if (k == 2u) { ax = vec3(20,0,0); az = vec3(0,hh,0); ay = vec3(0,0, 1); org = vec3(wx0, h0, wz0+20.0); }
+		else              { ax = vec3(20,0,0); az = vec3(0,hh,0); ay = vec3(0,0,-1); org = vec3(wx0, h0, wz0); }
+		if (iw) {
+			uint sl = atomicAdd(n_water, 1u);
+			if (sl < cap_water) { write_quad(true, sl, ax, ay, az, org, vec4(1.0)); }
+		} else {
+			uint sl = atomicAdd(n_solid, 1u);
+			if (sl < cap_solid) { write_quad(false, sl, ax, ay, az, org, scol); }
+		}
+	}
+}
+
 // ---- GPU worldgen: value-noise fbm heightfield, bowl basin, ridge ----
 
 float vhash(vec2 q) {
@@ -961,5 +1086,6 @@ void main() {
 	else if (mode == 6u) { do_skin_emit(); }
 	else if (mode == 7u) { do_decay(); }
 	else if (mode == 8u) { do_face_emit(); }
+	else if (mode == 11u) { do_lod_emit(); }
 	else { do_step(); }
 }

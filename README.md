@@ -148,16 +148,24 @@ Creative-mode free flight (no gravity / collision):
   regenerates; horizontal motion stays toroidal/state-preserving as long as you fly
   at roughly constant elevation. This is what lets a 256 m-tall world keep a wide
   (~50 m) footprint under the 1-billion-cell single-buffer ceiling.
-- **Scale**: the default fly window is a **1280x1280 footprint (64 m) with a
-  63 m resident band at 5 cm** — **~2.06 billion sim cells**. A single GPU storage
-  buffer is 32-bit-sized in Godot (~4 GB ≈ 1.07B cells), so the cells span **two
-  buffers** split at a y-slab boundary; a tiny routing helper in the shader
-  (`cget`/`cset`) picks the buffer per access, verified bit-identical to the
-  single-buffer sim (`VOX_SPLITTEST`). Worlds past ~2.06B cells are clamped with
-  a warning. The tall band costs no draw time (draw scales with surface, not
-  volume) and leaves ~50 m of vertical margin for steeper terrain. Toroidal
-  streaming (horizontal) and the vertical-tracking band (up/down) keep this
-  window resident while the world itself is unbounded sideways and 256 m tall.
+- **Distance LOD**: fine **5 cm faces** are emitted only within a near disc of the
+  camera (`VOX_LODR`, default 40 m); beyond it each **1 m block** becomes one top
+  quad plus side skirts down to its lower neighbours — the correct silhouette for
+  ~1/400th the instances. The near disc follows the camera (the emit re-runs when
+  it moves ~2 m), the far pass overlaps the fine region by a block so the boundary
+  can't gap, far tops use the min of sampled columns so they never poke through
+  the fine detail, and skirts are surface-coloured so distant ridges read like
+  the fine render. This decouples draw cost from window size — the draw is
+  ~10 ms at a 102 m window, faster than the old 64 m window.
+- **Scale**: the default fly window is a **2048x2048 footprint (102 m) with a
+  37.8 m resident band at 5 cm** — **~3.17 billion sim cells**. A single GPU
+  storage buffer is 32-bit-sized in Godot (~4 GB ≈ 1.07B cells), so the cells span
+  **three buffers** split at y-slab boundaries; a tiny routing helper in the
+  shader (`cget`/`cset`) picks the buffer per access, verified bit-identical to
+  the single-buffer sim (`VOX_SPLITTEST`). Worlds past ~3.17B cells are clamped
+  with a warning (uint32 indexing tops out at 4.29B). Toroidal streaming
+  (horizontal) and the vertical-tracking band (up/down) keep this window resident
+  while the world itself is unbounded sideways and 256 m tall.
 
 ## Physical scale & calibration
 

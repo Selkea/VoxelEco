@@ -22,6 +22,7 @@ var _title_acc := 0.0
 var interactive := false
 var _freeze_cam := false   # non-interactive shots that set their own camera
 var _band_acc := 0.0       # throttle for the vertical-tracking band check
+var _lod_cam_last := Vector2(1e12, 1e12)   # camera pos at the last LOD emit
 var _env: Environment
 var fly_pos := Vector3()
 var fly_yaw := 0.0         # radians, mouse-look
@@ -62,33 +63,39 @@ func _world_size() -> Vector3i:
 	var sz := OS.get_environment("VOX_SIZE").to_int()
 	if sz > 0:
 		return _clamp_cells(Vector3i(sz, sz, hh if hh > 0 else maxi(24, sz * 3 / 8)))
-	# default map: a 1280x1280 footprint (64 m) with a 1260-voxel (63 m) resident
+	# default map: a 2048x2048 footprint (102 m) with a 756-voxel (37.8 m) resident
 	# BAND that vertically tracks the terrain surface (gen_oy). The world's true
 	# vertical relief is 256 m (GpuWorld.RELIEF) but only this near-surface band is
-	# ever stored — ~2.06B sim cells, SPLIT ACROSS TWO GPU BUFFERS (a single Godot
-	# storage buffer caps at 4 GB; cget/cset in the shader route each access). The
-	# tall band costs no draw time (draw scales with surface, not volume) and gives
-	# ~50 m of vertical margin — room for much steeper terrain without clipping.
+	# ever stored — ~3.17B sim cells, SPLIT ACROSS THREE GPU BUFFERS (a single
+	# Godot storage buffer caps at 4 GB; cget/cset in the shader route each
+	# access). The draw stays 60fps-sized at this width because of DISTANCE LOD:
+	# fine 5 cm faces near the camera, coarse 1 m block quads beyond (VOX_LODR).
 	# VOX_H overrides the band height, not the relief.
-	return Vector3i(1280, 1280, hh if hh > 0 else 1260)
+	return Vector3i(2048, 2048, hh if hh > 0 else 756)
 
-# The cells now span TWO storage buffers (each 32-bit-size-capped at ~4 GB in
-# Godot), so the ceiling is ~2.06B cells (~8.3 GB VRAM). Past that a buffer would
-# silently truncate and the world read back as garbage, so clamp the height and
-# warn rather than generate a broken map. (More buffers would raise it further;
-# uint32 cell indexing tops out at 4.29B cells.)
+# The cells now span up to THREE storage buffers (each 32-bit-size-capped at
+# ~4 GB in Godot), so the ceiling is ~3.17B cells (~12.7 GB VRAM). Past that a
+# buffer would silently truncate and the world read back as garbage, so clamp
+# the height and warn rather than generate a broken map. (uint32 cell indexing
+# tops out at 4.29B cells, so a fourth buffer wouldn't be fully addressable.)
 func _clamp_cells(ws: Vector3i) -> Vector3i:
-	const MAX_CELLS := 2_060_000_000
+	const MAX_CELLS := 3_170_000_000
 	var cells := ws.x * ws.y * ws.z
 	if cells <= MAX_CELLS:
 		return ws
 	var h := maxi(24, MAX_CELLS / (ws.x * ws.y))
-	push_warning("World %dx%dx%d = %.1fB cells exceeds the ~2.06B two-buffer limit; clamping height to %d." % [ws.x, ws.y, ws.z, cells / 1e9, h])
+	push_warning("World %dx%dx%d = %.1fB cells exceeds the ~3.17B three-buffer limit; clamping height to %d." % [ws.x, ws.y, ws.z, cells / 1e9, h])
 	return Vector3i(ws.x, ws.y, h)
 
 func _ready() -> void:
 	var ws := _world_size()
 	world = GpuWorld.new(12345, ws.x, ws.y, ws.z)
+	if world is GpuWorld:
+		# distance LOD: fine faces within this radius (voxels) of the camera,
+		# coarse 1m block quads beyond. Default on for wide windows; VOX_LODR
+		# overrides (0 = off). Small/test worlds render all-fine as before.
+		var lr := OS.get_environment("VOX_LODR")
+		(world as GpuWorld).lod_r = lr.to_int() if lr != "" else (800 if ws.x >= 1536 else 0)
 	if not world.gpu_ok:
 		world.prime()      # the CPU fallback path needs its active set
 	view = VoxView.new()
@@ -374,6 +381,28 @@ func _process(dt: float) -> void:
 
 func _refresh_view(force := false) -> void:
 	if view.use_instances:
+		# distance LOD follows the camera: aim the near disc at the camera's local-
+		# frame position, and re-emit when the camera has moved far enough that the
+		# LOD boundary would visibly lag (even if the sim itself is static).
+		if world is GpuWorld and (world as GpuWorld).lod_r > 0:
+			var gw := world as GpuWorld
+			var lc: Vector3
+			if interactive:
+				lc = fly_pos
+			elif cam != null:
+				lc = cam.position + _render_off()
+			else:   # first refresh in _ready, before the camera exists
+				lc = Vector3(gw.gen_origin_x + world.W * 0.5, 0.0, gw.gen_origin_z + world.D * 0.5)
+			gw.lod_cx = maxi(0, int(lc.x) - gw.gen_origin_x)
+			gw.lod_cz = maxi(0, int(lc.z) - gw.gen_origin_z)
+			if Vector2(lc.x, lc.z).distance_to(_lod_cam_last) > 40.0:   # 2 m
+				force = true
+			if force or world.any_dirty_and_clear():
+				_lod_cam_last = Vector2(lc.x, lc.z)
+				var counts: PackedInt32Array = world.dispatch_emit()
+				if counts.size() == 2:
+					view.set_visible_counts(counts[0], counts[1])
+			return
 		# only re-emit when the sim actually changed (or forced on first show /
 		# restart). A static world keeps its instance buffer, so it can't flicker.
 		if force or world.any_dirty_and_clear():
@@ -433,6 +462,8 @@ func _take_screenshot() -> void:
 		cam.look_at(Vector3(cx, surf - 139.0, cz + 227.0) - ro, Vector3.UP)   # -34 deg (default pitch)
 		var vprid := get_viewport().get_viewport_rid()
 		RenderingServer.viewport_set_measure_render_time(vprid, true)
+		gw.lod_cx = maxi(0, int(cx) - gw.gen_origin_x)     # LOD near disc at the camera
+		gw.lod_cz = maxi(0, int(cz - 20.0) - gw.gen_origin_z)
 		var cnt: PackedInt32Array = gw.dispatch_emit()
 		view.set_visible_counts(cnt[0], cnt[1])
 		for i in range(15):
@@ -525,6 +556,8 @@ func _take_screenshot() -> void:
 		_freeze_cam = true
 		world.set_rain_mm_hr(0.0)
 		world.run(90)
+		gw.lod_cx = maxi(0, int(cx) - gw.gen_origin_x)   # LOD near disc at window centre
+		gw.lod_cz = maxi(0, int(cz) - gw.gen_origin_z)
 		var cnt: PackedInt32Array = gw.dispatch_emit()
 		view.set_visible_counts(cnt[0], cnt[1])
 		var lo := 1e9
@@ -670,10 +703,23 @@ func _run_sim_test() -> void:
 		# async; a tiny buffer read flushes + syncs the queue, so timing run()/emit
 		# followed by that read captures the GPU time.
 		var ws := _world_size()
+		# free the member world's VRAM first — at 3.17B cells (12.7 GB) two resident
+		# worlds oversubscribe a 24 GB card and the probe measures paging, not compute.
+		# Frees are deferred a few frames, so idle until the memory actually returns
+		# (speed_mult 0 keeps _process from stepping the freed world meanwhile).
+		speed_mult = 0
+		(world as GpuWorld).free_gpu()
+		for i in range(8):
+			await get_tree().process_frame
 		var gw := GpuWorld.new(999, ws.x, ws.y, ws.z)
 		if not gw.gpu_ok:
 			print("PERF: no GPU"); get_tree().quit(); return
 		gw.regen_tracked(100000, 100000)
+		# match the interactive LOD config so the emit numbers are the real ones
+		var lre := OS.get_environment("VOX_LODR")
+		gw.lod_r = lre.to_int() if lre != "" else (800 if ws.x >= 1536 else 0)
+		gw.lod_cx = ws.x / 2
+		gw.lod_cz = ws.y / 2
 		var cells := ws.x * ws.y * ws.z
 		# dummy instance buffers (64 B/instance: 12-float xform + 4-float colour) so
 		# the emit can write; bind them as the emit targets
@@ -712,14 +758,14 @@ func _run_sim_test() -> void:
 		# single-buffer run — gen, rain, physics and erosion are all deterministic
 		# per seed, so any cget/cset routing bug shows up as a cell mismatch.
 		var wa := GpuWorld.new(4242, 192, 192, 192)
-		OS.set_environment("VOX_FORCESPLIT", "1")
+		OS.set_environment("VOX_FORCESPLIT", "2")   # force THREE buffers on B
 		var wb := GpuWorld.new(4242, 192, 192, 192)
 		OS.set_environment("VOX_FORCESPLIT", "")
 		if not wa.gpu_ok or not wb.gpu_ok:
 			print("SPLITTEST: no GPU"); get_tree().quit(); return
 		var nt := 192 * 192 * 192
-		print("SPLITTEST: A split=%d/%d (single) vs B split=%d/%d (two buffers)" \
-			% [wa.cells_split, nt, wb.cells_split, nt])
+		print("SPLITTEST: A splits=%d,%d/%d (single) vs B splits=%d,%d/%d (three buffers)" \
+			% [wa.cells_split, wa.cells_split2, nt, wb.cells_split, wb.cells_split2, nt])
 		wa.regen_tracked(100000, 100000)
 		wb.gen_oy = wa.gen_oy               # identical band + origin
 		wb.regen(100000, 100000)
@@ -731,7 +777,7 @@ func _run_sim_test() -> void:
 		for i in range(wa.cell.size()):
 			if wa.cell[i] != wb.cell[i]: diff += 1
 		print("SPLITTEST: %d of %d cells differ after storm+settle" % [diff, nt])
-		print("SPLIT EQUIVALENT" if diff == 0 and wb.cells_split < nt else "SPLIT MISMATCH")
+		print("SPLIT EQUIVALENT" if diff == 0 and wb.cells_split2 < nt else "SPLIT MISMATCH")
 		wa.free_gpu(); wb.free_gpu()
 		get_tree().quit()
 		return
@@ -741,8 +787,8 @@ func _run_sim_test() -> void:
 		# assert the terrain surface stays resident in the band the whole way (never
 		# clips out the top or bottom). gw is tiny — only its CPU noise (surface_world_y,
 		# seeded) is used; the band footprint/height are the real defaults.
-		var Wt := 1280.0
-		var Ht := 1260
+		var Wt := 2048.0
+		var Ht := 756
 		var gw := GpuWorld.new(777, 64, 64, 64)
 		var base := 100000.0
 		var band_target := func(cx: float, cz: float) -> int:
