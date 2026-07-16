@@ -12,6 +12,11 @@ var gpu_ok := false
 var shader: RID
 var pipeline: RID
 var cells_buf: RID
+var cells_buf2: RID    # second half of a >4GB world (see cells_split)
+# first linear cell index living in cells_buf2. Godot caps one storage buffer at
+# 4 GB (32-bit byte size), so bigger worlds split at a whole y-slab boundary; the
+# shader's cget/cset route each access. Fits-in-one worlds set split = cell count.
+var cells_split := 0
 var pack_buf: RID
 var stats_buf: RID
 var dirty_buf: RID
@@ -94,17 +99,28 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	pipeline = rd.compute_pipeline_create(shader)
 
 	var n := cell.size()
+	# split point: worlds over ~4 GB of cells split across two buffers at a whole
+	# y-slab (VOX_FORCESPLIT=1 forces a split on small worlds for the equivalence
+	# test); otherwise everything lives in buffer A and B is a stub.
+	if n * 4 > 4_000_000_000 or OS.get_environment("VOX_FORCESPLIT") != "":
+		cells_split = (H / 2) * W * D
+	else:
+		cells_split = n
 	if _need_gpu_gen:
 		# no CPU upload — the gen kernel writes every cell, so allocating a
 		# multi-GB zeroed CPU array just to upload it would blow out RAM on big
-		# worlds. Create the VRAM buffer uninitialised; do_gen fills it in _init.
-		cells_buf = rd.storage_buffer_create(n * 4)
+		# worlds. Create the VRAM buffers uninitialised; do_gen fills them in _init.
+		cells_buf = rd.storage_buffer_create(cells_split * 4)
+		cells_buf2 = rd.storage_buffer_create(maxi((n - cells_split) * 4, 64))
 	else:
 		var ints := PackedInt32Array()
 		ints.resize(n)
 		for i in range(n):
 			ints[i] = cell[i]
-		cells_buf = rd.storage_buffer_create(n * 4, ints.to_byte_array())
+		var bytes := ints.to_byte_array()
+		cells_buf = rd.storage_buffer_create(cells_split * 4, bytes.slice(0, cells_split * 4))
+		cells_buf2 = rd.storage_buffer_create(maxi((n - cells_split) * 4, 64),
+				bytes.slice(cells_split * 4) if n > cells_split else PackedByteArray())
 	var words := (n + 3) / 4          # pack-dispatch thread count (see _pack_groups)
 	# pack buffer (~1 byte/cell) is only read by sync_cells (tests/analysis),
 	# never in the interactive/render path — allocate a stub and grow it on the
@@ -300,7 +316,7 @@ func band_oy_for(wx: float, wz: float) -> int:
 
 func _rebuild_uniform_set() -> void:
 	var bufs := [cells_buf, pack_buf, stats_buf, dirty_buf,
-			_solid_target, _water_target, inst_count_buf, active_buf]
+			_solid_target, _water_target, inst_count_buf, active_buf, cells_buf2]
 	var us: Array[RDUniform] = []
 	for b in range(bufs.size()):
 		var u := RDUniform.new()
@@ -319,7 +335,7 @@ func bind_instance_buffers(solid_rid: RID, water_rid: RID) -> void:
 	_water_target = water_rid
 	_rebuild_uniform_set()
 
-const PC_SIZE := 68   # push constant byte size (must match the shader struct)
+const PC_SIZE := 72   # push constant byte size (must match the shader struct)
 
 func _pc(mode: int, offset: int) -> PackedByteArray:
 	# 64-byte push constant. rain is an integer threshold out of 2^24; evap/erode
@@ -344,6 +360,7 @@ func _pc(mode: int, offset: int) -> PackedByteArray:
 	pc.encode_u32(56, gen_strip_x if gen_strip_x != 0 else (W << 16))
 	pc.encode_u32(60, gen_strip_z if gen_strip_z != 0 else (D << 16))
 	pc.encode_u32(64, gen_oy)          # world-Y voxel of the buffer floor (band)
+	pc.encode_u32(68, cells_split)     # first cell index in cells_buf2 (multi-buffer)
 	return pc
 
 func step() -> void:
@@ -454,7 +471,10 @@ func upload_cells() -> void:
 	ints.resize(n)
 	for i in range(n):
 		ints[i] = cell[i]
-	rd.buffer_update(cells_buf, 0, n * 4, ints.to_byte_array())
+	var bytes := ints.to_byte_array()
+	rd.buffer_update(cells_buf, 0, mini(n, cells_split) * 4, bytes.slice(0, mini(n, cells_split) * 4))
+	if n > cells_split:
+		rd.buffer_update(cells_buf2, 0, (n - cells_split) * 4, bytes.slice(cells_split * 4))
 
 func reset_water_stats() -> void:
 	super.reset_water_stats()
@@ -465,7 +485,7 @@ func free_gpu() -> void:
 	if rd == null:
 		return
 	# free our resources, never the shared main device
-	for r in [uniform_set, pipeline, shader, cells_buf, pack_buf, stats_buf,
+	for r in [uniform_set, pipeline, shader, cells_buf, cells_buf2, pack_buf, stats_buf,
 			dirty_buf, active_buf, inst_count_buf, _placeholder_a, _placeholder_b]:
 		if r.is_valid():
 			rd.free_rid(r)

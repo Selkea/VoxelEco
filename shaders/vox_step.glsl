@@ -13,6 +13,11 @@
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
 layout(set = 0, binding = 0, std430) restrict buffer CellsBuf { uint cells[]; };
+// MULTI-BUFFER CELLS: Godot caps a single storage buffer at 4 GB (32-bit byte
+// size), so worlds past ~1.07B cells split across TWO buffers at a linear index
+// boundary (p.cells_split, a whole y-slab). cget/cset route every access; smaller
+// worlds set cells_split = cell count so everything stays in buffer A.
+layout(set = 0, binding = 8, std430) restrict buffer CellsBuf2 { uint cells2[]; };
 layout(set = 0, binding = 1, std430) restrict buffer PackBuf { uint packed_out[]; };
 layout(set = 0, binding = 2, std430) restrict buffer StatsBuf { uint rained; uint evaporated; uint absorbed; };
 // Noita-style dirty tracking, one flag per 16x16-column mesh chunk: settled
@@ -50,7 +55,17 @@ layout(push_constant) uniform Params {
 	// buffer stores world-Y [gen_oy, gen_oy+H); gen/emit map buffer y -> world y by
 	// adding it. Below the band is implicit bedrock, above it is implicit air.
 	uint gen_oy;
+	// first linear cell index stored in cells2 (multi-buffer split; = total cell
+	// count when the world fits one buffer, so buffer B is never touched)
+	uint cells_split;
 } p;
+
+// route a linear cell index to its buffer (see CellsBuf2). Spatially adjacent
+// cells share a buffer (the split is a whole y-slab), so the branch is coherent.
+uint cget(uint i) { return i < p.cells_split ? cells[i] : cells2[i - p.cells_split]; }
+void cset(uint i, uint v) {
+	if (i < p.cells_split) { cells[i] = v; } else { cells2[i - p.cells_split] = v; }
+}
 
 const uint CHUNK = 16u;
 
@@ -197,8 +212,8 @@ void do_rain() {
 		uint x = id % p.W;
 		uint z = id / p.W;
 		uint i = cidx(x, p.H - 1u, z);
-		if (MAT(cells[i]) == AIR) {
-			cells[i] = WATER;
+		if (MAT(cget(i)) == AIR) {
+			cset(i, WATER);
 			atomicAdd(rained, 1u);
 			mark_dirty(x, z);
 		}
@@ -211,10 +226,10 @@ void do_pack() {
 	if (id * 4u >= n) { return; }
 	uint b = id * 4u;
 	// pack only the MATERIAL byte of each cell for CPU-side meshing/analysis
-	uint v = MAT(cells[b]);
-	if (b + 1u < n) { v |= MAT(cells[b + 1u]) << 8u; }
-	if (b + 2u < n) { v |= MAT(cells[b + 2u]) << 16u; }
-	if (b + 3u < n) { v |= MAT(cells[b + 3u]) << 24u; }
+	uint v = MAT(cget(b));
+	if (b + 1u < n) { v |= MAT(cget(b + 1u)) << 8u; }
+	if (b + 2u < n) { v |= MAT(cget(b + 2u)) << 16u; }
+	if (b + 3u < n) { v |= MAT(cget(b + 3u)) << 24u; }
 	packed_out[id] = v;
 }
 
@@ -259,13 +274,17 @@ void do_step() {
 		bool ok = pos.y < p.H;
 		ib[l] = ok;
 		ids[l] = ok ? cidx(pos.x, pos.y, pos.z) : 0u;
-		c[l] = ok ? cells[ids[l]] : BEDROCK;
+		c[l] = ok ? cget(ids[l]) : BEDROCK;
 		any_active = any_active || movable(MAT(c[l]));
 	}
 	if ((p.mode >> 8u) == 32u) {
 		// partition self-test: count how many threads touch each cell.
 		for (uint l = 0u; l < 8u; l++) {
-			if (ib[l]) { atomicAdd(cells[ids[l]], 1u); }
+			if (ib[l]) {
+				uint ai = ids[l];   // routed atomic (partition self-test only)
+				if (ai < p.cells_split) { atomicAdd(cells[ai], 1u); }
+				else { atomicAdd(cells2[ai - p.cells_split], 1u); }
+			}
 		}
 		return;
 	}
@@ -430,8 +449,8 @@ void do_step() {
 
 	bool changed = false;
 	for (uint l = 0u; l < 8u; l++) {
-		if (ib[l] && cells[ids[l]] != c[l]) {
-			cells[ids[l]] = c[l];
+		if (ib[l] && cget(ids[l]) != c[l]) {
+			cset(ids[l], c[l]);
 			changed = true;
 		}
 	}
@@ -520,7 +539,7 @@ void do_face_emit() {
 	while (yy > 0u) {
 		yy--;
 		uint cid = cidx(x, yy, z);
-		uint raw = cells[cid];
+		uint raw = cget(cid);
 		uint m = MAT(raw);
 		if (m == AIR) { buried = 0u; continue; }
 		bool is_water = m == WATER;
@@ -535,8 +554,12 @@ void do_face_emit() {
 			uint nm = AIR;
 			bool oob = nx<0 || nx>=int(p.W) || ny>=int(p.H) || nz<0 || nz>=int(p.D);
 			if (ny < 0) { nm = BEDROCK; }
-			else if (nz < int(p.cut_z)) { nm = AIR; }
-			else if (!oob) { nm = MAT(cells[cidx(uint(nx), uint(ny), uint(nz))]); }
+			else if (nz < int(p.cut_z)) { nm = AIR; }   // cross-section reveal stays open
+			// sideways past the window edge counts SOLID: the camera lives inside a
+			// streamed window, so the perimeter "diorama" walls are never visible —
+			// at a 1260-voxel band they were ~2.7M instances (half the draw) of wall.
+			else if (oob && dy == 0) { nm = BEDROCK; }
+			else if (!oob) { nm = MAT(cget(cidx(uint(nx), uint(ny), uint(nz)))); }
 			nbr[k] = nm;
 			if (nm != AIR && nm != WATER) { solid_n += 1; }
 		}
@@ -579,7 +602,7 @@ void do_emit() {
 	while (yy > 0u) {
 		yy--;
 		uint cid = cidx(x, yy, z);
-		uint raw = cells[cid];
+		uint raw = cget(cid);
 		uint m = MAT(raw);
 		if (m == AIR) { buried = 0u; continue; }
 		bool is_water = m == WATER;
@@ -599,7 +622,7 @@ void do_emit() {
 			bool oob = nx < 0 || nx >= int(p.W) || ny >= int(p.H) || nz < 0 || nz >= int(p.D);
 			if (ny < 0) { nm = BEDROCK; }
 			else if (nz < int(p.cut_z)) { nm = AIR; }   // across the cut = open (reveal section)
-			else if (!oob) { nm = MAT(cells[cidx(uint(nx), uint(ny), uint(nz))]); }
+			else if (!oob) { nm = MAT(cget(cidx(uint(nx), uint(ny), uint(nz)))); }
 			if (nm != AIR && nm != WATER) { solid_n += 1; }
 			if (is_water ? (nm == AIR) : (nm == AIR || nm == WATER)) { exposed = true; }
 		}
@@ -658,7 +681,7 @@ void do_block_emit() {
 	uint surfmat = AIR;
 	for (uint yy = p.H; yy > 0u; ) {
 		yy--;
-		uint m = MAT(cells[cidx(cx, yy, cz)]);
+		uint m = MAT(cget(cidx(cx, yy, cz)));
 		if (m != AIR) { surfy = int(yy); surfmat = m; break; }
 	}
 	if (surfy < 0) { return; }                       // empty column
@@ -667,7 +690,7 @@ void do_block_emit() {
 		uint y0 = by * 20u;
 		uint m = surfmat;                            // top cube = surface material
 		if (by + 1u < ntop) {                        // body cube = its own centre
-			m = MAT(cells[cidx(cx, min(y0 + 10u, p.H - 1u), cz)]);
+			m = MAT(cget(cidx(cx, min(y0 + 10u, p.H - 1u), cz)));
 			if (m == AIR) { m = SOIL; }
 		}
 		vec3 center = vec3(float(int(x0)) + 10.0,        // local frame (floating origin)
@@ -708,7 +731,7 @@ uint block_top_h(uint bx, uint bz) {
 	uint cz = min(bz * 20u + 10u, p.D - 1u);
 	for (uint yy = p.H; yy > 0u; ) {
 		yy--;
-		if (MAT(cells[cidx(cx, yy, cz)]) != AIR) { return max((yy + 10u) / 20u, 1u) * 20u; }
+		if (MAT(cget(cidx(cx, yy, cz))) != AIR) { return max((yy + 10u) / 20u, 1u) * 20u; }
 	}
 	return 0u;
 }
@@ -733,7 +756,7 @@ void do_skin_emit() {
 	// block top above the real 5 cm terrain)
 	uint sm = SOIL; uint sraw = 0u;
 	for (uint yy = topf; yy > 0u; ) {
-		yy--; uint raw = cells[cidx(x, yy, z)];
+		yy--; uint raw = cget(cidx(x, yy, z));
 		if (MAT(raw) != AIR) { sm = MAT(raw); sraw = raw; break; }
 	}
 	// lowest exposed voxel: the top is always exposed; each block edge whose
@@ -757,7 +780,7 @@ void do_skin_emit() {
 	float wx = float(world_coord(x, p.gen_ox, p.W) - p.gen_ox);   // local frame (floating origin)
 	float wz = float(world_coord(z, p.gen_oz, p.D) - p.gen_oz);
 	for (uint y = low; y < topf; y++) {
-		uint raw = cells[cidx(x, y, z)];
+		uint raw = cget(cidx(x, y, z));
 		uint m = MAT(raw);
 		if (m == AIR) { m = sm; raw = sraw; }
 		vec3 c = vec3(wx + 0.5, float(int(y) + int(p.gen_oy)) + 0.5, wz + 0.5);
@@ -910,7 +933,7 @@ void do_gen() {
 				&& (top < sea || wy < top - 1)) { s0 = sat_cap(m); }
 		// fill low basins and valleys with standing water up to the water line
 		if (m == AIR && wy < sea) { m = WATER; s0 = 0u; }
-		cells[cidx(x, y, z)] = PACK(m, s0);
+		cset(cidx(x, y, z), PACK(m, s0));
 	}
 	// wake the freshly generated chunk so the physics settles it (then it sleeps)
 	uint cw = (p.W + CHUNK - 1u) / CHUNK;

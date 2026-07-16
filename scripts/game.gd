@@ -62,28 +62,28 @@ func _world_size() -> Vector3i:
 	var sz := OS.get_environment("VOX_SIZE").to_int()
 	if sz > 0:
 		return _clamp_cells(Vector3i(sz, sz, hh if hh > 0 else maxi(24, sz * 3 / 8)))
-	# default map: a 1280x1280 footprint (64 m) with a 630-voxel (31.5 m) resident
+	# default map: a 1280x1280 footprint (64 m) with a 1260-voxel (63 m) resident
 	# BAND that vertically tracks the terrain surface (gen_oy). The world's true
-	# vertical relief is 256 m (GpuWorld.RELIEF) but only this thin near-surface
-	# band is ever stored, so the footprint stays wide while the world is tall —
-	# ~1.03B sim cells (just under the single-buffer ceiling). The face-quad
-	# renderer draws this window at ~14 ms (was 64 ms for a SMALLER window as
-	# cubes), and the band still has ~20 m of margin over the ~12 m local relief.
+	# vertical relief is 256 m (GpuWorld.RELIEF) but only this near-surface band is
+	# ever stored — ~2.06B sim cells, SPLIT ACROSS TWO GPU BUFFERS (a single Godot
+	# storage buffer caps at 4 GB; cget/cset in the shader route each access). The
+	# tall band costs no draw time (draw scales with surface, not volume) and gives
+	# ~50 m of vertical margin — room for much steeper terrain without clipping.
 	# VOX_H overrides the band height, not the relief.
-	return Vector3i(1280, 1280, hh if hh > 0 else 630)
+	return Vector3i(1280, 1280, hh if hh > 0 else 1260)
 
-# A single GPU storage buffer's byte size is 32-bit in Godot, so the cells
-# buffer (4 bytes/cell) hard-caps at ~4 GB ≈ 1.05B cells no matter how much VRAM
-# the card has. Past that the buffer silently truncates and the world reads back
-# as garbage, so clamp the height and warn rather than generate a broken map.
-# (Breaking this ceiling for real needs chunk streaming — the next milestone.)
+# The cells now span TWO storage buffers (each 32-bit-size-capped at ~4 GB in
+# Godot), so the ceiling is ~2.06B cells (~8.3 GB VRAM). Past that a buffer would
+# silently truncate and the world read back as garbage, so clamp the height and
+# warn rather than generate a broken map. (More buffers would raise it further;
+# uint32 cell indexing tops out at 4.29B cells.)
 func _clamp_cells(ws: Vector3i) -> Vector3i:
-	const MAX_CELLS := 1_040_000_000
+	const MAX_CELLS := 2_060_000_000
 	var cells := ws.x * ws.y * ws.z
 	if cells <= MAX_CELLS:
 		return ws
 	var h := maxi(24, MAX_CELLS / (ws.x * ws.y))
-	push_warning("World %dx%dx%d = %.1fB cells exceeds the ~1.05B single-buffer limit; clamping height to %d." % [ws.x, ws.y, ws.z, cells / 1e9, h])
+	push_warning("World %dx%dx%d = %.1fB cells exceeds the ~2.06B two-buffer limit; clamping height to %d." % [ws.x, ws.y, ws.z, cells / 1e9, h])
 	return Vector3i(ws.x, ws.y, h)
 
 func _ready() -> void:
@@ -706,6 +706,35 @@ func _run_sim_test() -> void:
 		gw.free_gpu()
 		get_tree().quit()
 		return
+	if OS.get_environment("VOX_SPLITTEST") != "":
+		# multi-buffer equivalence: the same world (seed, band, origin) simulated
+		# with its cells SPLIT across two buffers must be BIT-IDENTICAL to the
+		# single-buffer run — gen, rain, physics and erosion are all deterministic
+		# per seed, so any cget/cset routing bug shows up as a cell mismatch.
+		var wa := GpuWorld.new(4242, 192, 192, 192)
+		OS.set_environment("VOX_FORCESPLIT", "1")
+		var wb := GpuWorld.new(4242, 192, 192, 192)
+		OS.set_environment("VOX_FORCESPLIT", "")
+		if not wa.gpu_ok or not wb.gpu_ok:
+			print("SPLITTEST: no GPU"); get_tree().quit(); return
+		var nt := 192 * 192 * 192
+		print("SPLITTEST: A split=%d/%d (single) vs B split=%d/%d (two buffers)" \
+			% [wa.cells_split, nt, wb.cells_split, nt])
+		wa.regen_tracked(100000, 100000)
+		wb.gen_oy = wa.gen_oy               # identical band + origin
+		wb.regen(100000, 100000)
+		for w2: GpuWorld in [wa, wb]:
+			w2.set_rain_mm_hr(80.0); w2.run(150)   # storm builds water + erosion state
+			w2.set_rain_mm_hr(0.0); w2.run(60)     # then settle
+		wa.sync_cells(); wb.sync_cells()
+		var diff := 0
+		for i in range(wa.cell.size()):
+			if wa.cell[i] != wb.cell[i]: diff += 1
+		print("SPLITTEST: %d of %d cells differ after storm+settle" % [diff, nt])
+		print("SPLIT EQUIVALENT" if diff == 0 and wb.cells_split < nt else "SPLIT MISMATCH")
+		wa.free_gpu(); wb.free_gpu()
+		get_tree().quit()
+		return
 	if OS.get_environment("VOX_TRACKTEST") != "":
 		# vertical-tracking band: fly a long horizontal path across the 256 m-relief
 		# world, apply the same deadband band-shift the interactive tracker uses, and
@@ -713,7 +742,7 @@ func _run_sim_test() -> void:
 		# clips out the top or bottom). gw is tiny — only its CPU noise (surface_world_y,
 		# seeded) is used; the band footprint/height are the real defaults.
 		var Wt := 1280.0
-		var Ht := 630
+		var Ht := 1260
 		var gw := GpuWorld.new(777, 64, 64, 64)
 		var base := 100000.0
 		var band_target := func(cx: float, cz: float) -> int:

@@ -148,15 +148,16 @@ Creative-mode free flight (no gravity / collision):
   regenerates; horizontal motion stays toroidal/state-preserving as long as you fly
   at roughly constant elevation. This is what lets a 256 m-tall world keep a wide
   (~50 m) footprint under the 1-billion-cell single-buffer ceiling.
-- **Scale**: the default fly window is a **1024x1024 footprint (51 m) with a
-  ~45 m resident band at 5 cm** (~805M sim cells), sized so the full per-voxel
-  renderer flies smoothly. A single fixed (non-streamed) map is capped by a hard
-  ceiling: **a single GPU storage buffer is 32-bit-sized in Godot**, so the
-  cells buffer (4 bytes/cell) tops out at ~4 GB ≈ **1.05B cells** regardless of
-  VRAM — past that it silently truncates, so oversized `VOX_SIZE` requests are
-  clamped with a warning. Toroidal streaming (horizontal) and the vertical-tracking
-  band (up/down) together keep the resident window small while the world itself is
-  unbounded sideways and 256 m tall.
+- **Scale**: the default fly window is a **1280x1280 footprint (64 m) with a
+  63 m resident band at 5 cm** — **~2.06 billion sim cells**. A single GPU storage
+  buffer is 32-bit-sized in Godot (~4 GB ≈ 1.07B cells), so the cells span **two
+  buffers** split at a y-slab boundary; a tiny routing helper in the shader
+  (`cget`/`cset`) picks the buffer per access, verified bit-identical to the
+  single-buffer sim (`VOX_SPLITTEST`). Worlds past ~2.06B cells are clamped with
+  a warning. The tall band costs no draw time (draw scales with surface, not
+  volume) and leaves ~50 m of vertical margin for steeper terrain. Toroidal
+  streaming (horizontal) and the vertical-tracking band (up/down) keep this
+  window resident while the world itself is unbounded sideways and 256 m tall.
 
 ## Physical scale & calibration
 
