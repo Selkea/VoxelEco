@@ -956,6 +956,44 @@ func _run_sim_test() -> void:
 		wa.free_gpu(); wb.free_gpu()
 		get_tree().quit()
 		return
+	if OS.get_environment("VOX_LISTTEST") != "":
+		# indirect-dispatch equivalence: the same world stepped by the full-grid
+		# gated dispatch vs the compacted awake-list indirect dispatch must be
+		# BIT-IDENTICAL — the list path runs the same block set with the same
+		# virtual-gid RNG seeds, so any divergence is a compaction/indexing bug.
+		# VOX_LISTTEST=gg / ll / bb compare two same-mode worlds instead (a
+		# determinism probe: nonzero gg/ll/bb diff = that mode races with itself)
+		var lmode := OS.get_environment("VOX_LISTTEST")
+		var modes := {"gg": ["grid", "grid"], "ll": ["", ""],
+				"bb": ["bounded", "bounded"], "gb": ["grid", "bounded"]}.get(lmode, ["grid", ""]) as Array
+		OS.set_environment("VOX_STEPMODE", modes[0])
+		var wa := GpuWorld.new(4242, 192, 192, 192)
+		OS.set_environment("VOX_STEPMODE", modes[1])
+		var wb := GpuWorld.new(4242, 192, 192, 192)
+		OS.set_environment("VOX_STEPMODE", "")
+		if not wa.gpu_ok or not wb.gpu_ok:
+			print("LISTTEST: no GPU"); get_tree().quit(); return
+		var nt := 192 * 192 * 192
+		print("LISTTEST: A %s vs B %s" % [wa.step_mode, wb.step_mode])
+		wa.regen_tracked(100000, 100000)
+		wb.gen_oy = wa.gen_oy               # identical band + origin
+		wb.regen(100000, 100000)
+		for w2: GpuWorld in [wa, wb]:
+			w2.set_rain_mm_hr(80.0); w2.run(150)   # storm builds water + erosion state
+			w2.set_rain_mm_hr(0.0); w2.run(60)     # then settle
+		wa.sync_cells(); wb.sync_cells()
+		var diff := 0
+		for i in range(wa.cell.size()):
+			if wa.cell[i] != wb.cell[i]: diff += 1
+		print("LISTTEST: %d of %d cells differ after storm+settle" % [diff, nt])
+		if lmode in ["gg", "ll", "bb"]:
+			print("SELF DETERMINISTIC" if diff == 0 else "SELF RACE (%s)" % lmode)
+		else:
+			print("LIST EQUIVALENT" if diff == 0 and wb.step_mode == "indirect" \
+					and wa.step_mode == "grid" else "LIST MISMATCH")
+		wa.free_gpu(); wb.free_gpu()
+		get_tree().quit()
+		return
 	if OS.get_environment("VOX_TRACKTEST") != "":
 		# vertical-tracking band: fly a long horizontal path across the 256 m-relief
 		# world, apply the same deadband band-shift the interactive tracker uses, and

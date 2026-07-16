@@ -54,6 +54,18 @@ layout(set = 0, binding = 6, std430) restrict buffer InstCount { uint n_solid; u
 // Index layout: (cy * cd + cz) * cw + cx.
 layout(set = 0, binding = 7, std430) restrict buffer ActiveBuf { uint awake[]; };
 const uint KEEPALIVE = 4u;
+// indirect physics dispatch: do_compact (mode 17) packs the ids of awake chunks
+// into awake_list[1..] and bumps the group count awake_list[0] by 8 (a 16^3
+// chunk = 8x8x8 Margolus blocks = 8 workgroups of 4x4x4 threads); the CPU then
+// buffer_copy()s that count into a standalone indirect-args buffer and the step
+// dispatches INDIRECTLY from it (do_step_list, mode 18) — a settled world
+// launches almost no threads instead of one gate-read thread per block.
+// do_decay resets the count. The args buffer is deliberately NOT a shader
+// binding: bound as storage AND read as indirect args in one dispatch, the
+// render graph missed the ordering and the step consumed a stale count
+// (LISTTEST=ll caught a 6-cell self-race; transfer-write -> indirect-read is
+// the tracked pattern).
+layout(set = 0, binding = 14, std430) restrict buffer AwakeListBuf { uint awake_list[]; };
 
 layout(push_constant) uniform Params {
 	uint W; uint H; uint D; uint tick;
@@ -292,8 +304,7 @@ bool water_flowing(uint cc[8], uint j) {
 }
 
 // local cell index bits: bit0 = x, bit1 = y, bit2 = z
-void do_step() {
-	uvec3 base = gl_GlobalInvocationID * 2u + uvec3(p.offset);
+void do_step_at(uvec3 base) {
 	// Toroidal window: x/z wrap so the buffer is a torus, EXCEPT at the seam
 	// (buffer column origin mod W/D) where buffer-adjacent cells are world-far —
 	// skip Margolus blocks straddling it so nothing flows across the join. The
@@ -301,13 +312,6 @@ void do_step() {
 	uint sx = p.gen_ox % p.W;   // seam column (origin >= 0, so plain uint mod)
 	uint sz = p.gen_oz % p.D;
 	if ((base.x + 1u) % p.W == sx || (base.z + 1u) % p.D == sz) { return; }
-	// ACTIVE-BLOCK GATE: skip inert chunks BEFORE touching any cells — the cell
-	// reads are the cost, so gating here (one tiny flag read, cached per workgroup)
-	// is what actually saves time. Chunk index matches mark_dirty's awake layout.
-	uint cw = (p.W + CHUNK - 1u) / CHUNK;
-	uint cd = (p.D + CHUNK - 1u) / CHUNK;
-	if (awake[((min(base.y, p.H - 1u) / CHUNK) * cd + (min(base.z, p.D - 1u) / CHUNK)) * cw
-			+ (min(base.x, p.W - 1u) / CHUNK)] == 0u) { return; }
 	uint c[8];
 	bool ib[8];
 	uint ids[8];
@@ -335,9 +339,13 @@ void do_step() {
 		return;
 	}
 	if (!any_active) { return; }
-	g_state = pcg((gl_GlobalInvocationID.x * 73856093u)
-			^ (gl_GlobalInvocationID.y * 19349663u)
-			^ (gl_GlobalInvocationID.z * 83492791u)
+	// seed from the VIRTUAL grid id (base - offset)/2 — equals
+	// gl_GlobalInvocationID on the grid path and reconstructs it on the
+	// indirect-list path, so both dispatch modes simulate BIT-EXACTLY alike
+	uvec3 vgid = (base - uvec3(p.offset)) / 2u;
+	g_state = pcg((vgid.x * 73856093u)
+			^ (vgid.y * 19349663u)
+			^ (vgid.z * 83492791u)
 			^ pcg(p.tick * 2654435761u + p.seedv));
 
 	const uint bottoms[4] = uint[4](0u, 1u, 4u, 5u);
@@ -503,6 +511,51 @@ void do_step() {
 	if (changed) {
 		mark_dirty(base.x, base.y, base.z);
 		mark_dirty(base.x + 1u, base.y + 1u, base.z + 1u);
+	}
+}
+
+// grid dispatch (mode 0): one thread per Margolus block over the whole window,
+// gated per awake chunk. Kept for equivalence testing (VOX_STEPMODE=grid).
+void do_step() {
+	uvec3 base = gl_GlobalInvocationID * 2u + uvec3(p.offset);
+	// ACTIVE-BLOCK GATE: skip inert chunks BEFORE touching any cells — the cell
+	// reads are the cost. Chunk index matches mark_dirty's awake layout.
+	uint cw = (p.W + CHUNK - 1u) / CHUNK;
+	uint cd = (p.D + CHUNK - 1u) / CHUNK;
+	if (awake[((min(base.y, p.H - 1u) / CHUNK) * cd + (min(base.z, p.D - 1u) / CHUNK)) * cw
+			+ (min(base.x, p.W - 1u) / CHUNK)] == 0u) { return; }
+	do_step_at(base);
+}
+
+// indirect dispatch (mode 18): workgroups exist ONLY for awake chunks — 8 per
+// chunk (see ArgsBuf), each covering a 4x4x4 sub-cube of the chunk's 8x8x8
+// Margolus blocks. Block bases land on the same lattice as the grid path
+// (chunk side 16 is even), so this runs exactly the block set the grid gate
+// would pass, and do_step_at's virtual-gid RNG seed makes it bit-exact.
+void do_step_list() {
+	if (gl_WorkGroupID.x >= awake_list[0]) { return; }   // bounded (non-indirect) dispatch
+	uint chunk_id = awake_list[1u + (gl_WorkGroupID.x >> 3u)];
+	uint cw = (p.W + CHUNK - 1u) / CHUNK;
+	uint cd = (p.D + CHUNK - 1u) / CHUNK;
+	uvec3 cc = uvec3(chunk_id % cw, chunk_id / (cw * cd), (chunk_id / cw) % cd);
+	uint sub = gl_WorkGroupID.x & 7u;
+	uvec3 block = uvec3(sub & 1u, (sub >> 1u) & 1u, sub >> 2u) * 4u
+			+ gl_LocalInvocationID;
+	do_step_at(cc * CHUNK + block * 2u + uvec3(p.offset));
+}
+
+// mode 17: pack awake chunk ids into awake_list + set the indirect group count
+// (+8 per chunk; slot = previous count / 8). Runs between rain and the step so
+// freshly rained-on chunks are stepped the same tick, like the grid gate.
+void do_compact() {
+	uint cw = (p.W + CHUNK - 1u) / CHUNK;
+	uint cd = (p.D + CHUNK - 1u) / CHUNK;
+	uint chy = (p.H + CHUNK - 1u) / CHUNK;
+	uint id = flat_id();
+	if (id >= cw * cd * chy) { return; }
+	if (awake[id] > 0u) {
+		uint at = atomicAdd(awake_list[0], 8u);
+		awake_list[1u + (at >> 3u)] = id;
 	}
 }
 
@@ -1117,6 +1170,7 @@ void do_decay() {
 	uint cd = (p.D + CHUNK - 1u) / CHUNK;
 	uint chy = (p.H + CHUNK - 1u) / CHUNK;
 	uint id = flat_id();
+	if (id == 0u) { awake_list[0] = 0u; }   // reset the count for the next compact
 	if (id >= cw * cd * chy) { return; }
 	if (awake[id] > 0u) { awake[id] -= 1u; }
 }
@@ -1374,5 +1428,7 @@ void main() {
 	else if (mode == 14u) { do_heights(); }
 	else if (mode == 15u) { do_hmax(); }
 	else if (mode == 16u) { do_raycast(); }
+	else if (mode == 17u) { do_compact(); }
+	else if (mode == 18u) { do_step_list(); }
 	else { do_step(); }
 }

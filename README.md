@@ -84,12 +84,16 @@ VOX_LEVELS=6 VOX_DITHERSTR=1`.
 - **Noita-style dirty chunks**: the shader flags 16x16-column regions whose
   cells changed; only those chunks get remeshed. A settled landscape costs
   nothing to keep on screen.
-- **3D sleep grid for physics**: a separate per-16³-chunk `awake` grid gates
-  the Margolus step before any cell is read; a change wakes its chunk (+1-cell
-  margin, so material flows across sleep boundaries) for a few ticks. Because
-  the grid is 3D, a raindrop falling through a column wakes only the chunks on
-  its path — not the ~750 voxels of settled ground beneath — so a storm ticks
-  3x faster (10.7 → 3.5 ms on the 3.2B-cell world) and a settled world ~6x.
+- **3D sleep grid + indirect physics dispatch**: a per-16³-chunk `awake` grid
+  tracks recent activity; a change wakes its chunk (+1-cell margin, so material
+  flows across sleep boundaries) for a few ticks. Each tick a compact pass
+  packs the awake chunk ids into a list and the Margolus step dispatches
+  **indirectly** over just that list — a sleeping region costs zero threads,
+  not even a gate read. Because the grid is 3D, a raindrop falling through a
+  column wakes only the chunks on its path, not the ~750 voxels of settled
+  ground beneath. On the 3.2B-cell world a physics tick went from 3.3 ms
+  settled / 10.7 ms raining to **0.07 / 0.8 ms** (47x / 13x); the indirect
+  path is bit-exact with the full-grid gated dispatch (`VOX_LISTTEST`).
 - **Rendering**: each chunk builds two face-culled meshes — opaque
   vertex-coloured terrain and a translucent water surface — so interior
   voxels cost nothing.

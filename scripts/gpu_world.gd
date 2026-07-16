@@ -24,6 +24,13 @@ var pack_buf: RID
 var stats_buf: RID
 var dirty_buf: RID
 var active_buf: RID    # per-chunk physics keepalive (active-block skipping)
+# indirect physics dispatch: do_compact packs awake chunk ids into awake_list_buf
+# and writes the workgroup count into step_args_buf; the step then dispatches
+# indirectly, launching threads ONLY for awake chunks. VOX_STEPMODE=grid forces
+# the old full-grid gated dispatch (equivalence testing — both are bit-exact).
+var step_args_buf: RID
+var awake_list_buf: RID
+var step_mode := "indirect"   # "grid" | "bounded" (diagnostic) | "indirect"
 var inst_count_buf: RID
 var uniform_set: RID
 var _solid_target: RID    # multimesh buffers (bound by the view) or placeholders
@@ -43,7 +50,8 @@ var _col_groups := 0      # one thread per column (rain / worldgen)
 var _cell_groups := 0     # one thread per cell (voxel emit)
 var _pack_groups := 0
 var _block_groups := 0    # one thread per 1m block (block emit)
-var _decay_groups := 0    # one thread per chunk (active-flag decay)
+var _decay_groups := 0    # one thread per 16^3 chunk (active-flag decay/compact)
+var _tile_groups := 0     # one thread per 16x16 column tile (hmax)
 var nbx := 0
 var nby := 0
 var nbz := 0
@@ -145,6 +153,16 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	var zeros3 := PackedByteArray()
 	zeros3.resize(chunk_w * chunk_d * chunk_h * 4)   # 3D awake grid (16^3 chunks)
 	active_buf = rd.storage_buffer_create(zeros3.size(), zeros3)   # all asleep until gen wakes
+	var sm := OS.get_environment("VOX_STEPMODE")
+	step_mode = sm if sm in ["grid", "bounded"] else "indirect"
+	var zlist := PackedByteArray()
+	zlist.resize(zeros3.size() + 4)   # [0] = group count, [1..] = awake chunk ids
+	awake_list_buf = rd.storage_buffer_create(zlist.size(), zlist)
+	# indirect dispatch args {x, y, z}; x is buffer_copy'd from awake_list[0] each
+	# tick. NOT a shader binding — see the shader's AwakeListBuf comment.
+	step_args_buf = rd.storage_buffer_create(12,
+			PackedInt32Array([0, 1, 1]).to_byte_array(),
+			RenderingDevice.STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT)
 	heights_buf = rd.storage_buffer_create(W * D * 4)            # ray renderer: column heights
 	hmax_buf = rd.storage_buffer_create(zeros.size(), zeros)     # ray renderer: tile max heights
 	cam_buf = rd.storage_buffer_create(80)                       # ray renderer: camera/sun
@@ -183,6 +201,7 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	_pack_groups = ceili(words / 64.0)
 	_block_groups = ceili(nbx * nbz / 64.0)   # one thread per 1m block column
 	_decay_groups = ceili(chunk_w * chunk_d * chunk_h / 64.0)   # one thread per 16^3 chunk
+	_tile_groups = ceili(chunk_w * chunk_d / 64.0)              # one thread per 16x16 tile
 	gpu_ok = true
 	if OS.get_environment("VOX_GENMODE") == "terraced":
 		gen_flags = 1
@@ -364,7 +383,7 @@ func update_heights() -> void:
 	rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 	rd.compute_list_add_barrier(cl)
 	rd.compute_list_set_push_constant(cl, _pc(15, 0), PC_SIZE)   # tile max
-	rd.compute_list_dispatch(cl, _decay_groups, 1, 1)
+	rd.compute_list_dispatch(cl, _tile_groups, 1, 1)
 	rd.compute_list_end()
 
 ## march eye rays into ray_tex. Vectors are in the LOCAL render frame; fov terms
@@ -406,6 +425,11 @@ func _rebuild_uniform_set() -> void:
 	iu.binding = 13
 	iu.add_id(ray_tex)
 	us.append(iu)
+	var lu := RDUniform.new()
+	lu.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+	lu.binding = 14
+	lu.add_id(awake_list_buf)
+	us.append(lu)
 	uniform_set = rd.uniform_set_create(us, shader, 0)
 
 ## the view hands us its MultiMesh storage buffers: the emit pass writes
@@ -493,11 +517,32 @@ func run(n: int) -> void:
 		rd.compute_list_set_push_constant(cl, _pc(1, 0), PC_SIZE)      # rain
 		rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 		rd.compute_list_add_barrier(cl)
-		rd.compute_list_set_push_constant(cl, _pc(0, tick_count & 1), PC_SIZE)  # physics
-		rd.compute_list_dispatch(cl, _step_groups.x, _step_groups.y, _step_groups.z)
+		if step_mode == "grid":
+			rd.compute_list_set_push_constant(cl, _pc(0, tick_count & 1), PC_SIZE)  # physics
+			rd.compute_list_dispatch(cl, _step_groups.x, _step_groups.y, _step_groups.z)
+		else:
+			# pack awake chunks into a list, then step ONLY those (bit-exact
+			# with the grid path — see do_step_list / the virtual-gid seed)
+			rd.compute_list_set_push_constant(cl, _pc(17, 0), PC_SIZE)          # compact
+			rd.compute_list_dispatch(cl, _decay_groups, 1, 1)
+			rd.compute_list_add_barrier(cl)
+			if step_mode == "bounded":   # diagnostic: worst-case fixed dispatch
+				rd.compute_list_set_push_constant(cl, _pc(18, tick_count & 1), PC_SIZE)
+				rd.compute_list_dispatch(cl, chunk_w * chunk_d * chunk_h * 8, 1, 1)
+			else:
+				# the group count crosses to the indirect-args buffer via a
+				# TRANSFER copy (see the shader's AwakeListBuf comment), which
+				# means closing this compute list around it
+				rd.compute_list_end()
+				rd.buffer_copy(awake_list_buf, step_args_buf, 0, 0, 4)
+				cl = rd.compute_list_begin()
+				rd.compute_list_bind_compute_pipeline(cl, pipeline)
+				rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
+				rd.compute_list_set_push_constant(cl, _pc(18, tick_count & 1), PC_SIZE)
+				rd.compute_list_dispatch_indirect(cl, step_args_buf, 0)         # physics
 		rd.compute_list_add_barrier(cl)
 		rd.compute_list_set_push_constant(cl, _pc(7, 0), PC_SIZE)               # sleep/wake decay
-		rd.compute_list_dispatch(cl, _decay_groups, 1, 1)
+		rd.compute_list_dispatch(cl, _decay_groups, 1, 1)                       # (+count reset)
 		rd.compute_list_add_barrier(cl)
 	rd.compute_list_end()
 
@@ -623,7 +668,8 @@ func free_gpu() -> void:
 		return
 	# free our resources, never the shared main device
 	for r in [uniform_set, pipeline, shader, cells_buf, cells_buf2, cells_buf3, pack_buf,
-			stats_buf, dirty_buf, active_buf, inst_count_buf, _placeholder_a, _placeholder_b,
+			stats_buf, dirty_buf, active_buf, step_args_buf, awake_list_buf,
+			inst_count_buf, _placeholder_a, _placeholder_b,
 			heights_buf, hmax_buf, cam_buf, ray_tex]:
 		if r.is_valid():
 			rd.free_rid(r)
