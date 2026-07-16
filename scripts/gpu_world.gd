@@ -449,7 +449,12 @@ func bind_instance_buffers(solid_rid: RID, water_rid: RID) -> void:
 	_water_target = water_rid
 	_rebuild_uniform_set()
 
-const PC_SIZE := 96   # push constant byte size (must match the shader struct)
+const PC_SIZE := 112   # push constant byte size (must match the shader struct)
+
+# camera-cone emit culling: unit XZ view direction + cos(cull half-angle).
+# cone_cos -2.0 = off (tests/shots emit all around). Set per-emit by the game.
+var cone_dir := Vector2.ZERO
+var cone_cos := -2.0
 
 # distance LOD (mesh render): fine 5cm faces within lod_r voxels of the camera
 # (local render frame); coarser 1m block quads beyond. 0 = LOD off (all fine).
@@ -502,6 +507,10 @@ func _pc(mode: int, offset: int) -> PackedByteArray:
 	pc.encode_u32(84, lod_r)
 	pc.encode_u32(88, _img_w)          # ray-cast output image size
 	pc.encode_u32(92, _img_h)
+	pc.encode_float(96, cone_dir.x)    # camera-cone emit culling
+	pc.encode_float(100, cone_dir.y)
+	pc.encode_float(104, cone_cos)
+	pc.encode_u32(108, 0)
 	return pc
 
 func step() -> void:

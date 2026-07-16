@@ -99,6 +99,12 @@ VOX_LEVELS=6 VOX_DITHERSTR=1`.
   per-column watermark bounds the highest non-air cell — worldgen writes it
   exactly, the physics raises it when cells change, and the walkers tighten
   it back — so column walks start at the surface. Emit: 12.3 → **2.0 ms**.
+- **Camera-cone emit culling**: instances used to be emitted all 360° around
+  the camera while the view sees ~110°. The emit passes now skip geometry
+  outside the horizontal view cone (half-FOV + a generous ~40° margin, a 20 m
+  always-emit bubble, re-emit on ~6° of turn; steep pitches widen then disable
+  it). Instances 4.2M → 2.5M, draw 17.2 → **10.9 ms** — nothing visible
+  changes, the culled terrain was behind the camera. `VOX_CONE=0` disables.
 - **Rendering**: each chunk builds two face-culled meshes — opaque
   vertex-coloured terrain and a translucent water surface — so interior
   voxels cost nothing.

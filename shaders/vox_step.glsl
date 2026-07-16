@@ -104,6 +104,11 @@ layout(push_constant) uniform Params {
 	uint lod_cx; uint lod_cz; uint lod_r;
 	// ray-cast output image size (mode 16)
 	uint img_w; uint img_h;
+	// camera-cone emit culling: horizontal view direction (unit XZ) and the
+	// cosine of the cull half-angle (view half-FOV + a generous turn/shadow
+	// margin). Emit passes skip geometry outside the cone; the game re-emits
+	// as the camera turns. cone_cos <= -1.5 disables (tests, shots, top-down).
+	float cone_x; float cone_z; float cone_cos; uint pc_pad;
 } p;
 
 // route a linear cell index to its buffer (see CellsBuf2/3). Spatially adjacent
@@ -120,6 +125,17 @@ void cset(uint i, uint v) {
 }
 
 const uint CHUNK = 16u;
+
+// Is (dx, dz) — an offset from the camera in voxels — outside the horizontal
+// view cone? Near geometry always passes (it can reach the screen edges and
+// cast shadows into view); everything the camera can't see is skipped by the
+// emit passes, roughly halving the instance count with no visual change.
+bool cone_out(float dx, float dz, float near_r) {
+	if (p.cone_cos <= -1.5) { return false; }
+	float d2 = dx * dx + dz * dz;
+	if (d2 < near_r * near_r) { return false; }
+	return dx * p.cone_x + dz * p.cone_z < p.cone_cos * sqrt(d2);
+}
 
 // flag the chunks around (x, y, z) — a border cell change alters the visible
 // faces of cells in the adjacent chunk, so flag with a 1-cell margin. The margin
@@ -656,6 +672,7 @@ void do_face_emit() {
 		float ddx = wx - float(p.lod_cx);
 		float ddz = wz - float(p.lod_cz);
 		if (ddx * ddx + ddz * ddz > float(p.lod_r) * float(p.lod_r)) { return; }
+		if (cone_out(ddx, ddz, 400.0)) { return; }   // 20 m always-emit bubble
 	}
 	uint buried = 0u;
 	uint yy = min(topmark[id] + 1u, p.H);   // start just above the column top
@@ -983,6 +1000,7 @@ void do_lod_emit() {
 	float ddz = (wz0 + 10.0) - float(p.lod_cz);
 	float rr = max(float(p.lod_r) - 28.0, 0.0);
 	if (ddx * ddx + ddz * ddz < rr * rr) { return; }
+	if (cone_out(ddx, ddz, 400.0)) { return; }
 	uvec3 bt = lod_top(bx, bz);
 	uint top = bt.x;
 	if (top == 0u) { return; }
@@ -1231,6 +1249,7 @@ void do_far_emit() {
 	// heights differ slightly (coarser sampling), and skirts don't bridge across
 	// ring sizes — the overlap row tucks under the finer ring and seals the seam
 	if (d >= outer || d < inner - tile) { return; }
+	if (cone_out(dx, dz, tile * 4.0)) { return; }
 	// the resident window renders its own footprint — skip tiles inside it, but
 	// keep one tile of overlap tucked UNDER its edge (the window's perimeter
 	// walls are culled, so a lower far tile would otherwise show a gap)

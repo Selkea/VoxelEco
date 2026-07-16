@@ -23,6 +23,7 @@ var interactive := false
 var _freeze_cam := false   # non-interactive shots that set their own camera
 var _band_acc := 0.0       # throttle for the vertical-tracking band check
 var _lod_cam_last := Vector2(1e12, 1e12)   # camera pos at the last LOD emit
+var _emit_dir := Vector2.ZERO              # view direction at the last emit (cone)
 var _env: Environment
 # shader looks, cycled with V: 0 standard, 1 pixel-art, 2 toon, 3 toon+pixel
 const LOOK_NAMES := ["standard", "pixel", "toon", "retro"]
@@ -498,8 +499,28 @@ func _refresh_view(force := false) -> void:
 			gw.lod_cz = maxi(0, int(lc.z) - gw.gen_origin_z)
 			if Vector2(lc.x, lc.z).distance_to(_lod_cam_last) > 40.0:   # 2 m
 				force = true
+			# camera-cone emit culling: only geometry near the view cone is
+			# emitted; turning past the margin forces a re-emit. Steep pitches
+			# widen the projected cone, so the margin grows and near-vertical
+			# views disable it entirely.
+			# (non-interactive owners — tests, shots — manage gw.cone_* themselves)
+			if interactive and cam != null:
+				var fwd := -cam.global_transform.basis.z
+				var fxz := Vector2(fwd.x, fwd.z)
+				var flen := fxz.length()
+				if flen < 0.35 or OS.get_environment("VOX_CONE") == "0":
+					gw.cone_cos = -2.0                    # near-vertical: emit all
+				else:
+					fxz /= flen
+					gw.cone_dir = fxz
+					var aspect := get_viewport().get_visible_rect().size.aspect()
+					var hfov := atan(tan(deg_to_rad(cam.fov * 0.5)) * aspect)
+					gw.cone_cos = cos(minf(hfov + 0.7 + (1.0 - flen), PI))
+					if fxz.dot(_emit_dir) < cos(0.1):     # turned ~6 deg since last emit
+						force = true
 			if force or world.any_dirty_and_clear():
 				_lod_cam_last = Vector2(lc.x, lc.z)
+				_emit_dir = gw.cone_dir
 				if gw.ray_render:
 					gw.update_heights()   # rays read the heightfield; refresh with the sim
 				var counts: PackedInt32Array = world.dispatch_emit()
@@ -573,6 +594,15 @@ func _take_screenshot() -> void:
 		RenderingServer.viewport_set_measure_render_time(vprid, true)
 		gw.lod_cx = maxi(0, int(cx) - gw.gen_origin_x)     # LOD near disc at the camera
 		gw.lod_cz = maxi(0, int(cz - 20.0) - gw.gen_origin_z)
+		if OS.get_environment("VOX_CONE") != "0":
+			# camera-cone emit culling, same margin the interactive path uses
+			var fw := -cam.global_transform.basis.z
+			var fx := Vector2(fw.x, fw.z)
+			if fx.length() >= 0.35:
+				gw.cone_dir = fx.normalized()
+				var asp := get_viewport().get_visible_rect().size.aspect()
+				gw.cone_cos = cos(minf(atan(tan(deg_to_rad(cam.fov * 0.5)) * asp) \
+						+ 0.7 + (1.0 - fx.length()), PI))
 		if gw.ray_render:
 			gw.update_heights()                            # heights for the new origin
 		var cnt: PackedInt32Array = gw.dispatch_emit()
