@@ -111,7 +111,7 @@ func _ready() -> void:
 	e.ambient_light_energy = 0.55
 	e.tonemap_mode = Environment.TONE_MAPPER_ACES
 	e.tonemap_exposure = 0.92
-	e.ssao_enabled = true
+	e.ssao_enabled = OS.get_environment("VOX_SSAO") != "0"
 	e.ssao_intensity = 2.2
 	e.fog_enabled = false   # no distance fog (the streaming window's far edge is a hard cut)
 	env.environment = e
@@ -135,7 +135,8 @@ func _ready() -> void:
 	# the far:near ratio ~7x, and 4x MSAA smooths the high-contrast cube edges.
 	cam.near = float(OS.get_environment("VOX_NEAR")) if OS.get_environment("VOX_NEAR") != "" else 0.3
 	add_child(cam)
-	get_viewport().msaa_3d = Viewport.MSAA_4X
+	var msaa := OS.get_environment("VOX_MSAA")   # 0/2/4/8; default 4x
+	get_viewport().msaa_3d = ([Viewport.MSAA_DISABLED, Viewport.MSAA_2X, Viewport.MSAA_4X, Viewport.MSAA_8X][{"0":0,"2":1,"4":2,"8":3}.get(msaa, 2)] as Viewport.MSAA)
 	dist = world.W * 1.12
 	interactive = not ("--sim" in OS.get_cmdline_user_args() or "--shot" in OS.get_cmdline_user_args())
 	if interactive:
@@ -408,6 +409,44 @@ func _add_action(action: String, keys: Array) -> void:
 ## Debug: run a full rain-then-drain cycle so water sheds off the hills and
 ## collects as a clean lake, then save a frame to review the 3D scene.
 func _take_screenshot() -> void:
+	if OS.get_environment("VOX_FPSTEST") != "" and world is GpuWorld:
+		# measure the DRAW (rasterization) side: real render of the band from a
+		# representative fly view, reporting GPU render time/frame, primitives and
+		# instances. Complements VOX_PERF (which measures the emit/physics compute).
+		var gw := world as GpuWorld
+		var base := 100000
+		var cx := base + world.W * 0.5
+		var cz := base + world.D * 0.5
+		var surf := gw.surface_world_y(cx, cz)
+		gw.gen_oy = gw.band_oy_for(cx, cz)
+		gw.regen(base, base)
+		view.set_stream_origin(base, base)
+		_freeze_cam = true
+		speed_mult = 0
+		world.set_rain_mm_hr(0.0)
+		world.run(40)
+		var ro := _render_off()
+		cam.position = Vector3(cx, surf + 30.0, cz - 20.0) - ro   # representative fly view
+		cam.look_at(Vector3(cx, surf - 139.0, cz + 227.0) - ro, Vector3.UP)   # -34 deg (default pitch)
+		var vprid := get_viewport().get_viewport_rid()
+		RenderingServer.viewport_set_measure_render_time(vprid, true)
+		var cnt: PackedInt32Array = gw.dispatch_emit()
+		view.set_visible_counts(cnt[0], cnt[1])
+		for i in range(15):
+			await get_tree().process_frame                       # warm up
+		var gpu := 0.0
+		var cpu := 0.0
+		var N := 60
+		for i in range(N):
+			await get_tree().process_frame
+			gpu += RenderingServer.viewport_get_measured_render_time_gpu(vprid)
+			cpu += RenderingServer.viewport_get_measured_render_time_cpu(vprid)
+		var prims := RenderingServer.get_rendering_info(RenderingServer.RENDERING_INFO_TOTAL_PRIMITIVES_IN_FRAME)
+		print("FPSTEST: draw GPU %.2f ms/frame | CPU %.2f ms | %d instances | %.1fM primitives" \
+			% [gpu / N, cpu / N, cnt[0] + cnt[1], prims / 1e6])
+		get_viewport().get_texture().get_image().save_png("user://shot.png")
+		get_tree().quit()
+		return
 	if OS.get_environment("VOX_RELIEFSHOT") != "" and world is GpuWorld:
 		# terrain-shape PREVIEW: a single band view only shows a ~51 m slice, so to
 		# judge how mountainous the world is, draw a wide oblique overview of the true
