@@ -157,11 +157,13 @@ func _ready() -> void:
 		_toon_mat.set_shader_parameter("sun_dir", -sun.global_transform.basis.z)
 	var pm := ShaderMaterial.new()
 	pm.shader = load("res://shaders/pixel_post.gdshader")
-	pm.set_shader_parameter("pixel_size",
-			maxi(1, OS.get_environment("VOX_PIXEL").to_int()) if OS.get_environment("VOX_PIXEL") != "" else 4)
+	if OS.get_environment("VOX_PIXEL") != "":
+		pm.set_shader_parameter("pixel_size", maxi(1, OS.get_environment("VOX_PIXEL").to_int()))
 	if OS.get_environment("VOX_LEVELS") != "":
 		pm.set_shader_parameter("levels", maxi(2, OS.get_environment("VOX_LEVELS").to_int()))
 	pm.set_shader_parameter("dither", OS.get_environment("VOX_DITHER") != "0")
+	if OS.get_environment("VOX_DITHERSTR") != "":
+		pm.set_shader_parameter("dither_strength", clampf(OS.get_environment("VOX_DITHERSTR").to_float(), 0.0, 1.0))
 	var lay := CanvasLayer.new()
 	_pixel_rect = ColorRect.new()
 	_pixel_rect.set_anchors_preset(Control.PRESET_FULL_RECT)
