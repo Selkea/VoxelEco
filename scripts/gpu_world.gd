@@ -352,6 +352,11 @@ const PC_SIZE := 88   # push constant byte size (must match the shader struct)
 var lod_cx := 0
 var lod_cz := 0
 var lod_r := 0
+# far field: render-only terrain from the worldgen heightfield out to 8 km,
+# in 3 clip-rings around the camera (see do_far_emit). Rings dispatch side^2
+# threads each: sides must mirror the shader's RING_TILE/RING_OUTER constants.
+var far_field := false
+const FAR_SIDES := [400, 400, 500]
 
 func _pc(mode: int, offset: int) -> PackedByteArray:
 	# 64-byte push constant. rain is an integer threshold out of 2^24; evap/erode
@@ -446,6 +451,10 @@ func dispatch_emit() -> PackedInt32Array:
 		if lod_r > 0:
 			rd.compute_list_set_push_constant(cl, _pc(11, 0), PC_SIZE)   # coarse far block quads
 			rd.compute_list_dispatch(cl, _block_groups, 1, 1)
+		if far_field and lod_r > 0:
+			for ring in range(3):   # heightfield vista rings out to 8 km
+				rd.compute_list_set_push_constant(cl, _pc(12, ring), PC_SIZE)
+				rd.compute_list_dispatch(cl, ceili(FAR_SIDES[ring] * FAR_SIDES[ring] / 64.0), 1, 1)
 	elif block_render:
 		rd.compute_list_set_push_constant(cl, _pc(6, 0), PC_SIZE)   # 1m blocks + voxel-tinted tops
 		rd.compute_list_dispatch(cl, _col_groups, 1, 1)

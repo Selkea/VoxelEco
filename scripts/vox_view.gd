@@ -114,10 +114,18 @@ func _make_mm(mat: StandardMaterial3D, cap: int, quad: bool) -> MultiMeshInstanc
 	# spans the full vertical relief (not just the band height): the vertical-
 	# tracking band places instances anywhere in world-Y [0, RELIEF], so a band-
 	# height Y bound would cull the terrain whenever the band rode up a mountain.
-	mmi.custom_aabb = AABB(Vector3(-16, -16, -16),
-			Vector3(world.W + 32, AABB_Y, world.D + 32))
+	# With the far field on, instances reach ±8 km around the window in the local
+	# frame, so the box grows to cover the whole vista.
+	mmi.custom_aabb = _inst_aabb()
 	add_child(mmi)
 	return mmi
+
+func _inst_aabb() -> AABB:
+	if world is GpuWorld and (world as GpuWorld).far_field:
+		return AABB(Vector3(-170000, -16, -170000),
+				Vector3(340000 + world.W, AABB_Y, 340000 + world.D))
+	return AABB(Vector3(-16, -16, -16),
+			Vector3(world.W + 32, AABB_Y, world.D + 32))
 
 func solid_buffer_rid() -> RID:
 	return RenderingServer.multimesh_get_buffer_rd_rid(solid_mm.multimesh.get_rid())
@@ -137,8 +145,7 @@ func set_visible_counts(ns: int, nw: int) -> void:
 func set_stream_origin(_ox: int, _oz: int) -> void:
 	if not use_instances:
 		return
-	var a := AABB(Vector3(-16, -16, -16),
-			Vector3(world.W + 32, AABB_Y, world.D + 32))
+	var a := _inst_aabb()
 	solid_mm.custom_aabb = a
 	water_mm.custom_aabb = a
 

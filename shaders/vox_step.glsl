@@ -1076,6 +1076,81 @@ void do_decay() {
 	if (awake[id] > 0u) { awake[id] -= 1u; }
 }
 
+// ---- far field (mode 12): render-only terrain to the horizon ----
+// Beyond the resident sim window, terrain is drawn straight from the worldgen
+// heightfield — a pure function of world (x,z) + seed — with no cells and no sim.
+// Three square clip-rings of growing tile size follow the camera out to FAR_END
+// (8 km at 5 cm). Tiles snap to their own absolute grid so they don't swim as the
+// camera moves; each emits a flat top quad, plus skirts down to its lower east /
+// south neighbours (west/north edges are covered by THOSE tiles' skirts).
+// Basins below the sea line render as a flat water plane at SEA_Y, like the gen.
+const float FAR_END = 160000.0;                              // 8 km
+const float RING_TILE[3]  = float[3](40.0, 160.0, 640.0);    // 2 m / 8 m / 32 m
+const float RING_OUTER[3] = float[3](8000.0, 32000.0, FAR_END);
+
+void do_far_emit() {
+	uint ring = p.offset;               // reused push field: ring index 0..2
+	float tile = RING_TILE[ring];
+	float outer = RING_OUTER[ring];
+	float inner = ring == 0u ? 0.0 : RING_OUTER[ring - 1u];
+	uint side = uint(outer * 2.0 / tile);
+	uint id = flat_id();
+	if (id >= side * side) { return; }
+	float camx = float(p.gen_ox + p.lod_cx);   // camera in world voxels
+	float camz = float(p.gen_oz + p.lod_cz);
+	float gx = floor(camx / tile) * tile + (float(id % side) - float(side / 2u)) * tile;
+	float gz = floor(camz / tile) * tile + (float(id / side) - float(side / 2u)) * tile;
+	float dx = gx + tile * 0.5 - camx;
+	float dz = gz + tile * 0.5 - camz;
+	float d = max(abs(dx), abs(dz));           // square-ring metric
+	// rings OVERLAP inward by one tile: at a ring boundary the coarser ring's
+	// heights differ slightly (coarser sampling), and skirts don't bridge across
+	// ring sizes — the overlap row tucks under the finer ring and seals the seam
+	if (d >= outer || d < inner - tile) { return; }
+	// the resident window renders its own footprint — skip tiles inside it, but
+	// keep one tile of overlap tucked UNDER its edge (the window's perimeter
+	// walls are culled, so a lower far tile would otherwise show a gap)
+	float lx = gx + tile * 0.5 - float(p.gen_ox);
+	float lz = gz + tile * 0.5 - float(p.gen_oz);
+	if (lx >= tile && lx <= float(p.W) - tile && lz >= tile && lz <= float(p.D) - tile) { return; }
+	float h = world_height(vec2(gx + tile * 0.5, gz + tile * 0.5));
+	float sea = SEA_Y;
+	bool iw = h < sea;
+	float Y = iw ? sea : h;
+	// per-tile tint jitter (absolute tile coords, so it's stable as rings move)
+	uint th = pcg(uint(int(gx / tile)) * 73856093u ^ uint(int(gz / tile)) * 83492791u ^ p.seedv);
+	float jit = 1.0 + (float(th & 255u) / 255.0 * 0.20 - 0.10);
+	vec4 col = iw ? vec4(1.0) : vec4(mat_color(GRASS) * jit, 1.0);
+	vec3 org = vec3(gx - float(p.gen_ox), Y, gz - float(p.gen_oz));   // local frame
+	if (iw) {
+		uint sl = atomicAdd(n_water, 1u);
+		if (sl < cap_water) { write_quad(true, sl, vec3(tile,0,0), vec3(0,1,0), vec3(0,0,tile), org, col); }
+		return;                                   // the sea is flat: no skirts
+	}
+	uint sl = atomicAdd(n_solid, 1u);
+	if (sl < cap_solid) { write_quad(false, sl, vec3(tile,0,0), vec3(0,1,0), vec3(0,0,tile), org, col); }
+	// skirts on EVERY edge where this tile is the higher side (the lower
+	// neighbour never emits that edge, so covering only E/S left cracks wherever
+	// the ground rose to the east or south). Clamped up to the sea plane.
+	for (uint k = 0u; k < 4u; k++) {
+		vec2 off = k == 0u ? vec2(tile, 0.0) : (k == 1u ? vec2(-tile, 0.0)
+				: (k == 2u ? vec2(0.0, tile) : vec2(0.0, -tile)));
+		float hn = max(world_height(vec2(gx + tile * 0.5, gz + tile * 0.5) + off), sea);
+		if (h - hn < 0.5) { continue; }
+		hn -= 20.0;            // apron: overshoot 1 m down so sampling mismatches
+		float hh = h - hn;     // (ring boundaries, window edge) can't open cracks
+		float lx0 = gx - float(p.gen_ox);
+		float lz0 = gz - float(p.gen_oz);
+		vec3 ax, ay, az, sorg;
+		if (k == 0u)      { ax = vec3(0,hh,0); az = vec3(0,0,tile); ay = vec3( 1,0,0); sorg = vec3(lx0 + tile, hn, lz0); }
+		else if (k == 1u) { ax = vec3(0,hh,0); az = vec3(0,0,tile); ay = vec3(-1,0,0); sorg = vec3(lx0, hn, lz0); }
+		else if (k == 2u) { ax = vec3(tile,0,0); az = vec3(0,hh,0); ay = vec3(0,0, 1); sorg = vec3(lx0, hn, lz0 + tile); }
+		else              { ax = vec3(tile,0,0); az = vec3(0,hh,0); ay = vec3(0,0,-1); sorg = vec3(lx0, hn, lz0); }
+		uint s2 = atomicAdd(n_solid, 1u);
+		if (s2 < cap_solid) { write_quad(false, s2, ax, ay, az, sorg, col); }
+	}
+}
+
 void main() {
 	uint mode = p.mode & 0xFFu;      // high bits carry the debug rules mask
 	if (mode == 1u) { do_rain(); }
@@ -1087,5 +1162,6 @@ void main() {
 	else if (mode == 7u) { do_decay(); }
 	else if (mode == 8u) { do_face_emit(); }
 	else if (mode == 11u) { do_lod_emit(); }
+	else if (mode == 12u) { do_far_emit(); }
 	else { do_step(); }
 }

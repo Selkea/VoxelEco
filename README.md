@@ -157,6 +157,16 @@ Creative-mode free flight (no gravity / collision):
   the fine detail, and skirts are surface-coloured so distant ridges read like
   the fine render. This decouples draw cost from window size — the draw is
   ~10 ms at a 102 m window, faster than the old 64 m window.
+- **Far field to 8 km**: beyond the sim window, terrain is drawn straight from
+  the worldgen heightfield — a pure function of world (x,z) + seed, needing no
+  cells and no sim — as three square clip-rings of growing tile size (2 m / 8 m /
+  32 m) that follow the camera to the horizon. Tiles snap to absolute grids (no
+  swimming), skirt every edge where they're the higher side with a 1 m apron,
+  overlap one tile inward at ring boundaries and under the window edge (no
+  cracks), and colour like the gen surface — grass above the sea line, a flat
+  water plane over basins. The whole 8 km vista costs ~3-4 ms; `VOX_FAR=0`
+  disables it. What you see out there is the real terrain you can fly to — it
+  streams into the sim window as you approach.
 - **Scale**: the default fly window is a **2048x2048 footprint (102 m) with a
   37.8 m resident band at 5 cm** — **~3.17 billion sim cells**. A single GPU
   storage buffer is 32-bit-sized in Godot (~4 GB ≈ 1.07B cells), so the cells span

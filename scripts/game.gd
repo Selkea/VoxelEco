@@ -96,6 +96,10 @@ func _ready() -> void:
 		# overrides (0 = off). Small/test worlds render all-fine as before.
 		var lr := OS.get_environment("VOX_LODR")
 		(world as GpuWorld).lod_r = lr.to_int() if lr != "" else (800 if ws.x >= 1536 else 0)
+		# far field: heightfield-only vista out to 8 km beyond the sim window
+		# (VOX_FAR=0 disables). Needs the LOD camera, so it rides lod_r.
+		(world as GpuWorld).far_field = OS.get_environment("VOX_FAR") != "0" \
+				and (world as GpuWorld).lod_r > 0
 	if not world.gpu_ok:
 		world.prime()      # the CPU fallback path needs its active set
 	view = VoxView.new()
@@ -138,7 +142,9 @@ func _ready() -> void:
 	add_child(sun)
 
 	cam = Camera3D.new()
-	cam.far = maxf(2000.0, world.W * 1.6)   # see across a big world
+	# far plane covers the whole far-field vista (8 km rings + square corners)
+	var far_on := world is GpuWorld and (world as GpuWorld).far_field
+	cam.far = 400_000.0 if far_on else maxf(2000.0, world.W * 1.6)
 	# a 0.05 near plane against a 2000 far plane wastes almost all depth precision
 	# up close, so coincident voxel-cube faces z-fight into thin seams. 1 unit = 1
 	# voxel (5 cm); a 0.3-voxel near plane (1.5 cm) is closer than you fly yet lifts
@@ -420,7 +426,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		if event.button_index == MOUSE_BUTTON_LEFT and not mouse_captured:
 			_capture_mouse(true)                                  # click to re-grab
 		elif event.button_index == MOUSE_BUTTON_WHEEL_UP:
-			fly_speed = minf(fly_speed * 1.25, 500.0)             # faster
+			fly_speed = minf(fly_speed * 1.25, 4000.0)            # faster (up to 200 m/s)
 		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
 			fly_speed = maxf(fly_speed / 1.25, 2.0)               # slower
 	elif event is InputEventMouseMotion and mouse_captured:
@@ -458,8 +464,14 @@ func _take_screenshot() -> void:
 		world.set_rain_mm_hr(0.0)
 		world.run(40)
 		var ro := _render_off()
-		cam.position = Vector3(cx, surf + 30.0, cz - 20.0) - ro   # representative fly view
-		cam.look_at(Vector3(cx, surf - 139.0, cz + 227.0) - ro, Vector3.UP)   # -34 deg (default pitch)
+		var vy := OS.get_environment("VOX_CAMY").to_float()
+		if vy > 0.0:
+			# vista check: rise high and look level at the horizon (far field)
+			cam.position = Vector3(cx, surf + vy, cz - 20.0) - ro
+			cam.look_at(Vector3(cx, surf + vy * 0.6, cz + 8000.0) - ro, Vector3.UP)
+		else:
+			cam.position = Vector3(cx, surf + 30.0, cz - 20.0) - ro   # representative fly view
+			cam.look_at(Vector3(cx, surf - 139.0, cz + 227.0) - ro, Vector3.UP)   # -34 deg (default pitch)
 		var vprid := get_viewport().get_viewport_rid()
 		RenderingServer.viewport_set_measure_render_time(vprid, true)
 		gw.lod_cx = maxi(0, int(cx) - gw.gen_origin_x)     # LOD near disc at the camera
