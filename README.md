@@ -25,14 +25,16 @@ Creative-mode free flight (no gravity / collision):
 | Q / E | Less / more rain (mm/hour) — the world starts **calm**; press E to make it rain |
 | C | Toggle a cross-section (see subsurface moisture / the water table) |
 | B | Toggle render: full **5cm voxels** (default) ↔ **1m blocks** (voxel-tinted tops) |
+| V | Cycle shader look: **standard** → **pixel** → **toon** → **retro** (both) |
 | T | Toggle worldgen **blended** ↔ **terraced** (regenerates in place) |
 | P | Pause / resume |
 | R | Generate a fresh world |
 
-**Shader looks** (env vars, composable; default render unchanged without them):
-`VOX_PIXEL=n` pixel-art post-process (n screen px per art px) with `VOX_LEVELS=k`
-palette steps and Bayer dithering (`VOX_DITHER=0` disables); `VOX_TOON=1`
-cel-shades the terrain with hard-banded sunlight. All cost ~nothing (<0.5 ms).
+**Shader looks** — press **V** to cycle standard → pixel-art → toon → retro
+(the title bar shows the current look). Env vars tune the pixel-art post and
+pick the starting look: `VOX_PIXEL=n` (art-pixel size, default 4),
+`VOX_LEVELS=k` palette steps, `VOX_DITHER=0` disables the Bayer dither,
+`VOX_TOON=1` / `VOX_LOOK=0..3` choose the look at launch. All ~free (<0.5 ms).
 
 ## How it works
 

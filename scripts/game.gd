@@ -24,6 +24,11 @@ var _freeze_cam := false   # non-interactive shots that set their own camera
 var _band_acc := 0.0       # throttle for the vertical-tracking band check
 var _lod_cam_last := Vector2(1e12, 1e12)   # camera pos at the last LOD emit
 var _env: Environment
+# shader looks, cycled with V: 0 standard, 1 pixel-art, 2 toon, 3 toon+pixel
+const LOOK_NAMES := ["standard", "pixel", "toon", "retro"]
+var _look := 0
+var _toon_mat: ShaderMaterial
+var _pixel_rect: ColorRect
 var fly_pos := Vector3()
 var fly_yaw := 0.0         # radians, mouse-look
 var fly_pitch := -0.5
@@ -40,6 +45,7 @@ func _init() -> void:
 	_add_action("cut", [KEY_C])
 	_add_action("genmode", [KEY_T])   # toggle blended / terraced worldgen
 	_add_action("render_toggle", [KEY_B])   # per-voxel <-> 1m blocks (voxel tops)
+	_add_action("look_cycle", [KEY_V])      # cycle shader looks: standard/pixel/toon/retro
 	# creative fly controls (Minecraft-style): WASD move, Space/Shift up/down
 	_add_action("fly_fwd", [KEY_W])
 	_add_action("fly_back", [KEY_S])
@@ -141,29 +147,36 @@ func _ready() -> void:
 	sun.directional_shadow_max_distance = 340.0
 	add_child(sun)
 
-	# --- shader-look experiments (env-gated; nothing changes unless set) ---
-	# VOX_TOON=1: cel-shaded terrain — instance colours lit by a hard-banded sun
-	if OS.get_environment("VOX_TOON") != "" and view.use_instances:
-		var tm := ShaderMaterial.new()
-		tm.shader = load("res://shaders/toon_terrain.gdshader")
-		tm.set_shader_parameter("sun_dir", -sun.global_transform.basis.z)
-		view.solid_mm.material_override = tm
-	# VOX_PIXEL=n: pixel-art post over the whole frame (n screen px per art px);
-	# VOX_LEVELS=k palette steps, VOX_DITHER=0 disables the Bayer dither
-	if OS.get_environment("VOX_PIXEL") != "":
-		var pm := ShaderMaterial.new()
-		pm.shader = load("res://shaders/pixel_post.gdshader")
-		pm.set_shader_parameter("pixel_size", maxi(1, OS.get_environment("VOX_PIXEL").to_int()))
-		if OS.get_environment("VOX_LEVELS") != "":
-			pm.set_shader_parameter("levels", maxi(2, OS.get_environment("VOX_LEVELS").to_int()))
-		pm.set_shader_parameter("dither", OS.get_environment("VOX_DITHER") != "0")
-		var lay := CanvasLayer.new()
-		var rect := ColorRect.new()
-		rect.set_anchors_preset(Control.PRESET_FULL_RECT)
-		rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		rect.material = pm
-		lay.add_child(rect)
-		add_child(lay)
+	# --- shader looks (V cycles; env vars set the starting look/params) ---
+	# Both are built once here and toggled live: VOX_PIXEL=n / VOX_LEVELS=k /
+	# VOX_DITHER=0 configure the pixel-art post; VOX_TOON=1 starts cel-shaded;
+	# VOX_LOOK=0..3 picks the starting look directly.
+	if view.use_instances:
+		_toon_mat = ShaderMaterial.new()
+		_toon_mat.shader = load("res://shaders/toon_terrain.gdshader")
+		_toon_mat.set_shader_parameter("sun_dir", -sun.global_transform.basis.z)
+	var pm := ShaderMaterial.new()
+	pm.shader = load("res://shaders/pixel_post.gdshader")
+	pm.set_shader_parameter("pixel_size",
+			maxi(1, OS.get_environment("VOX_PIXEL").to_int()) if OS.get_environment("VOX_PIXEL") != "" else 4)
+	if OS.get_environment("VOX_LEVELS") != "":
+		pm.set_shader_parameter("levels", maxi(2, OS.get_environment("VOX_LEVELS").to_int()))
+	pm.set_shader_parameter("dither", OS.get_environment("VOX_DITHER") != "0")
+	var lay := CanvasLayer.new()
+	_pixel_rect = ColorRect.new()
+	_pixel_rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_pixel_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_pixel_rect.material = pm
+	_pixel_rect.visible = false
+	lay.add_child(_pixel_rect)
+	add_child(lay)
+	if OS.get_environment("VOX_LOOK") != "":
+		_look = clampi(OS.get_environment("VOX_LOOK").to_int(), 0, 3)
+	else:
+		var px := OS.get_environment("VOX_PIXEL") != ""
+		var tn := OS.get_environment("VOX_TOON") != ""
+		_look = 3 if px and tn else (1 if px else (2 if tn else 0))
+	_apply_look()
 
 	cam = Camera3D.new()
 	# far plane covers the whole far-field vista (8 km rings + square corners)
@@ -362,6 +375,9 @@ func _process(dt: float) -> void:
 		var gw := world as GpuWorld
 		gw.block_render = not gw.block_render
 		_refresh_view(true)
+	if Input.is_action_just_pressed("look_cycle"):
+		_look = (_look + 1) % 4
+		_apply_look()
 	if Input.is_action_just_pressed("restart"):
 		world.free_gpu()
 		var wsz := _world_size()
@@ -401,13 +417,21 @@ func _process(dt: float) -> void:
 		var sim_s := int(world.tick_count / TICK_RATE)
 		var genmode := "terraced" if (world is GpuWorld and (world as GpuWorld).gen_flags & 1) else "blended"
 		var rmode := "blocks" if (world is GpuWorld and (world as GpuWorld).block_render) else "voxels"
-		DisplayServer.window_set_title("VoxelEco — %s | %s | %s | sim %02d:%02d:%02d | %s | rain %d mm/h | %d fps" % [
+		DisplayServer.window_set_title("VoxelEco — %s | %s | %s | %s | sim %02d:%02d:%02d | %s | rain %d mm/h | %d fps" % [
 			"GPU" if world.gpu_ok else "CPU",
-			rmode, genmode,
+			rmode, genmode, LOOK_NAMES[_look],
 			sim_s / 3600, (sim_s / 60) % 60, sim_s % 60,
 			"paused" if speed_mult == 0 else str(speed_mult) + "x",
 			int(world.rain_mm_hr),
 			int(Engine.get_frames_per_second())])
+
+## apply the current shader look (V cycles): pixel-art post overlay on/off and
+## the terrain material swapped between standard PBR and the cel/toon shader
+func _apply_look() -> void:
+	if _pixel_rect != null:
+		_pixel_rect.visible = _look == 1 or _look == 3
+	if _toon_mat != null and view.use_instances:
+		view.solid_mm.material_override = _toon_mat if (_look == 2 or _look == 3) else view.solid_mat
 
 func _refresh_view(force := false) -> void:
 	if view.use_instances:
