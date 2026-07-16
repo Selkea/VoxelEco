@@ -22,6 +22,26 @@ var cd := 0
 var use_instances := false
 var solid_mm: MultiMeshInstance3D
 var water_mm: MultiMeshInstance3D
+# ray-cast renderer overlay: the compute pass writes an rgba8 image; this shows
+# it over the 3D view (alpha 0 where rays miss, so the sky/far field show through)
+var ray_layer: CanvasLayer
+var ray_rect: TextureRect
+
+func set_ray_mode(on: bool, tex_rid: RID) -> void:
+	if ray_layer == null:
+		ray_layer = CanvasLayer.new()
+		ray_layer.layer = 5   # below the pixel-post overlay (layer default 1? post uses its own)
+		ray_rect = TextureRect.new()
+		ray_rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+		ray_rect.stretch_mode = TextureRect.STRETCH_SCALE
+		ray_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		ray_layer.add_child(ray_rect)
+		add_child(ray_layer)
+	if on:
+		var t := Texture2DRD.new()
+		t.texture_rd_rid = tex_rid
+		ray_rect.texture = t
+	ray_layer.visible = on
 
 const COLOR := {
 	VoxWorld.BEDROCK: Color("#3a3f47"),

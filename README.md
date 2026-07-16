@@ -26,6 +26,7 @@ Creative-mode free flight (no gravity / collision):
 | C | Toggle a cross-section (see subsurface moisture / the water table) |
 | B | Toggle render: full **5cm voxels** (default) ↔ **1m blocks** (voxel-tinted tops) |
 | V | Cycle shader look: **standard** → **pixel** → **toon** → **retro** (both) |
+| G | Toggle renderer: **instances** (raster) ↔ **ray-cast** (experimental) |
 | T | Toggle worldgen **blended** ↔ **terraced** (regenerates in place) |
 | P | Pause / resume |
 | R | Generate a fresh world |
@@ -176,6 +177,15 @@ VOX_LEVELS=6 VOX_DITHERSTR=1`.
   water plane over basins. The whole 8 km vista costs ~3-4 ms; `VOX_FAR=0`
   disables it. What you see out there is the real terrain you can fly to — it
   streams into the sim window as you approach.
+- **Ray-cast renderer (experimental, G / `VOX_RENDER=ray`)**: GigaVoxels-inspired
+  alternative to the instanced renderer — eye rays march a per-column ground
+  heightfield (plus a per-16x16-tile max grid for empty-space skipping) in a
+  compute pass and write an image composited over the rasterized far field. The
+  whole 102 m window draws in **~0.2 ms at 720p** (vs ~9 ms of instances), scales
+  with screen resolution instead of window size, and shades the true cells (same
+  per-voxel colour/jitter/wetness). Current trade-offs: no MSAA/SSAO/shadows in
+  the ray image, airborne falling grains aren't drawn, and the cross-section cut
+  doesn't apply — hence experimental, raster stays the default.
 - **Scale**: the default fly window is a **2048x2048 footprint (102 m) with a
   37.8 m resident band at 5 cm** — **~3.17 billion sim cells**. A single GPU
   storage buffer is 32-bit-sized in Godot (~4 GB ≈ 1.07B cells), so the cells span

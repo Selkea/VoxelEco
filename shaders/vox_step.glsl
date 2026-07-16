@@ -21,6 +21,18 @@ layout(set = 0, binding = 0, std430) restrict buffer CellsBuf { uint cells[]; };
 // total at ~4.29B cells.
 layout(set = 0, binding = 8, std430) restrict buffer CellsBuf2 { uint cells2[]; };
 layout(set = 0, binding = 9, std430) restrict buffer CellsBuf3 { uint cells3[]; };
+// RAY-CAST renderer (GigaVoxels-inspired): per-column ground heights + a coarse
+// per-16x16-tile max grid accelerate a heightfield ray march — draw cost scales
+// with SCREEN RESOLUTION, not instance count. heights = first-air-above-ground
+// per column (contiguous ground; airborne falling grains are ignored).
+layout(set = 0, binding = 10, std430) restrict buffer HeightsBuf { uint heights[]; };
+layout(set = 0, binding = 11, std430) restrict buffer HMaxBuf { uint hmax[]; };
+// camera for the ray pass: eye/forward/right/up in the LOCAL render frame, plus
+// sun direction and tan(fov)*aspect factors — updated per frame, tiny buffer
+layout(set = 0, binding = 12, std430) restrict buffer CamBuf {
+	vec4 cam_eye; vec4 cam_fwd; vec4 cam_right; vec4 cam_up; vec4 cam_sun;
+};
+layout(set = 0, binding = 13, rgba8) uniform restrict writeonly image2D out_img;
 layout(set = 0, binding = 1, std430) restrict buffer PackBuf { uint packed_out[]; };
 layout(set = 0, binding = 2, std430) restrict buffer StatsBuf { uint rained; uint evaporated; uint absorbed; };
 // Noita-style dirty tracking, one flag per 16x16-column mesh chunk: settled
@@ -66,6 +78,8 @@ layout(push_constant) uniform Params {
 	// (do_face_emit); farther terrain as coarse 1 m block quads (do_lod_emit).
 	// lod_r == 0 disables LOD (everything fine) — tests and small worlds.
 	uint lod_cx; uint lod_cz; uint lod_r;
+	// ray-cast output image size (mode 16)
+	uint img_w; uint img_h;
 } p;
 
 // route a linear cell index to its buffer (see CellsBuf2/3). Spatially adjacent
@@ -1165,6 +1179,159 @@ void do_holes() {
 	if (col_top(id % p.W, id / p.W) == 0u) { atomicAdd(rained, 1u); }
 }
 
+// ---- ray-cast renderer (modes 14-16), GigaVoxels-inspired ----
+// Instead of emitting instances, march eye rays through the ground heightfield:
+// per-column heights + a per-16x16-tile max grid let rays skip empty space, so
+// draw cost scales with SCREEN RESOLUTION, not window size or instance count.
+
+// mode 14: per-column CONTIGUOUS ground height (scan up from the floor to the
+// first air). Airborne grains (falling rain/sand) are ignored by this renderer.
+// Cells are indexed by BUFFER SLOT (torus), but rays march in the LOCAL frame —
+// so heights are written at the column's LOCAL index (world_coord - origin),
+// unshuffling the toroidal seam once here instead of per ray step.
+void do_heights() {
+	uint id = flat_id();
+	if (id >= p.W * p.D) { return; }
+	uint x = id % p.W;
+	uint z = id / p.W;
+	uint y = 0u;
+	while (y < p.H && MAT(cget(cidx(x, y, z))) != AIR) { y++; }
+	uint lx = world_coord(x, p.gen_ox, p.W) - p.gen_ox;
+	uint lz = world_coord(z, p.gen_oz, p.D) - p.gen_oz;
+	heights[lz * p.W + lx] = y;
+}
+
+// mode 15: per-tile max of the column heights (16x16 columns, the chunk grid)
+void do_hmax() {
+	uint cw = (p.W + CHUNK - 1u) / CHUNK;
+	uint cd = (p.D + CHUNK - 1u) / CHUNK;
+	uint id = flat_id();
+	if (id >= cw * cd) { return; }
+	uint x0 = (id % cw) * CHUNK, z0 = (id / cw) * CHUNK;
+	uint m = 0u;
+	for (uint j = 0u; j < CHUNK; j++) {
+		for (uint i = 0u; i < CHUNK; i++) {
+			uint x = min(x0 + i, p.W - 1u), z = min(z0 + j, p.D - 1u);
+			m = max(m, heights[z * p.W + x]);
+		}
+	}
+	hmax[id] = m;
+}
+
+// mode 16: one thread per pixel — march the ray through the heightfield.
+// Two-level DDA: step 5 cm columns, but on entering a 16-column tile whose max
+// height stays below the ray, jump straight to the tile's exit. On a hit, shade
+// the actual CELL (same per-voxel colour/jitter/wetness as the raster emit).
+void do_raycast() {
+	uint id = flat_id();
+	if (id >= p.img_w * p.img_h) { return; }
+	int px = int(id % p.img_w);
+	int py = int(id / p.img_w);
+	float u = (float(px) + 0.5) / float(p.img_w) * 2.0 - 1.0;
+	float v = 1.0 - (float(py) + 0.5) / float(p.img_h) * 2.0;
+	vec3 o = cam_eye.xyz;
+	o.y -= float(p.gen_oy);   // camera rides in world-Y; heights are band-local
+	vec3 d = normalize(cam_fwd.xyz + cam_right.xyz * (u * cam_right.w) + cam_up.xyz * (v * cam_up.w));
+	float W = float(p.W), D = float(p.D);
+	// clip to the window's footprint
+	float t0 = 0.0, t1 = 1.0e9;
+	if (abs(d.x) < 1e-6) {
+		if (o.x < 0.0 || o.x > W) { imageStore(out_img, ivec2(px, py), vec4(0.0)); return; }
+	} else {
+		float ta = -o.x / d.x, tb = (W - o.x) / d.x;
+		t0 = max(t0, min(ta, tb)); t1 = min(t1, max(ta, tb));
+	}
+	if (abs(d.z) < 1e-6) {
+		if (o.z < 0.0 || o.z > D) { imageStore(out_img, ivec2(px, py), vec4(0.0)); return; }
+	} else {
+		float ta = -o.z / d.z, tb = (D - o.z) / d.z;
+		t0 = max(t0, min(ta, tb)); t1 = min(t1, max(ta, tb));
+	}
+	if (t1 <= t0) { imageStore(out_img, ivec2(px, py), vec4(0.0)); return; }
+	float t = t0 + 1e-4;
+	// column DDA state
+	int cx = clamp(int(floor(o.x + d.x * t)), 0, int(p.W) - 1);
+	int cz = clamp(int(floor(o.z + d.z * t)), 0, int(p.D) - 1);
+	int sx = d.x > 0.0 ? 1 : -1;
+	int sz = d.z > 0.0 ? 1 : -1;
+	float dtx = abs(d.x) > 1e-6 ? abs(1.0 / d.x) : 1.0e9;
+	float dtz = abs(d.z) > 1e-6 ? abs(1.0 / d.z) : 1.0e9;
+	float tmx = abs(d.x) > 1e-6 ? (float(cx + (sx > 0 ? 1 : 0)) - o.x) / d.x : 1.0e9;
+	float tmz = abs(d.z) > 1e-6 ? (float(cz + (sz > 0 ? 1 : 0)) - o.z) / d.z : 1.0e9;
+	int axis = d.y < 0.0 ? 1 : 0;   // last stepped axis: 0=x, 2=z (1 = top face)
+	uint cw = (p.W + CHUNK - 1u) / CHUNK;
+	int guard = 0;
+	while (t < t1 && guard < 8192) {
+		guard++;
+		// tile fast path: on tile entry, if the ray stays above the tile's max
+		// height for the whole crossing, jump to the tile's exit in one step
+		int tx = cx >> 4, tz = cz >> 4;
+		float tileExit = min(t1,
+				min(abs(d.x) > 1e-6 ? (float((tx + (sx > 0 ? 1 : 0)) << 4) - o.x) / d.x : 1.0e9,
+				    abs(d.z) > 1e-6 ? (float((tz + (sz > 0 ? 1 : 0)) << 4) - o.z) / d.z : 1.0e9));
+		float hmx = float(hmax[uint(tz) * cw + uint(tx)]);
+		float yA = o.y + d.y * t;
+		float yE = o.y + d.y * tileExit;
+		if (min(yA, yE) > hmx + 0.001) {
+			if (d.y >= 0.0) { break; }        // rising above everything: sky
+			// STRICTLY forward: at |pos|~1000 a 1e-4 step is ~1 float ulp, so the
+			// jump could round back into the same tile and loop until the guard
+			t = max(t + 0.01, tileExit + 0.01);
+			cx = int(floor(o.x + d.x * t)); cz = int(floor(o.z + d.z * t));
+			if (cx < 0 || cx >= int(p.W) || cz < 0 || cz >= int(p.D)) { break; }
+			tmx = abs(d.x) > 1e-6 ? (float(cx + (sx > 0 ? 1 : 0)) - o.x) / d.x : 1.0e9;
+			tmz = abs(d.z) > 1e-6 ? (float(cz + (sz > 0 ? 1 : 0)) - o.z) / d.z : 1.0e9;
+			continue;
+		}
+		// per-column test over this column's t-span [t, tNext]
+		float tNext = min(min(tmx, tmz), t1);
+		float h = float(heights[uint(cz) * p.W + uint(cx)]);
+		float y0 = o.y + d.y * t;
+		if (y0 < h) {
+			// entered the column below its top: SIDE face hit at t (camera-in-
+			// ground start shades as a top so the screen never goes garbage)
+			int cy = clamp(int(floor(y0)), 0, int(p.H) - 1);
+			vec3 n = axis == 0 ? vec3(float(-sx), 0.0, 0.0)
+					: (axis == 2 ? vec3(0.0, 0.0, float(-sz)) : vec3(0.0, 1.0, 0.0));
+			uint bx = (uint(cx) + p.gen_ox) % p.W;   // local -> buffer slot (torus)
+			uint bz = (uint(cz) + p.gen_oz) % p.D;
+			uint raw = cget(cidx(bx, uint(cy), bz));
+			uint m = MAT(raw);
+			if (m == AIR) { m = SOIL; }
+			uint vid = bx + bz * p.W + uint(cy) * p.W * p.D;
+			vec3 base = m == WATER ? vec3(0.024, 0.13, 0.34) : surf_color(raw, m, vid);
+			float ndl = max(dot(n, -normalize(cam_sun.xyz)), 0.0);
+			vec3 c = base * (0.42 + 0.72 * ndl);
+			imageStore(out_img, ivec2(px, py), vec4(pow(c, vec3(1.0 / 2.2)), 1.0));
+			return;
+		}
+		if (d.y < 0.0) {
+			float yN = o.y + d.y * tNext;
+			if (yN < h) {
+				// crosses the top plane inside this column: TOP face hit
+				float tt = (h - o.y) / d.y;
+				int cy = clamp(int(h) - 1, 0, int(p.H) - 1);
+				uint bx = (uint(cx) + p.gen_ox) % p.W;   // local -> buffer slot (torus)
+				uint bz = (uint(cz) + p.gen_oz) % p.D;
+				uint raw = cget(cidx(bx, uint(cy), bz));
+				uint m = MAT(raw);
+				if (m == AIR) { m = SOIL; }
+				uint vid = bx + bz * p.W + uint(cy) * p.W * p.D;
+				vec3 base = m == WATER ? vec3(0.024, 0.13, 0.34) : surf_color(raw, m, vid);
+				float ndl = max(dot(vec3(0.0, 1.0, 0.0), -normalize(cam_sun.xyz)), 0.0);
+				vec3 c = base * (0.42 + 0.72 * ndl);
+				imageStore(out_img, ivec2(px, py), vec4(pow(c, vec3(1.0 / 2.2)), 1.0));
+				return;
+			}
+		}
+		// advance to the next column
+		if (tmx < tmz) { t = tmx; cx += sx; tmx += dtx; axis = 0; }
+		else           { t = tmz; cz += sz; tmz += dtz; axis = 2; }
+		if (cx < 0 || cx >= int(p.W) || cz < 0 || cz >= int(p.D)) { break; }
+	}
+	imageStore(out_img, ivec2(px, py), vec4(0.0));   // window exit: sky / far field shows
+}
+
 void main() {
 	uint mode = p.mode & 0xFFu;      // high bits carry the debug rules mask
 	if (mode == 1u) { do_rain(); }
@@ -1178,5 +1345,8 @@ void main() {
 	else if (mode == 11u) { do_lod_emit(); }
 	else if (mode == 12u) { do_far_emit(); }
 	else if (mode == 13u) { do_holes(); }
+	else if (mode == 14u) { do_heights(); }
+	else if (mode == 15u) { do_hmax(); }
+	else if (mode == 16u) { do_raycast(); }
 	else { do_step(); }
 }

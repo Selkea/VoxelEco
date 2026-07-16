@@ -141,6 +141,10 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	zeros.resize(chunk_w * chunk_d * 4)
 	dirty_buf = rd.storage_buffer_create(zeros.size(), zeros)
 	active_buf = rd.storage_buffer_create(zeros.size(), zeros)   # all asleep until gen wakes
+	heights_buf = rd.storage_buffer_create(W * D * 4)            # ray renderer: column heights
+	hmax_buf = rd.storage_buffer_create(zeros.size(), zeros)     # ray renderer: tile max heights
+	cam_buf = rd.storage_buffer_create(80)                       # ray renderer: camera/sun
+	_make_ray_tex()
 	nbx = (W + 19) / 20
 	nby = (H + 19) / 20
 	nbz = (D + 19) / 20
@@ -324,9 +328,68 @@ func band_oy_for(wx: float, wz: float) -> int:
 	var oy := int(round(mid - float(H) * 0.5 + float(H) * 0.08))
 	return clampi(oy, 0, maxi(RELIEF - H, 0))
 
+## the ray pass writes this rgba8 storage image; a Texture2DRD shows it on screen
+func _make_ray_tex() -> void:
+	if ray_tex.is_valid():
+		rd.free_rid(ray_tex)
+	var fmt := RDTextureFormat.new()
+	fmt.width = _img_w
+	fmt.height = _img_h
+	fmt.format = RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM
+	fmt.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT \
+			| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	ray_tex = rd.texture_create(fmt, RDTextureView.new(), [])
+
+## (re)size the ray output image to the viewport; rebinds the uniform set
+func setup_raycast(w: int, h: int) -> void:
+	if not gpu_ok or (w == _img_w and h == _img_h):
+		return
+	_img_w = maxi(4, w)
+	_img_h = maxi(4, h)
+	_make_ray_tex()
+	_rebuild_uniform_set()
+
+## rebuild the column heights + tile max grids (call when the sim changed)
+func update_heights() -> void:
+	if not gpu_ok:
+		return
+	var cl := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(cl, pipeline)
+	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
+	rd.compute_list_set_push_constant(cl, _pc(14, 0), PC_SIZE)   # column heights
+	rd.compute_list_dispatch(cl, _col_groups, 1, 1)
+	rd.compute_list_add_barrier(cl)
+	rd.compute_list_set_push_constant(cl, _pc(15, 0), PC_SIZE)   # tile max
+	rd.compute_list_dispatch(cl, _decay_groups, 1, 1)
+	rd.compute_list_end()
+
+## march eye rays into ray_tex. Vectors are in the LOCAL render frame; fov terms
+## fold into right/up (right.w = tan(fov/2)*aspect, up.w = tan(fov/2)).
+func raycast(eye: Vector3, fwd: Vector3, right: Vector3, up: Vector3,
+		sun: Vector3, tanfov: float, aspect: float) -> void:
+	if not gpu_ok:
+		return
+	var cb := PackedByteArray()
+	cb.resize(80)
+	var vecs := [eye, fwd, right, up, sun]
+	var ws := [0.0, 0.0, tanfov * aspect, tanfov, 0.0]
+	for i in range(5):
+		cb.encode_float(i * 16, vecs[i].x)
+		cb.encode_float(i * 16 + 4, vecs[i].y)
+		cb.encode_float(i * 16 + 8, vecs[i].z)
+		cb.encode_float(i * 16 + 12, ws[i])
+	rd.buffer_update(cam_buf, 0, 80, cb)
+	var cl := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(cl, pipeline)
+	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
+	rd.compute_list_set_push_constant(cl, _pc(16, 0), PC_SIZE)
+	rd.compute_list_dispatch(cl, ceili(_img_w * _img_h / 64.0), 1, 1)
+	rd.compute_list_end()
+
 func _rebuild_uniform_set() -> void:
 	var bufs := [cells_buf, pack_buf, stats_buf, dirty_buf,
-			_solid_target, _water_target, inst_count_buf, active_buf, cells_buf2, cells_buf3]
+			_solid_target, _water_target, inst_count_buf, active_buf, cells_buf2, cells_buf3,
+			heights_buf, hmax_buf, cam_buf]
 	var us: Array[RDUniform] = []
 	for b in range(bufs.size()):
 		var u := RDUniform.new()
@@ -334,6 +397,11 @@ func _rebuild_uniform_set() -> void:
 		u.binding = b
 		u.add_id(bufs[b])
 		us.append(u)
+	var iu := RDUniform.new()
+	iu.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
+	iu.binding = 13
+	iu.add_id(ray_tex)
+	us.append(iu)
 	uniform_set = rd.uniform_set_create(us, shader, 0)
 
 ## the view hands us its MultiMesh storage buffers: the emit pass writes
@@ -345,7 +413,7 @@ func bind_instance_buffers(solid_rid: RID, water_rid: RID) -> void:
 	_water_target = water_rid
 	_rebuild_uniform_set()
 
-const PC_SIZE := 88   # push constant byte size (must match the shader struct)
+const PC_SIZE := 96   # push constant byte size (must match the shader struct)
 
 # distance LOD (mesh render): fine 5cm faces within lod_r voxels of the camera
 # (local render frame); coarser 1m block quads beyond. 0 = LOD off (all fine).
@@ -357,6 +425,16 @@ var lod_r := 0
 # threads each: sides must mirror the shader's RING_TILE/RING_OUTER constants.
 var far_field := false
 const FAR_SIDES := [400, 400, 500]
+# RAY-CAST renderer (GigaVoxels-inspired): march eye rays through a per-column
+# ground heightfield instead of emitting window instances — draw scales with
+# screen resolution, not window size. The far field stays rasterized behind it.
+var ray_render := false
+var heights_buf: RID       # per-column contiguous ground height
+var hmax_buf: RID          # per-16x16-tile max height (ray fast path)
+var cam_buf: RID           # eye/basis/sun for the ray pass
+var ray_tex: RID           # rgba8 storage image the rays write (shown via Texture2DRD)
+var _img_w := 4
+var _img_h := 4
 
 func _pc(mode: int, offset: int) -> PackedByteArray:
 	# 64-byte push constant. rain is an integer threshold out of 2^24; evap/erode
@@ -386,6 +464,8 @@ func _pc(mode: int, offset: int) -> PackedByteArray:
 	pc.encode_u32(76, lod_cx)          # LOD camera (local frame) + near radius
 	pc.encode_u32(80, lod_cz)
 	pc.encode_u32(84, lod_r)
+	pc.encode_u32(88, _img_w)          # ray-cast output image size
+	pc.encode_u32(92, _img_h)
 	return pc
 
 func step() -> void:
@@ -446,11 +526,12 @@ func dispatch_emit() -> PackedInt32Array:
 	rd.compute_list_bind_compute_pipeline(cl, pipeline)
 	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
 	if mesh_render:
-		rd.compute_list_set_push_constant(cl, _pc(8, 0), PC_SIZE)   # fine faces (near disc, or all if lod_r=0)
-		rd.compute_list_dispatch(cl, _col_groups, 1, 1)
-		if lod_r > 0:
-			rd.compute_list_set_push_constant(cl, _pc(11, 0), PC_SIZE)   # coarse far block quads
-			rd.compute_list_dispatch(cl, _block_groups, 1, 1)
+		if not ray_render:
+			rd.compute_list_set_push_constant(cl, _pc(8, 0), PC_SIZE)   # fine faces (near disc, or all if lod_r=0)
+			rd.compute_list_dispatch(cl, _col_groups, 1, 1)
+			if lod_r > 0:
+				rd.compute_list_set_push_constant(cl, _pc(11, 0), PC_SIZE)   # coarse far block quads
+				rd.compute_list_dispatch(cl, _block_groups, 1, 1)
 		if far_field and lod_r > 0:
 			for ring in range(3):   # heightfield vista rings out to 8 km
 				rd.compute_list_set_push_constant(cl, _pc(12, ring), PC_SIZE)
@@ -538,7 +619,8 @@ func free_gpu() -> void:
 		return
 	# free our resources, never the shared main device
 	for r in [uniform_set, pipeline, shader, cells_buf, cells_buf2, cells_buf3, pack_buf,
-			stats_buf, dirty_buf, active_buf, inst_count_buf, _placeholder_a, _placeholder_b]:
+			stats_buf, dirty_buf, active_buf, inst_count_buf, _placeholder_a, _placeholder_b,
+			heights_buf, hmax_buf, cam_buf, ray_tex]:
 		if r.is_valid():
 			rd.free_rid(r)
 	rd = null

@@ -29,6 +29,8 @@ const LOOK_NAMES := ["standard", "pixel", "toon", "retro"]
 var _look := 0
 var _toon_mat: ShaderMaterial
 var _pixel_rect: ColorRect
+var _sun: DirectionalLight3D
+var _ray_size := Vector2i.ZERO   # ray output size at the last setup (resize check)
 var fly_pos := Vector3()
 var fly_yaw := 0.0         # radians, mouse-look
 var fly_pitch := -0.5
@@ -46,6 +48,7 @@ func _init() -> void:
 	_add_action("genmode", [KEY_T])   # toggle blended / terraced worldgen
 	_add_action("render_toggle", [KEY_B])   # per-voxel <-> 1m blocks (voxel tops)
 	_add_action("look_cycle", [KEY_V])      # cycle shader looks: standard/pixel/toon/retro
+	_add_action("ray_toggle", [KEY_G])      # raster instances <-> ray-cast renderer
 	# creative fly controls (Minecraft-style): WASD move, Space/Shift up/down
 	_add_action("fly_fwd", [KEY_W])
 	_add_action("fly_back", [KEY_S])
@@ -146,6 +149,7 @@ func _ready() -> void:
 	sun.shadow_blur = 1.4
 	sun.directional_shadow_max_distance = 340.0
 	add_child(sun)
+	_sun = sun
 
 	# --- shader looks (V cycles; env vars set the starting look/params) ---
 	# Both are built once here and toggled live: VOX_PIXEL=n / VOX_LEVELS=k /
@@ -165,6 +169,7 @@ func _ready() -> void:
 	if OS.get_environment("VOX_DITHERSTR") != "":
 		pm.set_shader_parameter("dither_strength", clampf(OS.get_environment("VOX_DITHERSTR").to_float(), 0.0, 1.0))
 	var lay := CanvasLayer.new()
+	lay.layer = 10   # above the ray-cast overlay so the pixel post covers it too
 	_pixel_rect = ColorRect.new()
 	_pixel_rect.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_pixel_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -242,6 +247,8 @@ func _ready() -> void:
 		print("center column materials (y 0->%d): %s" % [world.H - 1, col])
 		get_tree().quit()
 		return
+	if OS.get_environment("VOX_RENDER") == "ray":
+		_set_ray(true)
 	if "--sim" in OS.get_cmdline_user_args():
 		_run_sim_test()
 	if "--shot" in OS.get_cmdline_user_args():
@@ -389,6 +396,8 @@ func _process(dt: float) -> void:
 	if Input.is_action_just_pressed("look_cycle"):
 		_look = (_look + 1) % 4
 		_apply_look()
+	if Input.is_action_just_pressed("ray_toggle") and world is GpuWorld:
+		_set_ray(not (world as GpuWorld).ray_render)
 	if Input.is_action_just_pressed("restart"):
 		world.free_gpu()
 		var wsz := _world_size()
@@ -422,6 +431,18 @@ func _process(dt: float) -> void:
 		_place_fly()   # re-sync camera to the (possibly shifted) render origin
 	elif not _freeze_cam:
 		_place_cam()
+	# ray-cast renderer: march the frame's rays from the final camera pose
+	if world is GpuWorld and (world as GpuWorld).ray_render and cam != null:
+		var gwr := world as GpuWorld
+		var vps := get_viewport().get_visible_rect().size
+		if Vector2i(int(vps.x), int(vps.y)) != _ray_size:
+			gwr.setup_raycast(int(vps.x), int(vps.y))
+			_ray_size = Vector2i(int(vps.x), int(vps.y))
+			view.set_ray_mode(true, gwr.ray_tex)
+		var b := cam.global_transform.basis
+		gwr.raycast(cam.position, -b.z, b.x, b.y,
+				-_sun.global_transform.basis.z,
+				tan(deg_to_rad(cam.fov * 0.5)), vps.x / vps.y)
 	_title_acc += dt
 	if _title_acc > 0.5:
 		_title_acc = 0.0
@@ -435,6 +456,21 @@ func _process(dt: float) -> void:
 			"paused" if speed_mult == 0 else str(speed_mult) + "x",
 			int(world.rain_mm_hr),
 			int(Engine.get_frames_per_second())])
+
+## toggle the ray-cast renderer (G): rays draw the window terrain into an image
+## overlay; the instanced emit switches to far-field-only behind it
+func _set_ray(on: bool) -> void:
+	if not (world is GpuWorld) or not view.use_instances:
+		return
+	var gw := world as GpuWorld
+	gw.ray_render = on
+	if on:
+		var vps := get_viewport().get_visible_rect().size
+		gw.setup_raycast(int(vps.x), int(vps.y))
+		_ray_size = Vector2i(int(vps.x), int(vps.y))
+		gw.update_heights()
+	view.set_ray_mode(on, gw.ray_tex)
+	_refresh_view(true)   # re-emit: far-only in ray mode, full otherwise
 
 ## apply the current shader look (V cycles): pixel-art post overlay on/off and
 ## the terrain material swapped between standard PBR and the cel/toon shader
@@ -464,6 +500,8 @@ func _refresh_view(force := false) -> void:
 				force = true
 			if force or world.any_dirty_and_clear():
 				_lod_cam_last = Vector2(lc.x, lc.z)
+				if gw.ray_render:
+					gw.update_heights()   # rays read the heightfield; refresh with the sim
 				var counts: PackedInt32Array = world.dispatch_emit()
 				if counts.size() == 2:
 					view.set_visible_counts(counts[0], counts[1])
@@ -535,8 +573,25 @@ func _take_screenshot() -> void:
 		RenderingServer.viewport_set_measure_render_time(vprid, true)
 		gw.lod_cx = maxi(0, int(cx) - gw.gen_origin_x)     # LOD near disc at the camera
 		gw.lod_cz = maxi(0, int(cz - 20.0) - gw.gen_origin_z)
+		if gw.ray_render:
+			gw.update_heights()                            # heights for the new origin
 		var cnt: PackedInt32Array = gw.dispatch_emit()
 		view.set_visible_counts(cnt[0], cnt[1])
+		if gw.ray_render:
+			# time the ray pass itself (the per-frame cost of the ray renderer)
+			var bb := cam.global_transform.basis
+			var vps2 := get_viewport().get_visible_rect().size
+			var rsync := func() -> void: gw.rd.buffer_get_data(gw.stats_buf)
+			gw.raycast(cam.position, -bb.z, bb.x, bb.y, -_sun.global_transform.basis.z,
+					tan(deg_to_rad(cam.fov * 0.5)), vps2.x / vps2.y)
+			rsync.call()
+			var rt0 := Time.get_ticks_usec()
+			for i in range(30):
+				gw.raycast(cam.position, -bb.z, bb.x, bb.y, -_sun.global_transform.basis.z,
+						tan(deg_to_rad(cam.fov * 0.5)), vps2.x / vps2.y)
+			rsync.call()
+			print("FPSTEST ray pass: %.2f ms/frame at %dx%d" % [
+				(Time.get_ticks_usec() - rt0) / 30.0 / 1000.0, int(vps2.x), int(vps2.y)])
 		for i in range(15):
 			await get_tree().process_frame                       # warm up
 		var gpu := 0.0
