@@ -639,7 +639,7 @@ func _run_sim_test() -> void:
 		var wbuf := gw.rd.storage_buffer_create(gw.water_cap * 64)
 		gw.bind_instance_buffers(sbuf, wbuf)
 		var sync := func() -> void: gw.rd.buffer_get_data(gw.stats_buf)
-		gw.run(4); sync.call()                                   # warm up
+		gw.run(80); sync.call()                                  # warm up: let it settle & sleep
 		var t0 := Time.get_ticks_usec()
 		gw.run(60); sync.call()
 		var settled_us := (Time.get_ticks_usec() - t0) / 60.0

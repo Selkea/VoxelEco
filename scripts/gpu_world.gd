@@ -15,6 +15,7 @@ var cells_buf: RID
 var pack_buf: RID
 var stats_buf: RID
 var dirty_buf: RID
+var active_buf: RID    # per-chunk physics keepalive (active-block skipping)
 var inst_count_buf: RID
 var uniform_set: RID
 var _solid_target: RID    # multimesh buffers (bound by the view) or placeholders
@@ -33,6 +34,7 @@ var _col_groups := 0      # one thread per column (rain / worldgen)
 var _cell_groups := 0     # one thread per cell (voxel emit)
 var _pack_groups := 0
 var _block_groups := 0    # one thread per 1m block (block emit)
+var _decay_groups := 0    # one thread per chunk (active-flag decay)
 var nbx := 0
 var nby := 0
 var nbz := 0
@@ -111,6 +113,7 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	var zeros := PackedByteArray()
 	zeros.resize(chunk_w * chunk_d * 4)
 	dirty_buf = rd.storage_buffer_create(zeros.size(), zeros)
+	active_buf = rd.storage_buffer_create(zeros.size(), zeros)   # all asleep until gen wakes
 	nbx = (W + 19) / 20
 	nby = (H + 19) / 20
 	nbz = (D + 19) / 20
@@ -144,6 +147,7 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	_cell_groups = ceili(W * D * H / 64.0)
 	_pack_groups = ceili(words / 64.0)
 	_block_groups = ceili(nbx * nbz / 64.0)   # one thread per 1m block column
+	_decay_groups = ceili(chunk_w * chunk_d / 64.0)   # one thread per 16x16 chunk
 	gpu_ok = true
 	if OS.get_environment("VOX_GENMODE") == "terraced":
 		gen_flags = 1
@@ -295,7 +299,7 @@ func band_oy_for(wx: float, wz: float) -> int:
 
 func _rebuild_uniform_set() -> void:
 	var bufs := [cells_buf, pack_buf, stats_buf, dirty_buf,
-			_solid_target, _water_target, inst_count_buf]
+			_solid_target, _water_target, inst_count_buf, active_buf]
 	var us: Array[RDUniform] = []
 	for b in range(bufs.size()):
 		var u := RDUniform.new()
@@ -364,6 +368,9 @@ func run(n: int) -> void:
 		rd.compute_list_add_barrier(cl)
 		rd.compute_list_set_push_constant(cl, _pc(0, tick_count & 1), PC_SIZE)  # physics
 		rd.compute_list_dispatch(cl, _step_groups.x, _step_groups.y, _step_groups.z)
+		rd.compute_list_add_barrier(cl)
+		rd.compute_list_set_push_constant(cl, _pc(7, 0), PC_SIZE)               # sleep/wake decay
+		rd.compute_list_dispatch(cl, _decay_groups, 1, 1)
 		rd.compute_list_add_barrier(cl)
 	rd.compute_list_end()
 
@@ -455,7 +462,7 @@ func free_gpu() -> void:
 		return
 	# free our resources, never the shared main device
 	for r in [uniform_set, pipeline, shader, cells_buf, pack_buf, stats_buf,
-			dirty_buf, inst_count_buf, _placeholder_a, _placeholder_b]:
+			dirty_buf, active_buf, inst_count_buf, _placeholder_a, _placeholder_b]:
 		if r.is_valid():
 			rd.free_rid(r)
 	rd = null

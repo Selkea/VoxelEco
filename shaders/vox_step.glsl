@@ -23,6 +23,13 @@ layout(set = 0, binding = 3, std430) restrict buffer DirtyBuf { uint dirty[]; };
 layout(set = 0, binding = 4, std430) restrict buffer SolidInst { float solid_inst[]; };
 layout(set = 0, binding = 5, std430) restrict buffer WaterInst { float water_inst[]; };
 layout(set = 0, binding = 6, std430) restrict buffer InstCount { uint n_solid; uint n_water; uint cap_solid; uint cap_water; };
+// active-block gating (per 16x16-column chunk, same grid as dirty): the physics
+// only steps chunks with recent activity, and settled regions sleep. A change
+// wakes a chunk (+1-chunk margin) to KEEPALIVE; do_decay counts it back down, so a
+// chunk stays awake for KEEPALIVE ticks after its last change (covers both Margolus
+// offsets). This skips the cell READS for inert regions, which is the whole cost.
+layout(set = 0, binding = 7, std430) restrict buffer ActiveBuf { uint awake[]; };
+const uint KEEPALIVE = 4u;
 
 layout(push_constant) uniform Params {
 	uint W; uint H; uint D; uint tick;
@@ -55,10 +62,12 @@ void mark_dirty(uint x, uint z) {
 	uint x1 = min(x + 1u, p.W - 1u) / CHUNK;
 	uint z0 = (z > 0u ? z - 1u : 0u) / CHUNK;
 	uint z1 = min(z + 1u, p.D - 1u) / CHUNK;
-	dirty[z0 * cw + x0] = 1u;
-	if (x1 != x0) { dirty[z0 * cw + x1] = 1u; }
-	if (z1 != z0) { dirty[z1 * cw + x0]= 1u; }
-	if (x1 != x0 && z1 != z0) { dirty[z1 * cw + x1] = 1u; }
+	// mark for remeshing (dirty) AND wake the chunk for physics (active). The
+	// 1-chunk margin wakes neighbours so material can flow across a sleep boundary.
+	uint i0 = z0 * cw + x0;              dirty[i0] = 1u; awake[i0] = KEEPALIVE;
+	if (x1 != x0) { uint i = z0 * cw + x1; dirty[i] = 1u; awake[i] = KEEPALIVE; }
+	if (z1 != z0) { uint i = z1 * cw + x0; dirty[i] = 1u; awake[i] = KEEPALIVE; }
+	if (x1 != x0 && z1 != z0) { uint i = z1 * cw + x1; dirty[i] = 1u; awake[i] = KEEPALIVE; }
 }
 
 const uint AIR = 0u;
@@ -234,6 +243,11 @@ void do_step() {
 	uint sx = p.gen_ox % p.W;   // seam column (origin >= 0, so plain uint mod)
 	uint sz = p.gen_oz % p.D;
 	if ((base.x + 1u) % p.W == sx || (base.z + 1u) % p.D == sz) { return; }
+	// ACTIVE-BLOCK GATE: skip inert chunks BEFORE touching any cells — the cell
+	// reads are the cost, so gating here (one tiny flag read, cached per workgroup)
+	// is what actually saves time. Chunk index matches mark_dirty / dirty.
+	uint cw = (p.W + CHUNK - 1u) / CHUNK;
+	if (awake[(min(base.z, p.D - 1u) / CHUNK) * cw + (min(base.x, p.W - 1u) / CHUNK)] == 0u) { return; }
 	uint c[8];
 	bool ib[8];
 	uint ids[8];
@@ -803,6 +817,20 @@ void do_gen() {
 		if (m == AIR && wy < sea) { m = WATER; s0 = 0u; }
 		cells[cidx(x, y, z)] = PACK(m, s0);
 	}
+	// wake the freshly generated chunk so the physics settles it (then it sleeps)
+	uint cw = (p.W + CHUNK - 1u) / CHUNK;
+	awake[(z / CHUNK) * cw + (x / CHUNK)] = KEEPALIVE;
+}
+
+// one thread per chunk: count the active flag down. A chunk woken by mark_dirty is
+// set to KEEPALIVE and decays 1/tick, so it stays awake KEEPALIVE ticks after its
+// last change, then sleeps and the physics stops reading its cells.
+void do_decay() {
+	uint cw = (p.W + CHUNK - 1u) / CHUNK;
+	uint cd = (p.D + CHUNK - 1u) / CHUNK;
+	uint id = flat_id();
+	if (id >= cw * cd) { return; }
+	if (awake[id] > 0u) { awake[id] -= 1u; }
 }
 
 void main() {
@@ -813,5 +841,6 @@ void main() {
 	else if (mode == 4u) { do_gen(); }
 	else if (mode == 5u) { do_block_emit(); }
 	else if (mode == 6u) { do_skin_emit(); }
+	else if (mode == 7u) { do_decay(); }
 	else { do_step(); }
 }
