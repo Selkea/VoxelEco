@@ -42,6 +42,7 @@ var nbz := 0
 # voxels — decouples render cost from the fine sim so the map can be large.
 # VOX_RENDER=voxel forces the old per-voxel path (small worlds only).
 var block_render := true
+var mesh_render := true    # greedy-mesh quads (the fast default); overrides block/voxel
 var can_toggle_render := false   # buffers sized for both render modes (live toggle)
 var _pack_full := false   # pack buffer grown to full size on first sync_cells
 
@@ -402,7 +403,10 @@ func dispatch_emit() -> PackedInt32Array:
 	var cl := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(cl, pipeline)
 	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
-	if block_render:
+	if mesh_render:
+		rd.compute_list_set_push_constant(cl, _pc(8, 0), PC_SIZE)   # greedy-mesh faces (per-column)
+		rd.compute_list_dispatch(cl, _col_groups, 1, 1)
+	elif block_render:
 		rd.compute_list_set_push_constant(cl, _pc(6, 0), PC_SIZE)   # 1m blocks + voxel-tinted tops
 		rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 	else:

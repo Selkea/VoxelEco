@@ -49,6 +49,15 @@ func _ready() -> void:
 	solid_mat = StandardMaterial3D.new()
 	solid_mat.vertex_color_use_as_albedo = true
 	solid_mat.roughness = 0.95
+	# GREEDY-MESH render: terrain is drawn as oriented quads (one can cover a whole
+	# merged face), so the material is double-sided (winding varies per face dir).
+	solid_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	# diagnostic: VOX_SHADING=unshaded / pervertex to isolate PBR fragment cost
+	var sh := OS.get_environment("VOX_SHADING")
+	if sh == "unshaded":
+		solid_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	elif sh == "pervertex":
+		solid_mat.shading_mode = BaseMaterial3D.SHADING_MODE_PER_VERTEX
 	water_mat = StandardMaterial3D.new()
 	# OPAQUE water. Transparent water shimmered: the emit writes instances in a
 	# non-deterministic order each frame, and alpha blending is order-dependent,
@@ -60,26 +69,43 @@ func _ready() -> void:
 	water_mat.roughness = 0.12
 	water_mat.metallic = 0.15
 	water_mat.specular = 0.6
+	water_mat.cull_mode = BaseMaterial3D.CULL_DISABLED   # water is quads too now
 	if use_instances:
 		# cap-allocated: the emit compute pass writes these multimesh buffers
-		# directly in VRAM; only visible_instance_count changes per frame
-		solid_mm = _make_mm(solid_mat, world.solid_cap)
-		water_mm = _make_mm(water_mat, world.water_cap)
+		# directly in VRAM; only visible_instance_count changes per frame. Solid
+		# terrain uses the greedy-mesh QUAD; water stays a small overlapping cube.
+		solid_mm = _make_mm(solid_mat, world.solid_cap, true)
+		water_mm = _make_mm(water_mat, world.water_cap, true)
 	else:
 		_alloc_chunks()
 
-func _make_mm(mat: StandardMaterial3D, cap: int) -> MultiMeshInstance3D:
+func _quad_mesh() -> ArrayMesh:
+	# unit quad in the local XZ plane [0,1]^2 at y=0, normal +Y — the base the emit's
+	# write_quad orients/stretches per face. Double-sided material handles winding.
+	var v := PackedVector3Array([Vector3(0,0,0), Vector3(1,0,0), Vector3(1,0,1), Vector3(0,0,1)])
+	var n := PackedVector3Array([Vector3.UP, Vector3.UP, Vector3.UP, Vector3.UP])
+	var idx := PackedInt32Array([0, 1, 2, 0, 2, 3])
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = v
+	arr[Mesh.ARRAY_NORMAL] = n
+	arr[Mesh.ARRAY_INDEX] = idx
+	var m := ArrayMesh.new()
+	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+	return m
+
+func _make_mm(mat: StandardMaterial3D, cap: int, quad: bool) -> MultiMeshInstance3D:
 	var mmi := MultiMeshInstance3D.new()
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_colors = true
-	var box := BoxMesh.new()
-	# inflate cubes ~2% so adjacent voxels OVERLAP slightly at their shared edges,
-	# sealing the hairline gaps/coincident-edge z-fighting that show as thin seams
-	# between voxels and between Y levels. Same-material overlaps are invisible (the
-	# colours match); the cost is only a sub-pixel sliver at material boundaries.
-	box.size = Vector3.ONE * 1.02
-	mm.mesh = box
+	if quad:
+		mm.mesh = _quad_mesh()
+	else:
+		var box := BoxMesh.new()
+		# inflate water cubes ~2% so adjacent ones overlap and seal hairline seams
+		box.size = Vector3.ONE * 1.02
+		mm.mesh = box
 	mm.instance_count = cap
 	mm.visible_instance_count = 0
 	mmi.multimesh = mm

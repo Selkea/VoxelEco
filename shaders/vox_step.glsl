@@ -467,6 +467,101 @@ void write_inst(bool water, uint slot, vec3 origin, vec4 col, float scale) {
 	}
 }
 
+// GREEDY-MESH RENDER: write an oriented, stretched QUAD instance. The base mesh is
+// a unit quad in local XZ [0,1]^2 (normal +Y), so a local vertex (lx,0,lz) maps to
+// org + lx*ax + lz*az. ax/az are the two in-plane world edge vectors already scaled
+// to the quad's size; ay is the outward normal (for lighting). Material is double-
+// sided so winding doesn't matter. One quad can cover a whole merged face.
+void write_quad(bool water, uint slot, vec3 ax, vec3 ay, vec3 az, vec3 org, vec4 col) {
+	uint b = slot * 16u;
+	float t[12] = float[12](ax.x, ay.x, az.x, org.x,
+			ax.y, ay.y, az.y, org.y,
+			ax.z, ay.z, az.z, org.z);
+	for (uint k = 0u; k < 12u; k++) {
+		if (water) { water_inst[b + k] = t[k]; } else { solid_inst[b + k] = t[k]; }
+	}
+	if (water) {
+		water_inst[b+12u] = col.r; water_inst[b+13u] = col.g;
+		water_inst[b+14u] = col.b; water_inst[b+15u] = col.a;
+	} else {
+		solid_inst[b+12u] = col.r; solid_inst[b+13u] = col.g;
+		solid_inst[b+14u] = col.b; solid_inst[b+15u] = col.a;
+	}
+}
+
+// emit a 1x1 quad on face k of a voxel at local (wx, Y, wz). k: 0 +X 1 -X 2 +Y
+// 3 -Y 4 +Z 5 -Z. Stage 1a: one quad per exposed face (per-voxel, not yet merged),
+// which should render identically to the cube emit but as flat faces.
+void emit_face(bool water, uint k, float wx, float Y, float wz, vec4 col) {
+	vec3 ax, ay, az, org;
+	if (k == 0u)      { ax = vec3(0,1,0); az = vec3(0,0,1); ay = vec3( 1,0,0); org = vec3(wx+1.0, Y, wz); }
+	else if (k == 1u) { ax = vec3(0,1,0); az = vec3(0,0,1); ay = vec3(-1,0,0); org = vec3(wx, Y, wz); }
+	else if (k == 2u) { ax = vec3(1,0,0); az = vec3(0,0,1); ay = vec3(0, 1,0); org = vec3(wx, Y+1.0, wz); }
+	else if (k == 3u) { ax = vec3(1,0,0); az = vec3(0,0,1); ay = vec3(0,-1,0); org = vec3(wx, Y, wz); }
+	else if (k == 4u) { ax = vec3(1,0,0); az = vec3(0,1,0); ay = vec3(0,0, 1); org = vec3(wx, Y, wz+1.0); }
+	else              { ax = vec3(1,0,0); az = vec3(0,1,0); ay = vec3(0,0,-1); org = vec3(wx, Y, wz); }
+	if (water) { uint s = atomicAdd(n_water, 1u); if (s < cap_water) { write_quad(true, s, ax, ay, az, org, col); } }
+	else       { uint s = atomicAdd(n_solid, 1u); if (s < cap_solid) { write_quad(false, s, ax, ay, az, org, col); } }
+}
+
+// one thread per COLUMN: emit exposed voxel FACES as quads (stage 1a of greedy
+// meshing — machinery test, not yet merged). Same per-column walk + early-out as
+// do_emit; same colour, so the result should match the cube render face-for-face.
+void do_face_emit() {
+	uint id = flat_id();
+	if (id >= p.W * p.D) { return; }
+	uint x = id % p.W;
+	uint z = id / p.W;
+	if (z < p.cut_z) { return; }
+	float wx = float(world_coord(x, p.gen_ox, p.W) - p.gen_ox);
+	float wz = float(world_coord(z, p.gen_oz, p.D) - p.gen_oz);
+	uint buried = 0u;
+	uint yy = p.H;
+	while (yy > 0u) {
+		yy--;
+		uint cid = cidx(x, yy, z);
+		uint raw = cells[cid];
+		uint m = MAT(raw);
+		if (m == AIR) { buried = 0u; continue; }
+		bool is_water = m == WATER;
+		float Y = float(int(yy) + int(p.gen_oy));
+		uint nbr[6];
+		int solid_n = 0;
+		for (uint k = 0u; k < 6u; k++) {
+			int dx = k==0u?1:(k==1u?-1:0);
+			int dy = k==2u?1:(k==3u?-1:0);
+			int dz = k==4u?1:(k==5u?-1:0);
+			int nx = int(x)+dx, ny = int(yy)+dy, nz = int(z)+dz;
+			uint nm = AIR;
+			bool oob = nx<0 || nx>=int(p.W) || ny>=int(p.H) || nz<0 || nz>=int(p.D);
+			if (ny < 0) { nm = BEDROCK; }
+			else if (nz < int(p.cut_z)) { nm = AIR; }
+			else if (!oob) { nm = MAT(cells[cidx(uint(nx), uint(ny), uint(nz))]); }
+			nbr[k] = nm;
+			if (nm != AIR && nm != WATER) { solid_n += 1; }
+		}
+		vec4 col;
+		if (is_water) { col = vec4(1.0); }
+		else {
+			float jit = 1.0 + (float(pcg(cid * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
+			float ao = 1.0 - float(solid_n) * 0.05;
+			vec3 base = mat_color(m);
+			if (m == SOIL || m == SAND) {
+				float wet = clamp(float(SAT(raw)) / float(sat_cap(m)), 0.0, 1.0);
+				base = mix(base, vec3(0.09, 0.05, 0.03), wet * 0.8);
+			}
+			col = vec4(base * jit * ao, 1.0);
+		}
+		for (uint k = 0u; k < 6u; k++) {
+			uint nm = nbr[k];
+			bool open = is_water ? (nm == AIR) : (nm == AIR || nm == WATER);
+			if (open) { emit_face(is_water, k, wx, Y, wz, col); }
+		}
+		if (solid_n == 6) { buried += 1u; if (buried >= 2u) { break; } }
+		else { buried = 0u; }
+	}
+}
+
 // one thread per COLUMN: walk it top-down and emit every exposed voxel, then stop
 // once a cell is buried in solid on all six sides — in this sim nothing below such
 // a cell is ever visible (no caves; water sits on top, the subsurface is solid
@@ -842,5 +937,6 @@ void main() {
 	else if (mode == 5u) { do_block_emit(); }
 	else if (mode == 6u) { do_skin_emit(); }
 	else if (mode == 7u) { do_decay(); }
+	else if (mode == 8u) { do_face_emit(); }
 	else { do_step(); }
 }
