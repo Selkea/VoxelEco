@@ -453,67 +453,77 @@ void write_inst(bool water, uint slot, vec3 origin, vec4 col, float scale) {
 	}
 }
 
-// one thread per cell: emit an instance for every exposed voxel
+// one thread per COLUMN: walk it top-down and emit every exposed voxel, then stop
+// once a cell is buried in solid on all six sides — in this sim nothing below such
+// a cell is ever visible (no caves; water sits on top, the subsurface is solid
+// soil/stone). This skips the deep buried interior the old per-cell dispatch
+// scanned (940M threads -> W*D threads), the same trick the block shell uses, at
+// full 5 cm detail. Exposure/colour logic is unchanged.
 void do_emit() {
-	uint n = p.W * p.H * p.D;
 	uint id = flat_id();
-	if (id >= n) { return; }
-	uint raw = cells[id];
-	uint m = MAT(raw);
-	if (m == AIR) { return; }
-	uint y = id / (p.W * p.D);
-	uint rem = id % (p.W * p.D);
-	uint z = rem / p.W;
-	uint x = rem % p.W;
-	if (z < p.cut_z) { return; }   // hidden behind the cross-section plane
-	bool is_water = m == WATER;
-	// exposure test mirrors the face-cull rules: solids show against
-	// AIR/WATER, water only against AIR; OOB sides count as exposed
-	// (diorama cut faces), the underside does not
-	bool exposed = false;
-	int solid_n = 0;
-	for (uint k = 0u; k < 6u; k++) {
-		int dx = k == 0u ? 1 : (k == 1u ? -1 : 0);
-		int dy = k == 2u ? 1 : (k == 3u ? -1 : 0);
-		int dz = k == 4u ? 1 : (k == 5u ? -1 : 0);
-		int nx = int(x) + dx;
-		int ny = int(y) + dy;
-		int nz = int(z) + dz;
-		uint nm = AIR;
-		bool oob = nx < 0 || nx >= int(p.W) || ny >= int(p.H) || nz < 0 || nz >= int(p.D);
-		if (ny < 0) { nm = BEDROCK; }
-		else if (nz < int(p.cut_z)) { nm = AIR; }   // across the cut = open (reveal section)
-		else if (!oob) { nm = MAT(cells[cidx(uint(nx), uint(ny), uint(nz))]); }
-		if (nm != AIR && nm != WATER) { solid_n += 1; }
-		if (is_water ? (nm == AIR) : (nm == AIR || nm == WATER)) { exposed = true; }
+	if (id >= p.W * p.D) { return; }
+	uint x = id % p.W;
+	uint z = id / p.W;
+	if (z < p.cut_z) { return; }   // whole column hidden behind the cross-section
+	uint buried = 0u;
+	uint yy = p.H;
+	while (yy > 0u) {
+		yy--;
+		uint cid = cidx(x, yy, z);
+		uint raw = cells[cid];
+		uint m = MAT(raw);
+		if (m == AIR) { buried = 0u; continue; }
+		bool is_water = m == WATER;
+		// exposure test mirrors the face-cull rules: solids show against
+		// AIR/WATER, water only against AIR; OOB sides count as exposed
+		// (diorama cut faces), the underside does not
+		bool exposed = false;
+		int solid_n = 0;
+		for (uint k = 0u; k < 6u; k++) {
+			int dx = k == 0u ? 1 : (k == 1u ? -1 : 0);
+			int dy = k == 2u ? 1 : (k == 3u ? -1 : 0);
+			int dz = k == 4u ? 1 : (k == 5u ? -1 : 0);
+			int nx = int(x) + dx;
+			int ny = int(yy) + dy;
+			int nz = int(z) + dz;
+			uint nm = AIR;
+			bool oob = nx < 0 || nx >= int(p.W) || ny >= int(p.H) || nz < 0 || nz >= int(p.D);
+			if (ny < 0) { nm = BEDROCK; }
+			else if (nz < int(p.cut_z)) { nm = AIR; }   // across the cut = open (reveal section)
+			else if (!oob) { nm = MAT(cells[cidx(uint(nx), uint(ny), uint(nz))]); }
+			if (nm != AIR && nm != WATER) { solid_n += 1; }
+			if (is_water ? (nm == AIR) : (nm == AIR || nm == WATER)) { exposed = true; }
+		}
+		if (exposed) {
+			// FLOATING ORIGIN: emit relative to the window origin (world_coord -
+			// origin, in [0, W/D)) so 5 cm cubes are drawn near zero, not at world
+			// coords ~1e5 where float32 cracks seams; the camera is offset to match.
+			vec3 origin = vec3(float(world_coord(x, p.gen_ox, p.W) - p.gen_ox) + 0.5,
+					float(int(yy) + int(p.gen_oy)) + 0.5,
+					float(world_coord(z, p.gen_oz, p.D) - p.gen_oz) + 0.5);
+			if (is_water) {
+				uint slot = atomicAdd(n_water, 1u);
+				if (slot < cap_water) { write_inst(true, slot, origin, vec4(1.0), 1.0); }
+			} else {
+				// per-voxel tint jitter + crude AO from buried-ness
+				float jit = 1.0 + (float(pcg(cid * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
+				float ao = 1.0 - float(solid_n) * 0.05;
+				vec3 base = mat_color(m);
+				// darken dry-able ground (soil/sand) toward wet earth as it saturates
+				if (m == SOIL || m == SAND) {
+					float wet = clamp(float(SAT(raw)) / float(sat_cap(m)), 0.0, 1.0);
+					base = mix(base, vec3(0.09, 0.05, 0.03), wet * 0.8);
+				}
+				vec4 col = vec4(base * jit * ao, 1.0);
+				uint slot = atomicAdd(n_solid, 1u);
+				if (slot < cap_solid) { write_inst(false, slot, origin, col, 1.0); }
+			}
+		}
+		// buried in solid on all six sides -> everything below in this column is
+		// hidden too (heightfield terrain, no caves); stop after a couple to be safe
+		if (solid_n == 6) { buried += 1u; if (buried >= 2u) { break; } }
+		else { buried = 0u; }
 	}
-	if (!exposed) { return; }
-	// FLOATING ORIGIN: emit at the position RELATIVE to the window origin
-	// (world_coord - origin, in [0, W/D)), not the absolute world coord. Drawing
-	// 5 cm cubes at world coords ~1e5 cracks seams open (float32 view-transform
-	// precision); rendering in the small local frame keeps them tight. The camera
-	// is offset by the same origin, so the view still shows the right world region.
-	vec3 origin = vec3(float(world_coord(x, p.gen_ox, p.W) - p.gen_ox) + 0.5,
-			float(int(y) + int(p.gen_oy)) + 0.5,
-			float(world_coord(z, p.gen_oz, p.D) - p.gen_oz) + 0.5);
-	if (is_water) {
-		uint slot = atomicAdd(n_water, 1u);
-		if (slot < cap_water) { write_inst(true, slot, origin, vec4(1.0), 1.0); }
-		return;
-	}
-	// per-voxel tint jitter + crude AO from buried-ness
-	float jit = 1.0 + (float(pcg(id * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
-	float ao = 1.0 - float(solid_n) * 0.05;
-	vec3 base = mat_color(m);
-	// darken the dry-able ground (soil/sand) toward wet earth as it saturates;
-	// mud/grass already carry their own wet/vegetated tone
-	if (m == SOIL || m == SAND) {
-		float wet = clamp(float(SAT(raw)) / float(sat_cap(m)), 0.0, 1.0);
-		base = mix(base, vec3(0.09, 0.05, 0.03), wet * 0.8);
-	}
-	vec4 col = vec4(base * jit * ao, 1.0);
-	uint slot = atomicAdd(n_solid, 1u);
-	if (slot < cap_solid) { write_inst(false, slot, origin, col, 1.0); }
 }
 
 // one thread per 1 m block COLUMN (20x20 voxels): render the fine 5 cm sim as a

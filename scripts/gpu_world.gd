@@ -399,8 +399,8 @@ func dispatch_emit() -> PackedInt32Array:
 		rd.compute_list_set_push_constant(cl, _pc(6, 0), PC_SIZE)   # 1m blocks + voxel-tinted tops
 		rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 	else:
-		rd.compute_list_set_push_constant(cl, _pc(3, 0), PC_SIZE)   # per-voxel
-		rd.compute_list_dispatch(cl, _cell_groups, 1, 1)
+		rd.compute_list_set_push_constant(cl, _pc(3, 0), PC_SIZE)   # per-voxel (per-column walk)
+		rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 	rd.compute_list_end()
 	var counts := rd.buffer_get_data(inst_count_buf, 0, 8).to_int32_array()
 	return PackedInt32Array([mini(counts[0], solid_cap), mini(counts[1], water_cap)])
