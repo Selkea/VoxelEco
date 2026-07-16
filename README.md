@@ -111,7 +111,9 @@ Creative-mode free flight (no gravity / collision):
   float32 loses precision in the view transform. So the emit writes instances in a
   **local frame** (position − window origin, ~0..W) and the camera is offset by the
   same origin — the scene is drawn near zero however far you stream. A lifted near
-  plane (far:near ~7000:1, not 40000:1) and 4x MSAA finish sealing the seams.
+  plane (far:near ~7000:1, not 40000:1), 4x MSAA, and a ~2% cube inflation (so
+  neighbouring voxels overlap and seal the hairline junctions between them and
+  between Y levels — same-material overlaps are invisible) finish the job.
 - **1 m blocks with voxel-skinned faces** (default): the fine 5 cm sim is drawn
   as chunky 1 m blocks (flat 1 m tops, 1 m-aligned steps), but **every visible
   face is skinned with its real 5 cm voxels** — so cliff sides show the strata

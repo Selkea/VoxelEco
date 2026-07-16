@@ -74,7 +74,11 @@ func _make_mm(mat: StandardMaterial3D, cap: int) -> MultiMeshInstance3D:
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_colors = true
 	var box := BoxMesh.new()
-	box.size = Vector3.ONE
+	# inflate cubes ~2% so adjacent voxels OVERLAP slightly at their shared edges,
+	# sealing the hairline gaps/coincident-edge z-fighting that show as thin seams
+	# between voxels and between Y levels. Same-material overlaps are invisible (the
+	# colours match); the cost is only a sub-pixel sliver at material boundaries.
+	box.size = Vector3.ONE * 1.02
 	mm.mesh = box
 	mm.instance_count = cap
 	mm.visible_instance_count = 0

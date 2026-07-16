@@ -135,7 +135,7 @@ func _ready() -> void:
 	# up close, so coincident voxel-cube faces z-fight into thin seams. 1 unit = 1
 	# voxel (5 cm); a 0.3-voxel near plane (1.5 cm) is closer than you fly yet lifts
 	# the far:near ratio ~7x, and 4x MSAA smooths the high-contrast cube edges.
-	cam.near = 0.3
+	cam.near = float(OS.get_environment("VOX_NEAR")) if OS.get_environment("VOX_NEAR") != "" else 0.3
 	add_child(cam)
 	get_viewport().msaa_3d = Viewport.MSAA_4X
 	dist = world.W * 1.12
