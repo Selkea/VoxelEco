@@ -84,7 +84,10 @@ func build_far_mesh(gw: GpuWorld, with_sim: bool) -> void:
 	water_plane = MeshInstance3D.new()
 	water_plane.mesh = _water_mesh(gw)
 	water_plane.material_override = water_plane_mat
-	water_plane.position = Vector3(gw.W * 0.5, 0.0, gw.D * 0.5)
+	# _water_mesh verts are already in window-local coords ([-apron, W+apron])
+	# so the node sits at the ORIGIN — a centred position here shifted the
+	# whole grid half a window and left skirt mega-quads over the gap
+	water_plane.position = Vector3.ZERO
 	water_plane.custom_aabb = AABB(
 			Vector3(-WATER_R - gw.W, -10.0, -WATER_R - gw.D),
 			Vector3((WATER_R + gw.W) * 2.0, AABB_Y + 10.0, (WATER_R + gw.D) * 2.0))
