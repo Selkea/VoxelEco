@@ -1409,8 +1409,8 @@ vec3 ray_shade(int cx, int cy, int cz, vec3 n, vec3 hit) {
 	// match the PBR pipeline that lights the far mesh: bluish sky ambient +
 	// warm sun (#fff2dd), then an ACES-fit tonemap — a colourless scalar here
 	// left the window a different HUE of green than the far field
-	vec3 lit = base * (vec3(0.30, 0.34, 0.40)
-			+ vec3(0.86, 0.79, 0.65) * (ndl * sh));
+	vec3 lit = base * (vec3(0.28, 0.34, 0.50)
+			+ vec3(0.81, 0.79, 0.82) * (ndl * sh));
 	lit *= 0.98;
 	return clamp((lit * (2.51 * lit + 0.03)) / (lit * (2.43 * lit + 0.59) + 0.14),
 			0.0, 1.0);
