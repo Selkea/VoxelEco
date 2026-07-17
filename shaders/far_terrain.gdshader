@@ -163,9 +163,9 @@ void fragment() {
 				: proc;
 		float pxw = length(VERTEX) * px_angle;
 		float tint = 1.0
-				+ spek(w, 1.0, 0.05, pxw, 0u)
-				+ spek(w, 5.0, 0.035, pxw, 668265263u)
-				+ spek(w, 20.0, 0.05, pxw, 1336530526u)
+				+ spek(w, 1.0, 0.03, pxw, 0u)
+				+ spek(w, 5.0, 0.02, pxw, 668265263u)
+				+ spek(w, 20.0, 0.03, pxw, 1336530526u)
 				+ spek(w, 100.0, 0.03, pxw, 2004795789u);
 		alb *= max(tint, 0.2);
 		ROUGHNESS = 1.0;
