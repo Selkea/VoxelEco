@@ -19,3 +19,5 @@ window/size/viewport_height=720
 renderer/rendering_method="forward_plus"
 renderer/rendering_method.mobile="gl_compatibility"
 lights_and_shadows/directional_shadow/size=4096
+anti_aliasing/quality/msaa_3d=2
+anti_aliasing/quality/screen_space_aa=1
