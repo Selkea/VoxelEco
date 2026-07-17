@@ -33,6 +33,12 @@ layout(set = 0, binding = 12, std430) restrict buffer CamBuf {
 	vec4 cam_eye; vec4 cam_fwd; vec4 cam_right; vec4 cam_up; vec4 cam_sun;
 };
 layout(set = 0, binding = 13, rgba8) uniform restrict writeonly image2D out_img;
+// WORLD-MESH surface data, written by do_heights, sampled by the clipmap
+// terrain/water vertex shaders (the sim is voxels; the render is a surface):
+// terra_img rg16f: r = solid ground top (local band Y, excl), g = fluid top
+// (ground incl. standing water); tcol_img: surface albedo of the top cell.
+layout(set = 0, binding = 16, rg16f) uniform restrict writeonly image2D terra_img;
+layout(set = 0, binding = 17, rgba8) uniform restrict writeonly image2D tcol_img;
 layout(set = 0, binding = 1, std430) restrict buffer PackBuf { uint packed_out[]; };
 layout(set = 0, binding = 2, std430) restrict buffer StatsBuf { uint rained; uint evaporated; uint absorbed; };
 // Noita-style dirty tracking, one flag per 16x16-column mesh chunk: settled
@@ -1322,7 +1328,15 @@ void do_heights() {
 	uint x = id % p.W;
 	uint z = id / p.W;
 	uint y = 0u;
-	while (y < p.H && MAT(cget(cidx(x, y, z))) != AIR) { y++; }
+	uint ysolid = 0u;          // top of contiguous SOLID ground (excl. water)
+	bool wseen = false;
+	while (y < p.H) {
+		uint m = MAT(cget(cidx(x, y, z)));
+		if (m == AIR) { break; }
+		if (m == WATER && !wseen) { wseen = true; ysolid = y; }
+		y++;
+	}
+	if (!wseen) { ysolid = y; }
 	// true SKY TOP above the contiguous ground: airborne material (falling rain,
 	// avalanching grains) sits between ground and the column's top watermark.
 	// Scan down from the watermark to the first non-air cell and TIGHTEN the
@@ -1339,6 +1353,15 @@ void do_heights() {
 	uint lz = world_coord(z, p.gen_oz, p.D) - p.gen_oz;
 	// packed: ground (exclusive) in the low 16 bits, sky top (exclusive) high
 	heights[lz * p.W + lx] = y | (sky << 16);
+	// world-mesh surface data: heights + the top solid cell's colour (world-
+	// anchored jitter so streaming never reshuffles the tint)
+	uint cy = max(ysolid, 1u) - 1u;
+	uint raw = cget(cidx(x, cy, z));
+	uint m = MAT(raw);
+	if (m == AIR || m == WATER) { m = SOIL; }
+	uint vid = (lx + p.gen_ox) ^ ((lz + p.gen_oz) << 11u) ^ ((cy + p.gen_oy) << 22u);
+	imageStore(terra_img, ivec2(int(lx), int(lz)), vec4(float(ysolid), float(y), 0.0, 0.0));
+	imageStore(tcol_img, ivec2(int(lx), int(lz)), vec4(surf_color(raw, m, vid), 1.0));
 }
 
 // mode 15: per-tile max of the column heights (16x16 columns, the chunk grid)
@@ -1369,7 +1392,7 @@ vec3 ray_shade(int cx, int cy, int cz, vec3 n, vec3 hit) {
 	uint m = MAT(raw);
 	if (m == AIR) { m = SOIL; }
 	// WORLD-anchored jitter id: slot-based ids reshuffled every voxel's tint
-	// each time the toroidal window advanced — a visible "pop" as terrain
+	// each time the toroidal window advanced ï¿½ a visible "pop" as terrain
 	// entered fine rendering. World coords keep every voxel's tint forever.
 	uint vid = (uint(cx) + p.gen_ox) ^ ((uint(cz) + p.gen_oz) << 11u)
 			^ ((uint(cy) + p.gen_oy) << 22u);

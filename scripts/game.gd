@@ -130,7 +130,7 @@ func _ready() -> void:
 	if view.use_instances and world is GpuWorld and (world as GpuWorld).far_field \
 			and OS.get_environment("VOX_FARMESH") != "0":
 		(world as GpuWorld).far_tiles = false
-		view.build_far_mesh(world.seed_value, float(world.W), float(world.D))
+		view.build_far_mesh(world as GpuWorld, OS.get_environment("VOX_RENDER") == "")
 	_refresh_view(true)
 
 	var env := WorldEnvironment.new()
@@ -265,8 +265,14 @@ func _ready() -> void:
 	# instanced raster; VOX_RENDER=mesh/block/voxel starts on the raster path).
 	# Shots/tests keep the raster unless they opt in with VOX_RENDER=ray.
 	var rmode_env := OS.get_environment("VOX_RENDER")
-	if rmode_env == "ray" or (interactive and rmode_env == ""):
+	if rmode_env == "ray":
 		_set_ray(true)
+	elif rmode_env == "" and world is GpuWorld and view.use_instances:
+		# DEFAULT: unified world mesh. The sim stays voxels; the render is one
+		# displaced surface sampling the sim surface textures (see vox_view).
+		(world as GpuWorld).world_mesh = true
+		(world as GpuWorld).update_heights()
+		_refresh_view(true)
 	if "--sim" in OS.get_cmdline_user_args():
 		_run_sim_test()
 	if "--shot" in OS.get_cmdline_user_args():
@@ -456,7 +462,7 @@ func _process(dt: float) -> void:
 		view.update_far_mesh(Vector2(cam.position.x, cam.position.z),
 				Vector2(gwf.gen_origin_x, gwf.gen_origin_z), (gwf.gen_flags & 1) != 0,
 				2.0 * tan(deg_to_rad(cam.fov * 0.5)) / maxf(vph, 1.0),
-				-_sun.global_transform.basis.z)
+				float(gwf.gen_oy))
 	# ray-cast renderer: march the frame's rays from the final camera pose
 	if world is GpuWorld and (world as GpuWorld).ray_render and cam != null:
 		var gwr := world as GpuWorld
@@ -546,7 +552,7 @@ func _refresh_view(force := false) -> void:
 			if force or world.any_dirty_and_clear():
 				_lod_cam_last = Vector2(lc.x, lc.z)
 				_emit_dir = gw.cone_dir
-				if gw.ray_render:
+				if gw.ray_render or gw.world_mesh:
 					gw.update_heights()   # rays read the heightfield; refresh with the sim
 				var counts: PackedInt32Array = world.dispatch_emit()
 				if counts.size() == 2:

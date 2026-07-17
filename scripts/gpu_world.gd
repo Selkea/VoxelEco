@@ -174,6 +174,7 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	hmax_buf = rd.storage_buffer_create(zeros.size(), zeros)     # ray renderer: tile max heights
 	cam_buf = rd.storage_buffer_create(80)                       # ray renderer: camera/sun
 	_make_ray_tex()
+	_make_world_tex()
 	nbx = (W + 19) / 20
 	nby = (H + 19) / 20
 	nbz = (D + 19) / 20
@@ -358,6 +359,30 @@ func band_oy_for(wx: float, wz: float) -> int:
 	var oy := int(round(mid - float(H) * 0.5 + float(H) * 0.08))
 	return clampi(oy, 0, maxi(RELIEF - H, 0))
 
+## WORLD-MESH textures: do_heights writes per-column sim surface data here and
+## the clipmap terrain/water meshes sample them in their vertex shaders
+## (Texture2DRD) — the sim stays voxels, the render is a displaced surface.
+## terra_tex rg16f: r = solid ground top (local band Y, exclusive), g = fluid
+## top (ground incl. standing water). tcol_tex rgba8: surface albedo.
+var terra_tex: RID
+var tcol_tex: RID
+
+func _make_world_tex() -> void:
+	var fmt := RDTextureFormat.new()
+	fmt.width = W
+	fmt.height = D
+	fmt.format = RenderingDevice.DATA_FORMAT_R16G16_SFLOAT
+	fmt.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT \
+			| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	terra_tex = rd.texture_create(fmt, RDTextureView.new(), [])
+	var fmt2 := RDTextureFormat.new()
+	fmt2.width = W
+	fmt2.height = D
+	fmt2.format = RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM
+	fmt2.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT \
+			| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	tcol_tex = rd.texture_create(fmt2, RDTextureView.new(), [])
+
 ## the ray pass writes this rgba8 storage image; a Texture2DRD shows it on screen
 func _make_ray_tex() -> void:
 	if ray_tex.is_valid():
@@ -427,11 +452,12 @@ func _rebuild_uniform_set() -> void:
 		u.binding = b
 		u.add_id(bufs[b])
 		us.append(u)
-	var iu := RDUniform.new()
-	iu.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
-	iu.binding = 13
-	iu.add_id(ray_tex)
-	us.append(iu)
+	for ipair: Array in [[13, ray_tex], [16, terra_tex], [17, tcol_tex]]:
+		var iu := RDUniform.new()
+		iu.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
+		iu.binding = ipair[0]
+		iu.add_id(ipair[1])
+		us.append(iu)
 	for pair: Array in [[14, awake_list_buf], [15, topmark_buf]]:
 		var bu := RDUniform.new()
 		bu.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
@@ -471,6 +497,7 @@ const FAR_SIDES := [400, 400, 400, 250]   # sides = RING_OUTER*2/RING_TILE per r
 # ground heightfield instead of emitting window instances — draw scales with
 # screen resolution, not window size. The far field stays rasterized behind it.
 var ray_render := false
+var world_mesh := false   # unified surface-mesh renderer (no window instances/rays)
 var heights_buf: RID       # per-column contiguous ground height
 var hmax_buf: RID          # per-16x16-tile max height (ray fast path)
 var cam_buf: RID           # eye/basis/sun for the ray pass
@@ -593,7 +620,7 @@ func dispatch_emit() -> PackedInt32Array:
 	rd.compute_list_bind_compute_pipeline(cl, pipeline)
 	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
 	if mesh_render:
-		if not ray_render:
+		if not ray_render and not world_mesh:
 			rd.compute_list_set_push_constant(cl, _pc(8, 0), PC_SIZE)   # fine faces (near disc, or all if lod_r=0)
 			rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 			if lod_r > 0:
@@ -688,7 +715,7 @@ func free_gpu() -> void:
 	for r in [uniform_set, pipeline, shader, cells_buf, cells_buf2, cells_buf3, pack_buf,
 			stats_buf, dirty_buf, active_buf, step_args_buf, awake_list_buf, topmark_buf,
 			inst_count_buf, _placeholder_a, _placeholder_b,
-			heights_buf, hmax_buf, cam_buf, ray_tex]:
+			heights_buf, hmax_buf, cam_buf, ray_tex, terra_tex, tcol_tex]:
 		if r.is_valid():
 			rd.free_rid(r)
 	rd = null

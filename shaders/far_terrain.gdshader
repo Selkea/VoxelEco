@@ -1,43 +1,35 @@
-// FAR-FIELD CLIPMAP MESH: a continuous heightfield mesh replacing the old
-// instanced far tiles. The terrain surface is a pure function of world (x,z)
-// + seed, so static grid rings that ride the camera displace their vertices
-// right here in the vertex shader by evaluating the SAME worldgen noise the
-// sim uses (ported from vox_step.glsl — the constants must match it and the
-// gpu_world.gd CPU mirror exactly or the far field won't line up with the
-// streamed window). Units are VOXELS in the local render frame; Y is world-Y
-// voxels, exactly like the instanced emit.
+// UNIFIED WORLD-MESH TERRAIN: one displaced clipmap surface from the camera to
+// the 8 km horizon. Inside the resident sim window, vertices sample the SIM's
+// per-column surface textures (terra/tcol, written by do_heights every refresh
+// — erosion, settling and water levels all show up); outside, the same
+// worldgen noise the sim generates from. The two crossfade over BLEND_M just
+// inside the window edge, so there is no renderer boundary anywhere.
+// Shaded PBR: the engine's sun/sky/ACES/shadows light everything uniformly.
+// Units are VOXELS in the local render frame; Y is world-Y voxels.
 shader_type spatial;
-// UNSHADED: lit manually with the EXACT formula the ray renderer uses
-// (ray_shade in vox_step.glsl), so the window and the far field are the same
-// math at every view angle — no SSAO/Fresnel/PBR divergence to calibrate away.
-// The engine still tonemaps (ACES) + sRGB-encodes this output, mirroring the
-// ray path's own ACES fit + gamma. tone_scale absorbs the tiny residual
-// between the two pipelines (calibrated by pixel measurement).
-render_mode unshaded, cull_disabled;
+render_mode cull_disabled;
 
 uniform int seed_v = 0;                  // world seed (vox_step p.seedv)
 uniform vec2 origin = vec2(0.0);         // local->world offset (gen_origin), voxels
 uniform bool terraced = false;           // gen_flags bit0 (T toggle)
-// resident-window rect in LOCAL coords: fragments inside are discarded — the
-// window draws itself (rays or fine/LOD instances). Shrunk ~one block by the
-// caller so the mesh tucks under the window edge (no crack at the boundary).
-uniform vec2 win_min = vec2(1.0);
-uniform vec2 win_max = vec2(-1.0);       // min > max = no exclusion
-uniform float normal_step = 20.0;        // finite-difference step (voxels)
-// radians per screen pixel (2*tan(fov/2)/viewport_h), set by the game — used
-// to fade each speckle lattice as its cells go subpixel without derivatives
-uniform float px_angle = 0.0015;
-uniform vec3 sun_dir = vec3(0.0, -1.0, 0.0);   // light travel direction (cam_sun)
-uniform vec3 tone_scale = vec3(0.948, 0.940, 0.883);   // residual pipeline calibration
+uniform float px_angle = 0.0015;         // radians per screen pixel (speckle fade)
+// sim window surface data (Texture2DRD): r = solid ground top, g = fluid top,
+// both in LOCAL band Y (add gen_oy for world-Y). win_size = (W, D); x <= 0
+// disables sim sampling (pure procedural rings).
+uniform sampler2D sim_terra : filter_linear, repeat_disable;
+uniform sampler2D sim_col : filter_linear, repeat_disable;
+uniform vec2 win_size = vec2(0.0);
+uniform float gen_oy = 0.0;
+const float BLEND_M = 200.0;             // sim->proc crossfade band (10 m)
 
 const float BLOCK_VOX = 20.0;
 const float RELIEF = 5120.0;
 const float SEA_Y = RELIEF * 0.30;
 
-varying vec3 v_local;                    // local-frame position (for discard/colour)
-varying float v_water;                   // 1 = sea surface vertex
-varying float v_hraw;                    // raw ground height (voxels)
+varying vec3 v_local;                    // local-frame position (displaced)
+varying float v_water;                   // 1 = procedural sea surface
 varying vec3 v_nrm;                      // world-axis surface normal
+varying float v_simf;                    // sim-data weight at this vertex
 
 uint pcg(uint v) {
 	v = v * 747796405u + 2891336453u;
@@ -97,28 +89,48 @@ float world_height(vec2 w) {
 		u.y);
 }
 
-void vertex() {
-	vec3 lp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;   // local render frame
-	vec2 w = lp.xz + origin;                            // world voxels
-	float h = world_height(w);
-	v_hraw = h;
-	v_water = h < SEA_Y ? 1.0 : 0.0;
-	float y = max(h, SEA_Y);                            // basins fill to the sea line
-	// finite-difference normal from the same height function (sea stays flat)
-	float hx = max(world_height(w + vec2(normal_step, 0.0)), SEA_Y);
-	float hz = max(world_height(w + vec2(0.0, normal_step)), SEA_Y);
-	v_nrm = normalize(vec3(max(h, SEA_Y) - hx, normal_step, max(h, SEA_Y) - hz));
-	v_local = vec3(lp.x, y, lp.z);
-	// write displaced position in the node's LOCAL space (undo the node offset)
-	VERTEX = vec3(VERTEX.x, y - MODEL_MATRIX[3].y, VERTEX.z);
+// how strongly this local position uses SIM data (0 outside the window,
+// ramping to 1 over BLEND_M inside its edge)
+float sim_w(vec2 lp) {
+	if (win_size.x <= 0.0) { return 0.0; }
+	vec2 e = min(lp, win_size - lp);
+	return clamp(min(e.x, e.y) / BLEND_M, 0.0, 1.0);
 }
 
-// one speckle lattice level: hashed tint at a given cell scale, faded out as
-// the cells go subpixel (pxw = world voxels per pixel)
+// terrain height at a local position: sim ground inside the window,
+// procedural outside, crossfaded — plus the sea clamp on the pure-proc side
+// (window water is a separate translucent mesh over the real lakebed)
+float terrain_h(vec2 lp, float f, out float wtr) {
+	float hs = 0.0;
+	wtr = 0.0;
+	if (f > 0.0) {
+		hs = texture(sim_terra, (lp + 0.5) / win_size).r + gen_oy;
+		if (f >= 1.0) { return hs; }
+	}
+	float hp = world_height(lp + origin);
+	if (hp < SEA_Y) { wtr = 1.0 - f; hp = SEA_Y; }
+	return mix(hp, hs, f);
+}
+
+void vertex() {
+	vec3 lp3 = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec2 lp = lp3.xz;
+	float f = sim_w(lp);
+	v_simf = f;
+	float wtr;
+	float h = terrain_h(lp, f, wtr);
+	v_water = wtr;
+	float hx = terrain_h(lp + vec2(20.0, 0.0), sim_w(lp + vec2(20.0, 0.0)), wtr);
+	float hz = terrain_h(lp + vec2(0.0, 20.0), sim_w(lp + vec2(0.0, 20.0)), wtr);
+	v_nrm = normalize(vec3(h - hx, 20.0, h - hz));
+	v_local = vec3(lp.x, h, lp.y);
+	NORMAL = v_nrm;
+	VERTEX = vec3(VERTEX.x, h - MODEL_MATRIX[3].y, VERTEX.z);
+}
+
+// one speckle lattice level: hashed tint at a cell scale, fading in only once
+// the cells cover ~3 px (mirrors real per-voxel jitter averaging)
 float spek(vec2 w, float scale, float amp, float pxw, uint salt) {
-	// full only once a cell covers ~3 pixels — mirrors how real voxel jitter
-	// averages away with distance (the old earlier fade-in over-grained the
-	// mesh right at the window seam)
 	float fade = clamp((scale / max(pxw, 1e-4) - 1.0) * 0.5, 0.0, 1.0);
 	uint h = pcg(uint(int(floor(w.x / scale))) * 2654435761u
 			^ uint(int(floor(w.y / scale))) * 40503u ^ salt);
@@ -126,62 +138,27 @@ float spek(vec2 w, float scale, float amp, float pxw, uint salt) {
 }
 
 void fragment() {
-	// the resident window draws itself — open a hole for it
-	if (v_local.x > win_min.x && v_local.x < win_max.x
-			&& v_local.z > win_min.y && v_local.z < win_max.y) {
-		discard;
-	}
-	// the underside shows where the (eroded, deposited) sim terrain stands a
-	// little above this pure-gen surface at the window edge — light it like
-	// the topside instead of a black backface
-	vec3 n = normalize(v_nrm) * (FRONT_FACING ? 1.0 : -1.0);
+	NORMAL = normalize((VIEW_MATRIX * vec4(v_nrm, 0.0)).xyz) * (FRONT_FACING ? 1.0 : -1.0);
 	vec2 w = v_local.xz + origin;
 	vec3 alb;
 	if (v_water > 0.5) {
-		alb = vec3(0.024, 0.13, 0.34);   // same water base the rays shade with
+		alb = vec3(0.024, 0.13, 0.34);        // procedural far sea
+		ROUGHNESS = 0.15;
+		SPECULAR = 0.4;
 	} else {
-		// multi-scale tint speckle matching the close-up per-voxel jitter: a
-		// hash lattice per scale (1 voxel, 25 cm, 1 m, 5 m), each fading out
-		// as its cells go subpixel. Near the window edge the mesh speckles
-		// per-voxel exactly like the real terrain; far hills keep a coarser
-		// grain instead of going flat.
-		// world voxels per screen pixel from view distance (no derivatives)
+		vec3 proc = vec3(0.086, 0.210, 0.052);   // mat_color(GRASS)
+		alb = v_simf > 0.0
+				? mix(proc, texture(sim_col, (v_local.xz + 0.5) / win_size).rgb, v_simf)
+				: proc;
 		float pxw = length(VERTEX) * px_angle;
 		float tint = 1.0
-				+ spek(w, 1.0, 0.12, pxw, 0u)             // per-voxel (5 cm)
-				+ spek(w, 5.0, 0.05, pxw, 668265263u)     // 25 cm
-				+ spek(w, 20.0, 0.05, pxw, 1336530526u)   // per-block (1 m)
-				+ spek(w, 100.0, 0.03, pxw, 2004795789u); // 5 m (far hills)
-		alb = vec3(0.086, 0.210, 0.052) * max(tint, 0.2);   // mat_color(GRASS)
-		// step lines at TRUE voxel frequency — the window darkens a riser at
-		// every 5 cm level, not every metre, so slopes carry dense fine
-		// terracing right up to the seam. Width scales with slope (~1 px
-		// projected); when lines would pack tighter than ~2 px they fade out
-		// and the stair-model riser shading below carries the merged average,
-		// exactly like real risers blurring together at distance.
-		float cd = abs(v_hraw - round(v_hraw));
-		float slope = length(vec2(n.x, n.z)) / max(n.y, 0.2);
-		float bw = slope * pxw * 1.5;
-		float sep_px = 1.0 / max(slope * pxw, 1e-4);   // px between voxel levels
-		float cfade = clamp(sep_px * 0.5 - 1.0, 0.0, 1.0);
-		alb *= 1.0 - (1.0 - smoothstep(bw * 0.6, bw * 1.4, cd)) * cfade * 0.30;
+				+ spek(w, 1.0, 0.12, pxw, 0u)
+				+ spek(w, 5.0, 0.05, pxw, 668265263u)
+				+ spek(w, 20.0, 0.05, pxw, 1336530526u)
+				+ spek(w, 100.0, 0.03, pxw, 2004795789u);
+		alb *= max(tint, 0.2);
+		ROUGHNESS = 1.0;
+		SPECULAR = 0.05;
 	}
-	// STAIR-MODEL lighting, matching how the rays actually light voxel terrain:
-	// blended slopes render as stair-stepped 5 cm TOP faces (normal straight
-	// up, one constant sun term everywhere) with occasional dark RISER faces
-	// whose share of the surface grows with slope. Smooth Lambert normals here
-	// made every away-facing slope darker than the window — the visible LOD
-	// line. Same light colours as ray_shade; engine ACES+sRGB mirrors its
-	// ACES fit + gamma; tone_scale is the pixel-measured residual.
-	vec3 sdir = -normalize(sun_dir);
-	vec3 amb = vec3(0.28, 0.34, 0.50);
-	vec3 sun = vec3(0.81, 0.79, 0.82);
-	vec3 lit_top = alb * (amb + sun * max(sdir.y, 0.0));
-	vec2 hn = vec2(n.x, n.z);
-	float hl = length(hn);
-	float ndl_side = hl > 1e-4 ? max(dot(hn / hl, sdir.xz), 0.0) : 0.0;
-	vec3 lit_side = alb * (amb + sun * ndl_side);
-	float riser = clamp((1.0 - n.y) * 3.0, 0.0, 0.5);   // riser share by slope
-	vec3 lit = mix(lit_top, lit_side, riser);
-	ALBEDO = lit * 0.98 * tone_scale;
+	ALBEDO = alb;
 }

@@ -35,54 +35,102 @@ var far_rings: Array[MeshInstance3D] = []
 const FAR_RING_CELL := [20.0, 80.0, 320.0, 1280.0]
 const FAR_RING_OUTER := [4000.0, 16000.0, 64000.0, 160000.0]
 
-## build the clipmap rings once (win_w/win_d = resident window size in voxels —
-## the shader discards inside it, minus a one-block tuck margin)
-func build_far_mesh(seed_v: int, win_w: float, win_d: float) -> void:
+## WORLD-MESH: with_sim adds fine camera-following rings over the window that
+## sample the sim surface textures, plus the translucent water plane — the
+## whole world renders as ONE displaced surface (no instanced voxels, no rays).
+func build_far_mesh(gw: GpuWorld, with_sim: bool) -> void:
 	if not far_rings.is_empty():
 		return
 	far_mat = ShaderMaterial.new()
 	far_mat.shader = load("res://shaders/far_terrain.gdshader")
-	far_mat.set_shader_parameter("seed_v", seed_v)
-	# tuck 9 m under the window edge: the ray image stochastically fades out
-	# over its last 4 m (edge_fade_out), and the mesh must be behind those pixels
-	far_mat.set_shader_parameter("win_min", Vector2(FAR_TUCK, FAR_TUCK))
-	far_mat.set_shader_parameter("win_max", Vector2(win_w - FAR_TUCK, win_d - FAR_TUCK))
+	far_mat.set_shader_parameter("seed_v", gw.seed_value)
+	if with_sim:
+		var tt := Texture2DRD.new()
+		tt.texture_rd_rid = gw.terra_tex
+		var tc := Texture2DRD.new()
+		tc.texture_rd_rid = gw.tcol_tex
+		far_mat.set_shader_parameter("sim_terra", tt)
+		far_mat.set_shader_parameter("sim_col", tc)
+		far_mat.set_shader_parameter("win_size", Vector2(gw.W, gw.D))
+	var sim_hole: float = SIM_OUTER[SIM_OUTER.size() - 1] - FAR_RING_CELL[0] * 2.0
 	for r in range(FAR_RING_CELL.size()):
-		var mi := MeshInstance3D.new()
-		mi.mesh = _far_ring_mesh(r)
-		mi.material_override = far_mat
-		var outer: float = FAR_RING_OUTER[r]
-		mi.custom_aabb = AABB(Vector3(-outer, -10.0, -outer),
-				Vector3(outer * 2.0, AABB_Y + 10.0, outer * 2.0))
-		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		add_child(mi)
-		far_rings.append(mi)
+		var inner: float = (sim_hole if with_sim else 0.0) if r == 0 \
+				else FAR_RING_OUTER[r - 1] - FAR_RING_CELL[r] * 2.0
+		_add_ring(_grid_ring_mesh(FAR_RING_CELL[r], FAR_RING_OUTER[r], inner),
+				far_mat, FAR_RING_OUTER[r], far_rings)
+	if not with_sim:
+		return
+	for r in range(SIM_CELL.size()):
+		var inner: float = 0.0 if r == 0 else SIM_OUTER[r - 1] - SIM_CELL[r] * 2.0
+		_add_ring(_grid_ring_mesh(SIM_CELL[r], SIM_OUTER[r], inner),
+				far_mat, SIM_OUTER[r], sim_rings)
+	# translucent sim water plane: static over the window rect (the world
+	# streams through the window; the rect itself never moves in local coords)
+	water_plane_mat = ShaderMaterial.new()
+	water_plane_mat.shader = load("res://shaders/water_mesh.gdshader")
+	var wt := Texture2DRD.new()
+	wt.texture_rd_rid = gw.terra_tex
+	water_plane_mat.set_shader_parameter("sim_terra", wt)
+	water_plane_mat.set_shader_parameter("win_size", Vector2(gw.W, gw.D))
+	var pm := PlaneMesh.new()
+	pm.size = Vector2(gw.W, gw.D)
+	pm.subdivide_width = int(gw.W / 8.0) - 1
+	pm.subdivide_depth = int(gw.D / 8.0) - 1
+	water_plane = MeshInstance3D.new()
+	water_plane.mesh = pm
+	water_plane.material_override = water_plane_mat
+	water_plane.position = Vector3(gw.W * 0.5, 0.0, gw.D * 0.5)
+	water_plane.custom_aabb = AABB(Vector3(-gw.W * 0.5, -10.0, -gw.D * 0.5),
+			Vector3(gw.W, AABB_Y + 10.0, gw.D))
+	water_plane.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(water_plane)
+
+func _add_ring(mesh: ArrayMesh, mat: ShaderMaterial, outer: float,
+		dest: Array[MeshInstance3D]) -> void:
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	mi.material_override = mat
+	mi.custom_aabb = AABB(Vector3(-outer, -10.0, -outer),
+			Vector3(outer * 2.0, AABB_Y + 10.0, outer * 2.0))
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(mi)
+	dest.append(mi)
 
 const BLOCK_F := 20.0    # one 1 m block in voxels
-const FAR_TUCK := 180.0  # mesh tuck under the window edge (see edge_fade_out)
+# fine sim-window rings: 10 cm cells near the camera, coarsening outward until
+# the coarsest far ring takes over (its ring-0 hole matches SIM_OUTER's last)
+const SIM_CELL := [2.0, 4.0, 8.0, 16.0]
+const SIM_OUTER := [640.0, 1280.0, 2560.0, 4080.0]
+var sim_rings: Array[MeshInstance3D] = []
+var water_plane: MeshInstance3D
+var water_plane_mat: ShaderMaterial
 
 ## per-frame: snap each ring to its own absolute world grid (no swimming) and
 ## keep the shader's world offset / terraced mode in sync
 func update_far_mesh(cam_local: Vector2, origin_v: Vector2, terr: bool,
-		pxa: float = 0.0015, sun: Vector3 = Vector3.DOWN) -> void:
+		pxa: float = 0.0015, oy: float = 0.0) -> void:
 	if far_rings.is_empty():
 		return
 	far_mat.set_shader_parameter("origin", origin_v)
 	far_mat.set_shader_parameter("terraced", terr)
 	far_mat.set_shader_parameter("px_angle", pxa)
-	far_mat.set_shader_parameter("sun_dir", sun)
+	far_mat.set_shader_parameter("gen_oy", oy)
+	if water_plane_mat != null:
+		water_plane_mat.set_shader_parameter("gen_oy", oy)
 	for r in range(far_rings.size()):
 		var cell: float = FAR_RING_CELL[r]
 		var wx := floorf((cam_local.x + origin_v.x) / cell) * cell - origin_v.x
 		var wz := floorf((cam_local.y + origin_v.y) / cell) * cell - origin_v.y
 		far_rings[r].position = Vector3(wx, 0.0, wz)
+	for r in range(sim_rings.size()):
+		var cell: float = SIM_CELL[r]
+		var wx := floorf((cam_local.x + origin_v.x) / cell) * cell - origin_v.x
+		var wz := floorf((cam_local.y + origin_v.y) / cell) * cell - origin_v.y
+		sim_rings[r].position = Vector3(wx, 0.0, wz)
 
 ## flat grid ring: full (n+1)^2 vertex lattice (unreferenced verts cost nothing),
 ## indices only for cells outside the inner hole (the finer ring covers it)
-func _far_ring_mesh(r: int) -> ArrayMesh:
-	var cell: float = FAR_RING_CELL[r]
-	var outer: float = FAR_RING_OUTER[r]
-	var inner: float = 0.0 if r == 0 else float(FAR_RING_OUTER[r - 1]) - cell * 2.0
+func _grid_ring_mesh(cell: float, outer: float, inner: float) -> ArrayMesh:
 	var n := int(outer * 2.0 / cell)
 	var verts := PackedVector3Array()
 	verts.resize((n + 1) * (n + 1))
