@@ -190,13 +190,14 @@ VOX_LEVELS=6 VOX_DITHERSTR=1`.
   ~10 ms at a 102 m window, faster than the old 64 m window.
 - **Far field to 8 km**: beyond the sim window, terrain is drawn straight from
   the worldgen heightfield — a pure function of world (x,z) + seed, needing no
-  cells and no sim — as three square clip-rings of growing tile size (2 m / 8 m /
-  32 m) that follow the camera to the horizon. Tiles snap to absolute grids (no
-  swimming), skirt every edge where they're the higher side with a 1 m apron,
-  overlap one tile inward at ring boundaries and under the window edge (no
-  cracks), and colour like the gen surface — grass above the sea line, a flat
-  water plane over basins. The whole 8 km vista costs ~3-4 ms; `VOX_FAR=0`
-  disables it. What you see out there is the real terrain you can fly to — it
+  cells and no sim — as four square clip-rings of growing tile size (1 m to
+  200 m, 4 m to 800 m, 16 m to 3.2 km, 64 m to 8 km; 1 m = the worldgen's
+  native block resolution) that follow the camera to the horizon. Tiles snap
+  to absolute grids (no swimming), skirt every edge where they're the higher
+  side with a 1 m apron, overlap one tile inward at ring boundaries and under
+  the window edge (no cracks), and colour like the gen surface — grass above
+  the sea line, a flat water plane over basins. The whole 8 km vista costs
+  ~3 ms; `VOX_FAR=0` disables it. What you see out there is the real terrain you can fly to — it
   streams into the sim window as you approach.
 - **Ray-cast renderer (experimental, G / `VOX_RENDER=ray`)**: GigaVoxels-inspired
   alternative to the instanced renderer — eye rays march a per-column ground
