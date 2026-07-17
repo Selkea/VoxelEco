@@ -1431,10 +1431,16 @@ const float FAR_RAY_END = 16000.0;    // 800 m
 // far-march heightfield sample: full blended (4-tap bilinear) while treads are
 // still discernible, single nearest-block tap beyond 200 m (4x cheaper; a 1 m
 // plateau is subpixel out there)
-float far_h(vec2 w, bool sm) {
-	if (sm) { return world_height(w); }
+float far_h(vec2 w, float t) {
+	// GEOMORPH: full blended detail near, 1 m block plateaus far, crossfaded
+	// over 150-400 m so the level of detail dissolves instead of switching at
+	// a visible line (a hard swap at 150 m read as a LOD pop while flying)
 	vec2 s = vec2(float(p.seedv & 0xFFFFu), float((p.seedv >> 16) & 0xFFFFu)) * 0.618;
-	return block_height(floor(w / BLOCK_VOX), float(p.H), s);
+	if (t >= 8000.0) { return block_height(floor(w / BLOCK_VOX), float(p.H), s); }
+	if (t < 3000.0) { return world_height(w); }
+	float f = (t - 3000.0) / 5000.0;
+	return mix(world_height(w),
+			block_height(floor(w / BLOCK_VOX), float(p.H), s), f);
 }
 void far_march(vec3 o, vec3 d, float tstart, int px, int py, uint id) {
 	float wy0 = o.y + float(p.gen_oy);            // world-frame ray origin
@@ -1446,9 +1452,8 @@ void far_march(vec3 o, vec3 d, float tstart, int px, int py, uint id) {
 	for (int i = 0; i < 320; i++) {
 		float yw = wy0 + d.y * t;
 		if (t > FAR_RAY_END || (d.y >= 0.0 && yw > RELIEF)) { break; }
-		bool sm = t < 3000.0;   // smooth sampling near, block beyond
 		vec2 w = vec2(wx0 + d.x * t, wz0 + d.z * t);
-		float h = max(floor(far_h(w, sm)), SEA_Y);
+		float h = max(floor(far_h(w, t)), SEA_Y);
 		if (yw < h) {
 			// local slope from the pre-bisection bracket (rise over run)
 			float slp = hp < 0.0 ? 0.0
@@ -1457,14 +1462,14 @@ void far_march(vec3 o, vec3 d, float tstart, int px, int py, uint id) {
 			for (int b = 0; b < 6; b++) {
 				float tm = (tp + t) * 0.5;
 				vec2 wm = vec2(wx0 + d.x * tm, wz0 + d.z * tm);
-				float hm = max(floor(far_h(wm, sm)), SEA_Y);
+				float hm = max(floor(far_h(wm, tm)), SEA_Y);
 				if (wy0 + d.y * tm < hm) { t = tm; h = hm; } else { tp = tm; }
 			}
 			// far-end stochastic handoff to the mesh
 			float r = float(pcg(id * 2246822519u) & 1023u) / 1023.0;
 			if (r >= (FAR_RAY_END - t) / 2000.0) { break; }
 			vec2 wh = vec2(wx0 + d.x * t, wz0 + d.z * t);
-			bool water = far_h(wh, sm) < SEA_Y;
+			bool water = far_h(wh, t) < SEA_Y;
 			uint hsh = pcg(uint(int(floor(wh.x))) * 2654435761u
 					^ uint(int(h)) * 40503u ^ uint(int(floor(wh.y))) * 668265263u);
 			float jit = water ? 1.0 : 1.0 + (float(hsh & 255u) / 255.0 * 0.24 - 0.12);
