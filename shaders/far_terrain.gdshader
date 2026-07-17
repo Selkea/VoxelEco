@@ -146,14 +146,27 @@ void fragment() {
 		float pxw = length(VERTEX) * px_angle;
 		float tint = 1.0
 				+ spek(w, 1.0, 0.12, pxw, 0u)             // per-voxel (5 cm)
-				+ spek(w, 5.0, 0.10, pxw, 668265263u)     // 25 cm
-				+ spek(w, 20.0, 0.12, pxw, 1336530526u)   // per-block (1 m)
-				+ spek(w, 100.0, 0.07, pxw, 2004795789u); // 5 m (far hills)
+				+ spek(w, 5.0, 0.05, pxw, 668265263u)     // 25 cm
+				+ spek(w, 20.0, 0.05, pxw, 1336530526u)   // per-block (1 m)
+				+ spek(w, 100.0, 0.03, pxw, 2004795789u); // 5 m (far hills)
 		alb = vec3(0.086, 0.210, 0.052) * max(tint, 0.2);   // mat_color(GRASS)
 	}
-	// EXACTLY ray_shade's lighting: bluish sky ambient + warm sun Lambert.
-	// The engine's ACES + sRGB then mirrors the ray path's ACES fit + gamma.
-	float ndl = max(dot(n, -normalize(sun_dir)), 0.0);
-	vec3 lit = alb * (vec3(0.28, 0.34, 0.50) + vec3(0.81, 0.79, 0.82) * ndl);
+	// STAIR-MODEL lighting, matching how the rays actually light voxel terrain:
+	// blended slopes render as stair-stepped 5 cm TOP faces (normal straight
+	// up, one constant sun term everywhere) with occasional dark RISER faces
+	// whose share of the surface grows with slope. Smooth Lambert normals here
+	// made every away-facing slope darker than the window — the visible LOD
+	// line. Same light colours as ray_shade; engine ACES+sRGB mirrors its
+	// ACES fit + gamma; tone_scale is the pixel-measured residual.
+	vec3 sdir = -normalize(sun_dir);
+	vec3 amb = vec3(0.28, 0.34, 0.50);
+	vec3 sun = vec3(0.81, 0.79, 0.82);
+	vec3 lit_top = alb * (amb + sun * max(sdir.y, 0.0));
+	vec2 hn = vec2(n.x, n.z);
+	float hl = length(hn);
+	float ndl_side = hl > 1e-4 ? max(dot(hn / hl, sdir.xz), 0.0) : 0.0;
+	vec3 lit_side = alb * (amb + sun * ndl_side);
+	float riser = clamp((1.0 - n.y) * 3.0, 0.0, 0.5);   // riser share by slope
+	vec3 lit = mix(lit_top, lit_side, riser);
 	ALBEDO = lit * 0.98 * tone_scale;
 }
