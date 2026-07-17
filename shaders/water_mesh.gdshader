@@ -90,15 +90,17 @@ void fragment() {
 	if (v_wy - grd < 0.05) { discard; }
 	// deepen the blue with depth; shallows stay translucent over the bed
 	float dp = 1.0 - exp(-d * 0.10);
-	// FEATHER the edge to zero over the first ~1.5 voxels of depth. The
-	// waterline is naturally soft — shallow water is nearly transparent — so
-	// a depth-driven alpha ramp both smooths the shore (no hard voxel-snapped
-	// edge, no slivers) and erases the faint films over dry sub-sea-level
-	// hollows, which have exactly zero RAW depth even where the smoothed
-	// fluid channel bleeds a hair above ground.
-	float feather = clamp(d * (1.0 / 1.5), 0.0, 1.0);
+	// ALPHA ramps from 0 at the waterline to near-opaque within ~1.5 voxels
+	// of depth. This does double duty: it feathers the very edge (no hard
+	// voxel-snapped shoreline, no slivers, and the faint films over dry
+	// sub-sea-level hollows vanish since their RAW depth is exactly 0), AND
+	// it keeps the lake reading as SOLID water. The old fixed 0.55 alpha
+	// floor left the whole shallow shelf half-transparent, so over the brown
+	// mud bed — meters wide on a gentle shelf — it smeared into a milky,
+	// sky-reflecting band up close. A quick ramp leaves only a thin
+	// translucent rim at the shore.
 	ALBEDO = mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34), dp);
-	ALPHA = clamp(0.55 + dp * 0.45, 0.0, 0.97) * feather;
+	ALPHA = clamp(d * (1.0 / 1.5), 0.0, 0.95);
 	ROUGHNESS = mix(0.08, 0.15, dp);
 	SPECULAR = mix(0.55, 0.4, dp);
 }
