@@ -1416,18 +1416,73 @@ vec3 ray_shade(int cx, int cy, int cz, vec3 n, vec3 hit) {
 			0.0, 1.0);
 }
 
-// stochastic cross-fade at the window edge: within EDGE_FADE voxels of the
-// window rect boundary, hand a growing share of pixels to the far mesh behind
-// the ray image (alpha-0 miss), so the two renderers interleave per pixel
-// instead of meeting at a visible line. The mesh tucks 9 m under the window
-// edge, so there is always geometry behind the faded pixels.
-bool edge_fade_out(int cx, int cz, uint id) {
-	const float EDGE_FADE = 80.0;   // 4 m band
-	float ed = min(min(float(cx), float(int(p.W) - 1 - cx)),
-			min(float(cz), float(int(p.D) - 1 - cz)));
-	if (ed >= EDGE_FADE) { return false; }
-	float r = float(pcg(id * 2246822519u) & 1023u) / 1023.0;
-	return r >= ed / EDGE_FADE;
+// UNIFIED FAR FIELD: when a ray leaves the resident window, keep marching the
+// PROCEDURAL worldgen heightfield (world_height, floored to whole voxels so
+// real 5 cm steps appear) out to FAR_RAY_END. Same renderer, same steps, same
+// per-voxel jitter and lighting as the window — the window edge stops being a
+// renderer seam at all. Step size grows with distance (detail is subpixel out
+// there anyway); past FAR_RAY_END a stochastic band hands off to the far mesh,
+// where everything is far below pixel size.
+const float FAR_RAY_END = 16000.0;    // 800 m
+// far-march heightfield sample: full blended (4-tap bilinear) while treads are
+// still discernible, single nearest-block tap beyond 200 m (4x cheaper; a 1 m
+// plateau is subpixel out there)
+float far_h(vec2 w, bool sm) {
+	if (sm) { return world_height(w); }
+	vec2 s = vec2(float(p.seedv & 0xFFFFu), float((p.seedv >> 16) & 0xFFFFu)) * 0.618;
+	return block_height(floor(w / BLOCK_VOX), float(p.H), s);
+}
+void far_march(vec3 o, vec3 d, float tstart, int px, int py, uint id) {
+	float wy0 = o.y + float(p.gen_oy);            // world-frame ray origin
+	float wx0 = o.x + float(p.gen_ox);
+	float wz0 = o.z + float(p.gen_oz);
+	float t = max(tstart, 0.0) + 0.5;
+	float tp = t;
+	float hp = -1.0;
+	for (int i = 0; i < 320; i++) {
+		float yw = wy0 + d.y * t;
+		if (t > FAR_RAY_END || (d.y >= 0.0 && yw > RELIEF)) { break; }
+		bool sm = t < 4000.0;   // smooth sampling near, block beyond
+		vec2 w = vec2(wx0 + d.x * t, wz0 + d.z * t);
+		float h = max(floor(far_h(w, sm)), SEA_Y);
+		if (yw < h) {
+			// the bracket [tp, t] crosses the surface: bisect to the crossing
+			for (int b = 0; b < 6; b++) {
+				float tm = (tp + t) * 0.5;
+				vec2 wm = vec2(wx0 + d.x * tm, wz0 + d.z * tm);
+				float hm = max(floor(far_h(wm, sm)), SEA_Y);
+				if (wy0 + d.y * tm < hm) { t = tm; h = hm; } else { tp = tm; }
+			}
+			// far-end stochastic handoff to the mesh
+			float r = float(pcg(id * 2246822519u) & 1023u) / 1023.0;
+			if (r >= (FAR_RAY_END - t) / 2000.0) { break; }
+			vec2 wh = vec2(wx0 + d.x * t, wz0 + d.z * t);
+			bool water = far_h(wh, sm) < SEA_Y;
+			uint hsh = pcg(uint(int(floor(wh.x))) * 2654435761u
+					^ uint(int(h)) * 40503u ^ uint(int(floor(wh.y))) * 668265263u);
+			float jit = water ? 1.0 : 1.0 + (float(hsh & 255u) / 255.0 * 0.24 - 0.12);
+			vec3 base = (water ? vec3(0.024, 0.13, 0.34)
+					: vec3(0.086, 0.210, 0.052)) * jit;
+			// stair lighting: a tread (top face) unless the crossing jumped
+			// more than a voxel — then it's a riser wall, horizontal normal
+			vec3 sdir = -normalize(cam_sun.xyz);
+			float ndl = max(sdir.y, 0.0);
+			if (!water && hp >= 0.0 && h - hp > (sm ? 1.5 : 21.0)) {
+				vec2 hn = normalize(vec2(-d.x, -d.z));
+				ndl = max(hn.x * sdir.x + hn.y * sdir.z, 0.0);
+			}
+			vec3 lit = base * (vec3(0.28, 0.34, 0.50) + vec3(0.81, 0.79, 0.82) * ndl);
+			lit *= 0.98;
+			vec3 c = clamp((lit * (2.51 * lit + 0.03))
+					/ (lit * (2.43 * lit + 0.59) + 0.14), 0.0, 1.0);
+			imageStore(out_img, ivec2(px, py), vec4(pow(c, vec3(1.0 / 2.2)), 1.0));
+			return;
+		}
+		hp = h;
+		tp = t;
+		t += max(4.0, t * 0.025);
+	}
+	imageStore(out_img, ivec2(px, py), vec4(0.0));   // sky / far mesh beyond
 }
 
 // mode 16: one thread per pixel — march the ray through the heightfield.
@@ -1459,7 +1514,7 @@ void do_raycast() {
 		float ta = -o.z / d.z, tb = (D - o.z) / d.z;
 		t0 = max(t0, min(ta, tb)); t1 = min(t1, max(ta, tb));
 	}
-	if (t1 <= t0) { imageStore(out_img, ivec2(px, py), vec4(0.0)); return; }
+	if (t1 <= t0) { far_march(o, d, 0.0, px, py, id); return; }   // over the band: far hills
 	float t = t0 + 1e-4;
 	// column DDA state
 	int cx = clamp(int(floor(o.x + d.x * t)), 0, int(p.W) - 1);
@@ -1507,7 +1562,6 @@ void do_raycast() {
 		if (y0 < h) {
 			// entered the column below its top: SIDE face hit at t (camera-in-
 			// ground start shades as a top so the screen never goes garbage)
-			if (edge_fade_out(cx, cz, id)) { imageStore(out_img, ivec2(px, py), vec4(0.0)); return; }
 			int cy = clamp(int(floor(y0)), 0, int(p.H) - 1);
 			vec3 n = axis == 0 ? vec3(float(-sx), 0.0, 0.0)
 					: (axis == 2 ? vec3(0.0, 0.0, float(-sz)) : vec3(0.0, 1.0, 0.0));
@@ -1529,8 +1583,7 @@ void do_raycast() {
 			for (int i = 0; i < steps; i++) {
 				int cy = ya + i * ystep;
 				if (MAT(cget(cidx(bx, uint(cy), bz))) != AIR) {
-					if (edge_fade_out(cx, cz, id)) { imageStore(out_img, ivec2(px, py), vec4(0.0)); return; }
-					vec3 n = axis == 0 ? vec3(float(-sx), 0.0, 0.0)
+							vec3 n = axis == 0 ? vec3(float(-sx), 0.0, 0.0)
 							: (axis == 2 ? vec3(0.0, 0.0, float(-sz)) : vec3(0.0, 1.0, 0.0));
 					vec3 c = ray_shade(cx, cy, cz, n, o + d * (t + tNext) * 0.5);
 					imageStore(out_img, ivec2(px, py), vec4(pow(c, vec3(1.0 / 2.2)), 1.0));
@@ -1540,7 +1593,6 @@ void do_raycast() {
 		}
 		if (d.y < 0.0 && yN < h) {
 			// crosses the top plane inside this column: TOP face hit
-			if (edge_fade_out(cx, cz, id)) { imageStore(out_img, ivec2(px, py), vec4(0.0)); return; }
 			int cy = clamp(int(h) - 1, 0, int(p.H) - 1);
 			float tt = (h - o.y) / d.y;
 			vec3 c = ray_shade(cx, cy, cz, vec3(0.0, 1.0, 0.0), o + d * tt);
@@ -1552,7 +1604,7 @@ void do_raycast() {
 		else           { t = tmz; cz += sz; tmz += dtz; axis = 2; }
 		if (cx < 0 || cx >= int(p.W) || cz < 0 || cz >= int(p.D)) { break; }
 	}
-	imageStore(out_img, ivec2(px, py), vec4(0.0));   // window exit: sky / far field shows
+	far_march(o, d, max(t, t0), px, py, id);   // window exit: continue procedurally
 }
 
 void main() {
