@@ -46,7 +46,7 @@ func build_far_mesh(gw: GpuWorld, with_sim: bool) -> void:
 	far_mat.set_shader_parameter("seed_v", gw.seed_value)
 	if with_sim:
 		var tt := Texture2DRD.new()
-		tt.texture_rd_rid = gw.terra_tex
+		tt.texture_rd_rid = gw.terra_s_tex   # smoothed heights (mode 19)
 		var tc := Texture2DRD.new()
 		tc.texture_rd_rid = gw.tcol_tex
 		far_mat.set_shader_parameter("sim_terra", tt)
@@ -69,7 +69,7 @@ func build_far_mesh(gw: GpuWorld, with_sim: bool) -> void:
 	water_plane_mat = ShaderMaterial.new()
 	water_plane_mat.shader = load("res://shaders/water_mesh.gdshader")
 	var wt := Texture2DRD.new()
-	wt.texture_rd_rid = gw.terra_tex
+	wt.texture_rd_rid = gw.terra_s_tex   # smoothed heights (mode 19)
 	water_plane_mat.set_shader_parameter("sim_terra", wt)
 	water_plane_mat.set_shader_parameter("win_size", Vector2(gw.W, gw.D))
 	var pm := PlaneMesh.new()

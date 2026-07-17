@@ -365,6 +365,7 @@ func band_oy_for(wx: float, wz: float) -> int:
 ## terra_tex rg16f: r = solid ground top (local band Y, exclusive), g = fluid
 ## top (ground incl. standing water). tcol_tex rgba8: surface albedo.
 var terra_tex: RID
+var terra_s_tex: RID     # bilaterally smoothed copy — what the meshes sample
 var tcol_tex: RID
 
 func _make_world_tex() -> void:
@@ -375,6 +376,7 @@ func _make_world_tex() -> void:
 	fmt.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT \
 			| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
 	terra_tex = rd.texture_create(fmt, RDTextureView.new(), [])
+	terra_s_tex = rd.texture_create(fmt, RDTextureView.new(), [])
 	var fmt2 := RDTextureFormat.new()
 	fmt2.width = W
 	fmt2.height = D
@@ -416,6 +418,8 @@ func update_heights() -> void:
 	rd.compute_list_add_barrier(cl)
 	rd.compute_list_set_push_constant(cl, _pc(15, 0), PC_SIZE)   # tile max
 	rd.compute_list_dispatch(cl, _tile_groups, 1, 1)
+	rd.compute_list_set_push_constant(cl, _pc(19, 0), PC_SIZE)   # smooth surface
+	rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 	rd.compute_list_end()
 
 ## march eye rays into ray_tex. Vectors are in the LOCAL render frame; fov terms
@@ -452,7 +456,7 @@ func _rebuild_uniform_set() -> void:
 		u.binding = b
 		u.add_id(bufs[b])
 		us.append(u)
-	for ipair: Array in [[13, ray_tex], [16, terra_tex], [17, tcol_tex]]:
+	for ipair: Array in [[13, ray_tex], [16, terra_tex], [17, tcol_tex], [18, terra_s_tex]]:
 		var iu := RDUniform.new()
 		iu.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
 		iu.binding = ipair[0]
@@ -715,7 +719,7 @@ func free_gpu() -> void:
 	for r in [uniform_set, pipeline, shader, cells_buf, cells_buf2, cells_buf3, pack_buf,
 			stats_buf, dirty_buf, active_buf, step_args_buf, awake_list_buf, topmark_buf,
 			inst_count_buf, _placeholder_a, _placeholder_b,
-			heights_buf, hmax_buf, cam_buf, ray_tex, terra_tex, tcol_tex]:
+			heights_buf, hmax_buf, cam_buf, ray_tex, terra_tex, terra_s_tex, tcol_tex]:
 		if r.is_valid():
 			rd.free_rid(r)
 	rd = null
