@@ -20,7 +20,6 @@ uniform sampler2D sim_terra : filter_linear, repeat_disable;
 uniform sampler2D sim_col : filter_linear, repeat_disable;
 uniform vec2 win_size = vec2(0.0);
 uniform float gen_oy = 0.0;
-const float BLEND_M = 200.0;             // sim->proc crossfade band (10 m)
 
 #include "res://shaders/worldgen.gdshaderinc"
 #include "res://shaders/sim_surface.gdshaderinc"
