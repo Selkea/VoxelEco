@@ -116,7 +116,10 @@ void vertex() {
 // one speckle lattice level: hashed tint at a given cell scale, faded out as
 // the cells go subpixel (pxw = world voxels per pixel)
 float spek(vec2 w, float scale, float amp, float pxw, uint salt) {
-	float fade = clamp(scale / max(pxw, 1e-4) - 0.5, 0.0, 1.0);
+	// full only once a cell covers ~3 pixels — mirrors how real voxel jitter
+	// averages away with distance (the old earlier fade-in over-grained the
+	// mesh right at the window seam)
+	float fade = clamp((scale / max(pxw, 1e-4) - 1.0) * 0.5, 0.0, 1.0);
 	uint h = pcg(uint(int(floor(w.x / scale))) * 2654435761u
 			^ uint(int(floor(w.y / scale))) * 40503u ^ salt);
 	return (float(h & 255u) / 255.0 - 0.5) * 2.0 * amp * fade;
@@ -150,6 +153,14 @@ void fragment() {
 				+ spek(w, 20.0, 0.05, pxw, 1336530526u)   // per-block (1 m)
 				+ spek(w, 100.0, 0.03, pxw, 2004795789u); // 5 m (far hills)
 		alb = vec3(0.086, 0.210, 0.052) * max(tint, 0.2);   // mat_color(GRASS)
+		// 1 m contour lines like the window's terrace-step shadows: darken a
+		// ~1-voxel band at each whole-metre height (density tracks slope for
+		// free — flat ground crosses metre levels rarely), fading as the band
+		// goes subpixel. This carries the window's signature texture across
+		// the renderer seam.
+		float cd = abs(v_hraw / 20.0 - round(v_hraw / 20.0)) * 20.0;
+		float cfade = clamp(2.0 / max(pxw, 1e-4) - 0.2, 0.0, 1.0);
+		alb *= 1.0 - (1.0 - smoothstep(0.5, 1.2, cd)) * cfade * 0.35;
 	}
 	// STAIR-MODEL lighting, matching how the rays actually light voxel terrain:
 	// blended slopes render as stair-stepped 5 cm TOP faces (normal straight

@@ -1416,6 +1416,20 @@ vec3 ray_shade(int cx, int cy, int cz, vec3 n, vec3 hit) {
 			0.0, 1.0);
 }
 
+// stochastic cross-fade at the window edge: within EDGE_FADE voxels of the
+// window rect boundary, hand a growing share of pixels to the far mesh behind
+// the ray image (alpha-0 miss), so the two renderers interleave per pixel
+// instead of meeting at a visible line. The mesh tucks 9 m under the window
+// edge, so there is always geometry behind the faded pixels.
+bool edge_fade_out(int cx, int cz, uint id) {
+	const float EDGE_FADE = 80.0;   // 4 m band
+	float ed = min(min(float(cx), float(int(p.W) - 1 - cx)),
+			min(float(cz), float(int(p.D) - 1 - cz)));
+	if (ed >= EDGE_FADE) { return false; }
+	float r = float(pcg(id * 2246822519u) & 1023u) / 1023.0;
+	return r >= ed / EDGE_FADE;
+}
+
 // mode 16: one thread per pixel — march the ray through the heightfield.
 // Two-level DDA: step 5 cm columns, but on entering a 16-column tile whose max
 // height stays below the ray, jump straight to the tile's exit. On a hit, shade
@@ -1493,6 +1507,7 @@ void do_raycast() {
 		if (y0 < h) {
 			// entered the column below its top: SIDE face hit at t (camera-in-
 			// ground start shades as a top so the screen never goes garbage)
+			if (edge_fade_out(cx, cz, id)) { imageStore(out_img, ivec2(px, py), vec4(0.0)); return; }
 			int cy = clamp(int(floor(y0)), 0, int(p.H) - 1);
 			vec3 n = axis == 0 ? vec3(float(-sx), 0.0, 0.0)
 					: (axis == 2 ? vec3(0.0, 0.0, float(-sz)) : vec3(0.0, 1.0, 0.0));
@@ -1514,6 +1529,7 @@ void do_raycast() {
 			for (int i = 0; i < steps; i++) {
 				int cy = ya + i * ystep;
 				if (MAT(cget(cidx(bx, uint(cy), bz))) != AIR) {
+					if (edge_fade_out(cx, cz, id)) { imageStore(out_img, ivec2(px, py), vec4(0.0)); return; }
 					vec3 n = axis == 0 ? vec3(float(-sx), 0.0, 0.0)
 							: (axis == 2 ? vec3(0.0, 0.0, float(-sz)) : vec3(0.0, 1.0, 0.0));
 					vec3 c = ray_shade(cx, cy, cz, n, o + d * (t + tNext) * 0.5);
@@ -1524,6 +1540,7 @@ void do_raycast() {
 		}
 		if (d.y < 0.0 && yN < h) {
 			// crosses the top plane inside this column: TOP face hit
+			if (edge_fade_out(cx, cz, id)) { imageStore(out_img, ivec2(px, py), vec4(0.0)); return; }
 			int cy = clamp(int(h) - 1, 0, int(p.H) - 1);
 			float tt = (h - o.y) / d.y;
 			vec3 c = ray_shade(cx, cy, cz, vec3(0.0, 1.0, 0.0), o + d * tt);

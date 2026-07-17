@@ -43,8 +43,10 @@ func build_far_mesh(seed_v: int, win_w: float, win_d: float) -> void:
 	far_mat = ShaderMaterial.new()
 	far_mat.shader = load("res://shaders/far_terrain.gdshader")
 	far_mat.set_shader_parameter("seed_v", seed_v)
-	far_mat.set_shader_parameter("win_min", Vector2(BLOCK_F, BLOCK_F))
-	far_mat.set_shader_parameter("win_max", Vector2(win_w - BLOCK_F, win_d - BLOCK_F))
+	# tuck 9 m under the window edge: the ray image stochastically fades out
+	# over its last 4 m (edge_fade_out), and the mesh must be behind those pixels
+	far_mat.set_shader_parameter("win_min", Vector2(FAR_TUCK, FAR_TUCK))
+	far_mat.set_shader_parameter("win_max", Vector2(win_w - FAR_TUCK, win_d - FAR_TUCK))
 	for r in range(FAR_RING_CELL.size()):
 		var mi := MeshInstance3D.new()
 		mi.mesh = _far_ring_mesh(r)
@@ -56,7 +58,8 @@ func build_far_mesh(seed_v: int, win_w: float, win_d: float) -> void:
 		add_child(mi)
 		far_rings.append(mi)
 
-const BLOCK_F := 20.0   # one 1 m block in voxels (window tuck margin)
+const BLOCK_F := 20.0    # one 1 m block in voxels
+const FAR_TUCK := 180.0  # mesh tuck under the window edge (see edge_fade_out)
 
 ## per-frame: snap each ring to its own absolute world grid (no swimming) and
 ## keep the shader's world offset / terraced mode in sync
