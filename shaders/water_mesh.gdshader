@@ -78,24 +78,27 @@ void fragment() {
 		grd = mix(wh, grd, f);
 		d = mix(d, v_wy - wh, v_pw);
 	}
-	// WET means BOTH: (1) the sheet floats above the DRAWN ground — below it
-	// the terrain occludes it anyway, and where the coarse sheet merely
-	// chords across a concave dry hollow it must not count; and (2) inside
-	// the window, where the sheet hugs the sim surface, the sim actually
-	// holds water in this column or its smoothed neighbourhood (the
-	// neighbourhood term seals the bank: the smoothed ground dips below lake
-	// level slightly inland of the raw waterline). Testing against the drawn
-	// ground — not raw sim ground, not clamped edge texels — is what stops
-	// clipping: over the apron the clamped samples describe the window
-	// EDGE's columns, so a wet edge used to keep the sheet alive straight
-	// through any hill the terrain draws there.
-	float wet = max(draw, hs.g - hs.r);
-	bool dry = v_wy - grd < 0.05 || (v_pw <= 0.0 && wet < 0.25);
-	if (dry) { discard; }
+	// WET/DRY is ONE smooth test: keep the sheet only where its surface sits
+	// above the DRAWN ground. Both sides are B-spline-smoothed (v_wy from the
+	// smoothed fluid channel, grd the exact ground far_terrain rasterizes), so
+	// the waterline is a continuous curve — testing raw/quantized depth here
+	// instead snapped the shoreline to voxel columns and shed blocky slivers
+	// across shallow shelves. In dry columns the fluid channel equals the
+	// ground channel, so v_wy hugs (just under) the terrain and discards
+	// cleanly — no chording across dry hollows, no film over land. Raw depth
+	// stays for TINT only, where quantization is invisible.
+	if (v_wy - grd < 0.05) { discard; }
 	// deepen the blue with depth; shallows stay translucent over the bed
 	float dp = 1.0 - exp(-d * 0.10);
+	// FEATHER the edge to zero over the first ~1.5 voxels of depth. The
+	// waterline is naturally soft — shallow water is nearly transparent — so
+	// a depth-driven alpha ramp both smooths the shore (no hard voxel-snapped
+	// edge, no slivers) and erases the faint films over dry sub-sea-level
+	// hollows, which have exactly zero RAW depth even where the smoothed
+	// fluid channel bleeds a hair above ground.
+	float feather = clamp(d * (1.0 / 1.5), 0.0, 1.0);
 	ALBEDO = mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34), dp);
-	ALPHA = clamp(0.55 + dp * 0.45, 0.0, 0.97);
+	ALPHA = clamp(0.55 + dp * 0.45, 0.0, 0.97) * feather;
 	ROUGHNESS = mix(0.08, 0.15, dp);
 	SPECULAR = mix(0.55, 0.4, dp);
 }
