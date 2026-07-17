@@ -481,13 +481,17 @@ func _process(dt: float) -> void:
 		var sim_s := int(world.tick_count / TICK_RATE)
 		var genmode := "terraced" if (world is GpuWorld and (world as GpuWorld).gen_flags & 1) else "blended"
 		var rmode := "blocks" if (world is GpuWorld and (world as GpuWorld).block_render) else "voxels"
-		DisplayServer.window_set_title("VoxelEco — %s | %s | %s | %s | sim %02d:%02d:%02d | %s | rain %d mm/h | %d fps" % [
+		# pos + look are WORLD voxel coords / degrees — paste straight into the
+		# FPSTEST player-exact envs (VOX_PX/PY/PZ/YAW/PITCH) to reproduce a shot
+		DisplayServer.window_set_title("VoxelEco — %s | %s | %s | %s | sim %02d:%02d:%02d | %s | rain %d mm/h | %d fps | pos %d %d %d | yaw %d pitch %d" % [
 			"GPU" if world.gpu_ok else "CPU",
 			rmode, genmode, LOOK_NAMES[_look],
 			sim_s / 3600, (sim_s / 60) % 60, sim_s % 60,
 			"paused" if speed_mult == 0 else str(speed_mult) + "x",
 			int(world.rain_mm_hr),
-			int(Engine.get_frames_per_second())])
+			int(Engine.get_frames_per_second()),
+			int(round(fly_pos.x)), int(round(fly_pos.y)), int(round(fly_pos.z)),
+			int(round(rad_to_deg(fly_yaw))), int(round(rad_to_deg(fly_pitch)))])
 
 ## toggle the ray-cast renderer (G): rays draw the window terrain into an image
 ## overlay; the instanced emit switches to far-field-only behind it
@@ -606,6 +610,15 @@ func _take_screenshot() -> void:
 		# specific feature (e.g. a lake shore) instead of the default site
 		var box := int(OS.get_environment("VOX_BASEOX").to_float())
 		var boz := int(OS.get_environment("VOX_BASEOZ").to_float())
+		# player-exact repro: paste the title-bar coords to stand exactly where
+		# the interactive camera was. VOX_PX/PY/PZ = world voxel eye position;
+		# the window recenters on it, VOX_YAW/VOX_PITCH (degrees) set the look.
+		var player := OS.get_environment("VOX_PX") != ""
+		var pwx := OS.get_environment("VOX_PX").to_float()
+		var pwz := OS.get_environment("VOX_PZ").to_float()
+		if player:
+			box = int(round(pwx)) - base - int(world.W * 0.5)
+			boz = int(round(pwz)) - base - int(world.D * 0.5)
 		var cx := base + box + world.W * 0.5
 		var cz := base + boz + world.D * 0.5
 		if OS.get_environment("VOX_FINDSEA") != "":
@@ -621,8 +634,9 @@ func _take_screenshot() -> void:
 				print("FINDSEA z%+06d %s" % [dz2, row])
 		# camera-only offsets (voxels) from the window centre: aim test shots
 		# at specific features (e.g. a lake crossing the window edge)
-		cx += OS.get_environment("VOX_CAMOX").to_float()
-		cz += OS.get_environment("VOX_CAMOZ").to_float()
+		if not player:
+			cx += OS.get_environment("VOX_CAMOX").to_float()
+			cz += OS.get_environment("VOX_CAMOZ").to_float()
 		var surf := gw.surface_world_y(cx, cz)
 		gw.gen_oy = gw.band_oy_for(base + box + world.W * 0.5, base + boz + world.D * 0.5)
 		gw.regen(base + box, base + boz)
@@ -633,7 +647,12 @@ func _take_screenshot() -> void:
 		world.run(40)
 		var ro := _render_off()
 		var vy := OS.get_environment("VOX_CAMY").to_float()
-		if vy > 0.0 and OS.get_environment("VOX_CAMDOWN") != "":
+		if player:
+			# stand exactly at the interactive eye, same yaw/pitch as the title bar
+			cam.position = Vector3(pwx, OS.get_environment("VOX_PY").to_float(), pwz) - ro
+			cam.basis = Basis(Vector3.UP, deg_to_rad(OS.get_environment("VOX_YAW").to_float())) \
+					* Basis(Vector3.RIGHT, deg_to_rad(OS.get_environment("VOX_PITCH").to_float()))
+		elif vy > 0.0 and OS.get_environment("VOX_CAMDOWN") != "":
 			# nadir check: straight down from altitude (surface texture/tint QA)
 			cam.position = Vector3(cx, surf + vy, cz) - ro
 			cam.look_at(Vector3(cx, surf, cz) - ro, Vector3(0, 0, 1))
