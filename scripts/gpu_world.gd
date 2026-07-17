@@ -374,7 +374,8 @@ func _make_world_tex() -> void:
 	fmt.height = D
 	fmt.format = RenderingDevice.DATA_FORMAT_R16G16_SFLOAT
 	fmt.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT \
-			| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+			| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT \
+			| RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
 	terra_tex = rd.texture_create(fmt, RDTextureView.new(), [])
 	terra_s_tex = rd.texture_create(fmt, RDTextureView.new(), [])
 	var fmt2 := RDTextureFormat.new()

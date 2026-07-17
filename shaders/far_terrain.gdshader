@@ -99,19 +99,42 @@ float sim_w(vec2 lp) {
 	return clamp(min(e.x, e.y) / BLEND_M, 0.0, 1.0);
 }
 
+// beyond-window zone (voxels) where the translucent water plane's APRON
+// carries the water surface. 48 vox SHORTER than vox_view WATER_APRON: the
+// opaque sea starts under the apron's (slightly sunk) rim, so the handoff
+// overlaps instead of abutting — no hairline cracks along the rect.
+const float APRON_M = 464.0;
+
 // terrain height at a local position: sim ground inside the window,
-// procedural outside, crossfaded — plus the sea clamp on the pure-proc side
-// (window water is a separate translucent mesh over the real lakebed)
+// procedural outside, crossfaded. INSIDE the window all water is drawn by
+// the translucent plane, so the band blends bed-to-bed (clamping the proc
+// side to sea level rendered the band as a wedge ramp across lakes). In the
+// APRON just outside a WET window edge the plane still carries the water
+// surface, so terrain stays bed there too — the hard bed->sea handoff
+// happens at the apron's end, where both water surfaces meet at SEA_Y and
+// the submerged step is invisible. Dry edges keep the plain SEA_Y sea.
 float terrain_h(vec2 lp, float f, out float wtr) {
-	float hs = 0.0;
 	wtr = 0.0;
 	if (f > 0.0) {
-		hs = sim_tex_smooth(sim_terra, lp, win_size).r + gen_oy;
+		float hs = sim_tex_smooth(sim_terra, lp, win_size).r + gen_oy;
 		if (f >= 1.0) { return hs; }
+		return mix(world_height(lp + origin), hs, f);
 	}
 	float hp = world_height(lp + origin);
-	if (hp < SEA_Y) { wtr = 1.0 - f; hp = SEA_Y; }
-	return mix(hp, hs, f);
+	if (hp < SEA_Y) {
+		if (win_size.x > 0.0) {
+			vec2 e = min(lp, win_size - lp);
+			float dout = -min(e.x, e.y);          // voxels beyond the window
+			if (dout < APRON_M) {
+				vec2 srg = sim_tex_smooth(sim_terra,
+						clamp(lp, vec2(0.5), win_size - 0.5), win_size).rg;
+				if (srg.g - srg.r > 0.6) { return hp; }   // bed; plane covers
+			}
+		}
+		wtr = 1.0;
+		return SEA_Y;
+	}
+	return hp;
 }
 
 void vertex() {
