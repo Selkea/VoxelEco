@@ -1227,8 +1227,11 @@ void do_decay() {
 // south neighbours (west/north edges are covered by THOSE tiles' skirts).
 // Basins below the sea line render as a flat water plane at SEA_Y, like the gen.
 const float FAR_END = 160000.0;                              // 8 km
-const float RING_TILE[3]  = float[3](40.0, 160.0, 640.0);    // 2 m / 8 m / 32 m
-const float RING_OUTER[3] = float[3](8000.0, 32000.0, FAR_END);
+// four rings, each finer but shorter than the old three (2m/8m/32m): 1 m tiles
+// (the worldgen's native block resolution) where the eye can tell, out to the
+// same 8 km, at nearly the same total tile count.
+const float RING_TILE[4]  = float[4](20.0, 80.0, 320.0, 1280.0);   // 1/4/16/64 m
+const float RING_OUTER[4] = float[4](4000.0, 16000.0, 64000.0, FAR_END);
 
 void do_far_emit() {
 	uint ring = p.offset;               // reused push field: ring index 0..2

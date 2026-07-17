@@ -465,7 +465,7 @@ var lod_r := 0
 # in 3 clip-rings around the camera (see do_far_emit). Rings dispatch side^2
 # threads each: sides must mirror the shader's RING_TILE/RING_OUTER constants.
 var far_field := false
-const FAR_SIDES := [400, 400, 500]
+const FAR_SIDES := [400, 400, 400, 250]   # sides = RING_OUTER*2/RING_TILE per ring
 # RAY-CAST renderer (GigaVoxels-inspired): march eye rays through a per-column
 # ground heightfield instead of emitting window instances — draw scales with
 # screen resolution, not window size. The far field stays rasterized behind it.
@@ -599,7 +599,7 @@ func dispatch_emit() -> PackedInt32Array:
 				rd.compute_list_set_push_constant(cl, _pc(11, 0), PC_SIZE)   # coarse far block quads
 				rd.compute_list_dispatch(cl, _block_groups, 1, 1)
 		if far_field and lod_r > 0:
-			for ring in range(3):   # heightfield vista rings out to 8 km
+			for ring in range(FAR_SIDES.size()):   # heightfield vista rings out to 8 km
 				rd.compute_list_set_push_constant(cl, _pc(12, ring), PC_SIZE)
 				rd.compute_list_dispatch(cl, ceili(FAR_SIDES[ring] * FAR_SIDES[ring] / 64.0), 1, 1)
 	elif block_render:
