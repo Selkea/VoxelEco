@@ -26,6 +26,79 @@ var water_mm: MultiMeshInstance3D
 # it over the 3D view (alpha 0 where rays miss, so the sky/far field show through)
 var ray_layer: CanvasLayer
 var ray_rect: TextureRect
+# far-field clipmap MESH (replaces the instanced far tiles): concentric grid
+# rings that ride the camera; the far_terrain.gdshader vertex pass displaces
+# them with the worldgen height function. Ring cells/outers must pair finer ->
+# coarser; each ring's hole is covered by the previous ring (2-cell overlap).
+var far_mat: ShaderMaterial
+var far_rings: Array[MeshInstance3D] = []
+const FAR_RING_CELL := [20.0, 80.0, 320.0, 1280.0]
+const FAR_RING_OUTER := [4000.0, 16000.0, 64000.0, 160000.0]
+
+## build the clipmap rings once (win_w/win_d = resident window size in voxels —
+## the shader discards inside it, minus a one-block tuck margin)
+func build_far_mesh(seed_v: int, win_w: float, win_d: float) -> void:
+	if not far_rings.is_empty():
+		return
+	far_mat = ShaderMaterial.new()
+	far_mat.shader = load("res://shaders/far_terrain.gdshader")
+	far_mat.set_shader_parameter("seed_v", seed_v)
+	far_mat.set_shader_parameter("win_min", Vector2(BLOCK_F, BLOCK_F))
+	far_mat.set_shader_parameter("win_max", Vector2(win_w - BLOCK_F, win_d - BLOCK_F))
+	for r in range(FAR_RING_CELL.size()):
+		var mi := MeshInstance3D.new()
+		mi.mesh = _far_ring_mesh(r)
+		mi.material_override = far_mat
+		var outer: float = FAR_RING_OUTER[r]
+		mi.custom_aabb = AABB(Vector3(-outer, -10.0, -outer),
+				Vector3(outer * 2.0, AABB_Y + 10.0, outer * 2.0))
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		add_child(mi)
+		far_rings.append(mi)
+
+const BLOCK_F := 20.0   # one 1 m block in voxels (window tuck margin)
+
+## per-frame: snap each ring to its own absolute world grid (no swimming) and
+## keep the shader's world offset / terraced mode in sync
+func update_far_mesh(cam_local: Vector2, origin_v: Vector2, terr: bool) -> void:
+	if far_rings.is_empty():
+		return
+	far_mat.set_shader_parameter("origin", origin_v)
+	far_mat.set_shader_parameter("terraced", terr)
+	for r in range(far_rings.size()):
+		var cell: float = FAR_RING_CELL[r]
+		var wx := floorf((cam_local.x + origin_v.x) / cell) * cell - origin_v.x
+		var wz := floorf((cam_local.y + origin_v.y) / cell) * cell - origin_v.y
+		far_rings[r].position = Vector3(wx, 0.0, wz)
+
+## flat grid ring: full (n+1)^2 vertex lattice (unreferenced verts cost nothing),
+## indices only for cells outside the inner hole (the finer ring covers it)
+func _far_ring_mesh(r: int) -> ArrayMesh:
+	var cell: float = FAR_RING_CELL[r]
+	var outer: float = FAR_RING_OUTER[r]
+	var inner: float = 0.0 if r == 0 else float(FAR_RING_OUTER[r - 1]) - cell * 2.0
+	var n := int(outer * 2.0 / cell)
+	var verts := PackedVector3Array()
+	verts.resize((n + 1) * (n + 1))
+	for j in range(n + 1):
+		for i in range(n + 1):
+			verts[j * (n + 1) + i] = Vector3(-outer + i * cell, 0.0, -outer + j * cell)
+	var idx := PackedInt32Array()
+	for j in range(n):
+		for i in range(n):
+			var x0 := -outer + i * cell
+			var z0 := -outer + j * cell
+			if x0 >= -inner and x0 + cell <= inner and z0 >= -inner and z0 + cell <= inner:
+				continue
+			var a := j * (n + 1) + i
+			idx.append_array([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1])
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_INDEX] = idx
+	var m := ArrayMesh.new()
+	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return m
 
 func set_ray_mode(on: bool, tex_rid: RID) -> void:
 	if ray_layer == null:

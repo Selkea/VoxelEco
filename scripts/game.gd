@@ -123,6 +123,14 @@ func _ready() -> void:
 	add_child(view)
 	if view.use_instances:
 		world.bind_instance_buffers(view.solid_buffer_rid(), view.water_buffer_rid())
+	# far field as a clipmap MESH (default): continuous heightfield rings
+	# displaced in the vertex shader by the worldgen noise — smooth connected
+	# slopes instead of instanced tiles, and zero emit instances out there.
+	# VOX_FARMESH=0 falls back to the old instanced far tiles.
+	if view.use_instances and world is GpuWorld and (world as GpuWorld).far_field \
+			and OS.get_environment("VOX_FARMESH") != "0":
+		(world as GpuWorld).far_tiles = false
+		view.build_far_mesh(world.seed_value, float(world.W), float(world.D))
 	_refresh_view(true)
 
 	var env := WorldEnvironment.new()
@@ -441,6 +449,11 @@ func _process(dt: float) -> void:
 		_place_fly()   # re-sync camera to the (possibly shifted) render origin
 	elif not _freeze_cam:
 		_place_cam()
+	# far clipmap mesh rides the camera (per-ring grid snap + world offset sync)
+	if cam != null and world is GpuWorld:
+		var gwf := world as GpuWorld
+		view.update_far_mesh(Vector2(cam.position.x, cam.position.z),
+				Vector2(gwf.gen_origin_x, gwf.gen_origin_z), (gwf.gen_flags & 1) != 0)
 	# ray-cast renderer: march the frame's rays from the final camera pose
 	if world is GpuWorld and (world as GpuWorld).ray_render and cam != null:
 		var gwr := world as GpuWorld

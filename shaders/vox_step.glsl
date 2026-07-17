@@ -1406,7 +1406,9 @@ vec3 ray_shade(int cx, int cy, int cz, vec3 n, vec3 hit) {
 			stride *= 1.12;
 		}
 	}
-	return base * (0.42 + 0.72 * ndl * sh);
+	// tone tuned against the PBR-lit far mesh (sky ambient + ACES): ambient
+	// lifted so the window/far boundary reads as one continuous surface
+	return base * (0.56 + 0.74 * ndl * sh);
 }
 
 // mode 16: one thread per pixel — march the ray through the heightfield.
