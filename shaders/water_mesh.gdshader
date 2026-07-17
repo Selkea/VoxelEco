@@ -10,12 +10,13 @@ uniform sampler2D sim_terra : filter_linear, repeat_disable;
 uniform vec2 win_size = vec2(0.0);
 uniform float gen_oy = 0.0;
 
+#include "res://shaders/sim_surface.gdshaderinc"
+
 varying float v_depth;    // fluid top minus ground top (voxels)
 
 void vertex() {
 	vec3 lp3 = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
-	vec2 uv = (lp3.xz + 0.5) / win_size;
-	vec2 hw = texture(sim_terra, uv).rg;
+	vec2 hw = sim_tex_smooth(sim_terra, lp3.xz, win_size).rg;
 	v_depth = hw.g - hw.r;
 	// dry columns keep the surface hugging the ground slightly below the
 	// terrain (fragments discard anyway) so shoreline triangles don't stretch
