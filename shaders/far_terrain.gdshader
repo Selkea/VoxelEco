@@ -7,7 +7,13 @@
 // streamed window). Units are VOXELS in the local render frame; Y is world-Y
 // voxels, exactly like the instanced emit.
 shader_type spatial;
-render_mode cull_disabled;   // heightfield seen from above; winding-proof (repo rule)
+// UNSHADED: lit manually with the EXACT formula the ray renderer uses
+// (ray_shade in vox_step.glsl), so the window and the far field are the same
+// math at every view angle — no SSAO/Fresnel/PBR divergence to calibrate away.
+// The engine still tonemaps (ACES) + sRGB-encodes this output, mirroring the
+// ray path's own ACES fit + gamma. tone_scale absorbs the tiny residual
+// between the two pipelines (calibrated by pixel measurement).
+render_mode unshaded, cull_disabled;
 
 uniform int seed_v = 0;                  // world seed (vox_step p.seedv)
 uniform vec2 origin = vec2(0.0);         // local->world offset (gen_origin), voxels
@@ -21,6 +27,8 @@ uniform float normal_step = 20.0;        // finite-difference step (voxels)
 // radians per screen pixel (2*tan(fov/2)/viewport_h), set by the game — used
 // to fade each speckle lattice as its cells go subpixel without derivatives
 uniform float px_angle = 0.0015;
+uniform vec3 sun_dir = vec3(0.0, -1.0, 0.0);   // light travel direction (cam_sun)
+uniform vec3 tone_scale = vec3(0.948, 0.940, 0.883);   // residual pipeline calibration
 
 const float BLOCK_VOX = 20.0;
 const float RELIEF = 5120.0;
@@ -29,6 +37,7 @@ const float SEA_Y = RELIEF * 0.30;
 varying vec3 v_local;                    // local-frame position (for discard/colour)
 varying float v_water;                   // 1 = sea surface vertex
 varying float v_hraw;                    // raw ground height (voxels)
+varying vec3 v_nrm;                      // world-axis surface normal
 
 uint pcg(uint v) {
 	v = v * 747796405u + 2891336453u;
@@ -98,7 +107,7 @@ void vertex() {
 	// finite-difference normal from the same height function (sea stays flat)
 	float hx = max(world_height(w + vec2(normal_step, 0.0)), SEA_Y);
 	float hz = max(world_height(w + vec2(0.0, normal_step)), SEA_Y);
-	NORMAL = normalize(vec3(max(h, SEA_Y) - hx, normal_step, max(h, SEA_Y) - hz));
+	v_nrm = normalize(vec3(max(h, SEA_Y) - hx, normal_step, max(h, SEA_Y) - hz));
 	v_local = vec3(lp.x, y, lp.z);
 	// write displaced position in the node's LOCAL space (undo the node offset)
 	VERTEX = vec3(VERTEX.x, y - MODEL_MATRIX[3].y, VERTEX.z);
@@ -122,12 +131,11 @@ void fragment() {
 	// the underside shows where the (eroded, deposited) sim terrain stands a
 	// little above this pure-gen surface at the window edge — light it like
 	// the topside instead of a black backface
-	NORMAL = FRONT_FACING ? NORMAL : -NORMAL;
+	vec3 n = normalize(v_nrm) * (FRONT_FACING ? 1.0 : -1.0);
 	vec2 w = v_local.xz + origin;
+	vec3 alb;
 	if (v_water > 0.5) {
-		ALBEDO = vec3(0.05, 0.18, 0.35);
-		ROUGHNESS = 0.15;
-		SPECULAR = 0.6;
+		alb = vec3(0.024, 0.13, 0.34);   // same water base the rays shade with
 	} else {
 		// multi-scale tint speckle matching the close-up per-voxel jitter: a
 		// hash lattice per scale (1 voxel, 25 cm, 1 m, 5 m), each fading out
@@ -141,11 +149,11 @@ void fragment() {
 				+ spek(w, 5.0, 0.10, pxw, 668265263u)     // 25 cm
 				+ spek(w, 20.0, 0.12, pxw, 1336530526u)   // per-block (1 m)
 				+ spek(w, 100.0, 0.07, pxw, 2004795789u); // 5 m (far hills)
-		// mat_color(GRASS) dimmed ~18%: the window's 5 cm voxels average darker
-		// (per-voxel jitter/AO/wetness), so straight grass albedo reads brighter
-		// than the terrain it continues — this meets the window in the middle
-		ALBEDO = vec3(0.086, 0.210, 0.052) * 0.84 * max(tint, 0.2);
-		ROUGHNESS = 1.0;
-		SPECULAR = 0.0;
+		alb = vec3(0.086, 0.210, 0.052) * max(tint, 0.2);   // mat_color(GRASS)
 	}
+	// EXACTLY ray_shade's lighting: bluish sky ambient + warm sun Lambert.
+	// The engine's ACES + sRGB then mirrors the ray path's ACES fit + gamma.
+	float ndl = max(dot(n, -normalize(sun_dir)), 0.0);
+	vec3 lit = alb * (vec3(0.28, 0.34, 0.50) + vec3(0.81, 0.79, 0.82) * ndl);
+	ALBEDO = lit * 0.98 * tone_scale;
 }

@@ -61,12 +61,13 @@ const BLOCK_F := 20.0   # one 1 m block in voxels (window tuck margin)
 ## per-frame: snap each ring to its own absolute world grid (no swimming) and
 ## keep the shader's world offset / terraced mode in sync
 func update_far_mesh(cam_local: Vector2, origin_v: Vector2, terr: bool,
-		pxa: float = 0.0015) -> void:
+		pxa: float = 0.0015, sun: Vector3 = Vector3.DOWN) -> void:
 	if far_rings.is_empty():
 		return
 	far_mat.set_shader_parameter("origin", origin_v)
 	far_mat.set_shader_parameter("terraced", terr)
 	far_mat.set_shader_parameter("px_angle", pxa)
+	far_mat.set_shader_parameter("sun_dir", sun)
 	for r in range(far_rings.size()):
 		var cell: float = FAR_RING_CELL[r]
 		var wx := floorf((cam_local.x + origin_v.x) / cell) * cell - origin_v.x

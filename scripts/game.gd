@@ -455,7 +455,8 @@ func _process(dt: float) -> void:
 		var vph := get_viewport().get_visible_rect().size.y
 		view.update_far_mesh(Vector2(cam.position.x, cam.position.z),
 				Vector2(gwf.gen_origin_x, gwf.gen_origin_z), (gwf.gen_flags & 1) != 0,
-				2.0 * tan(deg_to_rad(cam.fov * 0.5)) / maxf(vph, 1.0))
+				2.0 * tan(deg_to_rad(cam.fov * 0.5)) / maxf(vph, 1.0),
+				-_sun.global_transform.basis.z)
 	# ray-cast renderer: march the frame's rays from the final camera pose
 	if world is GpuWorld and (world as GpuWorld).ray_render and cam != null:
 		var gwr := world as GpuWorld
