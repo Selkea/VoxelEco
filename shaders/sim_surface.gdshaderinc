@@ -6,6 +6,12 @@
 // feature wider than ~2 voxels (channels, banks, dunes) keeps its shape.
 // lp is the local column position in voxels (texel k is centred at lp = k),
 // wsz the sim window size (W, D).
+
+// sim->proc crossfade band just inside the window edge (10 m). Terrain and
+// water must agree on it: the water shader reconstructs the exact ground the
+// terrain draws to decide where the sheet is submerged.
+const float BLEND_M = 200.0;
+
 vec4 sim_tex_smooth(sampler2D tex, vec2 lp, vec2 wsz) {
 	vec2 b = floor(lp);
 	vec2 f = lp - b;

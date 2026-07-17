@@ -59,29 +59,38 @@ void vertex() {
 }
 
 void fragment() {
-	// wet/dry + tint depth, PER-PIXEL: inside the window the RAW sim
-	// texture gives the true per-column depth (crisp shoreline at the
-	// simulated waterline); outside, depth is the blended surface over the
-	// per-fragment worldgen bed (per-vertex values inherit mesh density
-	// and print LoD artefacts on the mirror-flat surface).
-	vec2 raw = texture(sim_raw,
-			(clamp(v_lp, vec2(0.5), win_size - 0.5) + 0.5) / win_size).rg;
-	float d = raw.g - raw.r;
-	if (v_pw > 0.0) {
-		d = mix(d, v_wy - world_height(v_lp + origin), v_pw);
+	vec2 lpc = clamp(v_lp, vec2(0.5), win_size - 0.5);
+	vec2 hs = sim_tex_smooth(sim_terra, lpc, win_size).rg;
+	vec2 raw = texture(sim_raw, (lpc + 0.5) / win_size).rg;
+	// tint depth, PER-PIXEL: inside the window the RAW sim texture gives the
+	// true per-column depth; outside, the blended surface over the worldgen
+	// bed (per-vertex values inherit mesh density and print LoD artefacts)
+	float draw = raw.g - raw.r;
+	float d = draw;
+	// the GROUND the terrain mesh draws at this pixel — smoothed sim inside
+	// the window, worldgen outside, crossfaded over BLEND_M inside the edge
+	// (mirrors far_terrain's terrain_h exactly)
+	vec2 e = min(v_lp, win_size - v_lp);
+	float f = clamp(min(e.x, e.y) / BLEND_M, 0.0, 1.0);
+	float grd = hs.r + gen_oy;
+	if (f < 1.0) {
+		float wh = world_height(v_lp + origin);
+		grd = mix(wh, grd, f);
+		d = mix(d, v_wy - wh, v_pw);
 	}
-	// SEAL against the drawn terrain: the waterline is RAW but the terrain
-	// is SMOOTHED, and the smoothed bank crosses lake level inland of the
-	// raw waterline — discarding on raw depth alone opened a thin slit of
-	// unsubmerged bank along every shore (most obvious from underwater).
-	// Keep the sheet wherever it still floats above the smoothed terrain;
-	// it tucks under the bank exactly where the drawn ground rises out.
-	bool dry = d < 0.25;
-	if (dry && v_pw < 1.0) {
-		float terr = sim_tex_smooth(sim_terra,
-				clamp(v_lp, vec2(0.5), win_size - 0.5), win_size).r + gen_oy;
-		dry = v_wy < terr + 0.05;
-	}
+	// WET means BOTH: (1) the sheet floats above the DRAWN ground — below it
+	// the terrain occludes it anyway, and where the coarse sheet merely
+	// chords across a concave dry hollow it must not count; and (2) inside
+	// the window, where the sheet hugs the sim surface, the sim actually
+	// holds water in this column or its smoothed neighbourhood (the
+	// neighbourhood term seals the bank: the smoothed ground dips below lake
+	// level slightly inland of the raw waterline). Testing against the drawn
+	// ground — not raw sim ground, not clamped edge texels — is what stops
+	// clipping: over the apron the clamped samples describe the window
+	// EDGE's columns, so a wet edge used to keep the sheet alive straight
+	// through any hill the terrain draws there.
+	float wet = max(draw, hs.g - hs.r);
+	bool dry = v_wy - grd < 0.05 || (v_pw <= 0.0 && wet < 0.25);
 	if (dry) { discard; }
 	// deepen the blue with depth; shallows stay translucent over the bed
 	float dp = 1.0 - exp(-d * 0.10);
