@@ -9,12 +9,11 @@ const CHUNK := 16
 # Y extent of the instance culling AABB: the full 256 m relief (RELIEF=5120) plus
 # margin, so the vertical-tracking band is never culled wherever it rides.
 const AABB_Y := 5400.0
-# how far (voxels) the sim water plane reaches beyond the window rect. The
-# terrain's opaque sea starts at APRON_M (far_terrain.gdshader, 464) and its
-# first vertex row can land up to a ring cell (~64 vox) later — the plane
-# rides just ABOVE the sea through that whole zone and only dips under in
-# its final 64 vox, so the submerged bed->sea wall rim never pokes through.
+# how far (voxels) the water mesh keeps its fine 8-vox grid beyond the
+# window rect — the zone where sim water levels relax to the sea line
 const WATER_APRON := 640.0
+# horizon reach of the flat water skirt (matches the far rings' extent)
+const WATER_R := 168000.0
 
 var world: VoxWorld
 var solid_mat: StandardMaterial3D
@@ -79,22 +78,73 @@ func build_far_mesh(gw: GpuWorld, with_sim: bool) -> void:
 	water_plane_mat.set_shader_parameter("sim_terra", wt)
 	water_plane_mat.set_shader_parameter("win_size", Vector2(gw.W, gw.D))
 	water_plane_mat.set_shader_parameter("apron", WATER_APRON)
-	# the plane carries an APRON beyond the window rect: wet edges continue
-	# the sim's water level outward, relaxing to SEA_Y, so the terrain's
-	# bed->sea handoff happens under a continuous water surface
-	var pm := PlaneMesh.new()
-	pm.size = Vector2(gw.W + 2.0 * WATER_APRON, gw.D + 2.0 * WATER_APRON)
-	pm.subdivide_width = int(pm.size.x / 8.0) - 1
-	pm.subdivide_depth = int(pm.size.y / 8.0) - 1
+	water_plane_mat.set_shader_parameter("seed_v", gw.seed_value)
+	# ONE water surface for everything: fine grid over window+apron (sim
+	# levels), flat single-quad skirt at SEA_Y to the horizon (proc sea).
 	water_plane = MeshInstance3D.new()
-	water_plane.mesh = pm
+	water_plane.mesh = _water_mesh(gw)
 	water_plane.material_override = water_plane_mat
 	water_plane.position = Vector3(gw.W * 0.5, 0.0, gw.D * 0.5)
 	water_plane.custom_aabb = AABB(
-			Vector3(-pm.size.x * 0.5, -10.0, -pm.size.y * 0.5),
-			Vector3(pm.size.x, AABB_Y + 10.0, pm.size.y))
+			Vector3(-WATER_R - gw.W, -10.0, -WATER_R - gw.D),
+			Vector3((WATER_R + gw.W) * 2.0, AABB_Y + 10.0, (WATER_R + gw.D) * 2.0))
 	water_plane.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(water_plane)
+
+## the unified water mesh: an 8-vox vertex grid over [-apron, W+apron]^2
+## (displaced by sim fluid levels in the shader) plus 8 single-quad skirt
+## rectangles out to the horizon. Outside the apron the shader outputs
+## EXACTLY SEA_Y, so the T-junctions along the fine grid's edge are
+## colinear and cannot crack.
+func _water_mesh(gw: GpuWorld) -> ArrayMesh:
+	var lo := -WATER_APRON
+	var hix := gw.W + WATER_APRON
+	var hiz := gw.D + WATER_APRON
+	var step := 8.0
+	var nx := int((hix - lo) / step)
+	var nz := int((hiz - lo) / step)
+	var verts := PackedVector3Array()
+	verts.resize((nx + 1) * (nz + 1))
+	for j in range(nz + 1):
+		for i in range(nx + 1):
+			verts[j * (nx + 1) + i] = Vector3(lo + i * step, 0.0, lo + j * step)
+	var idx := PackedInt32Array()
+	idx.resize(nx * nz * 6)
+	var k := 0
+	for j in range(nz):
+		for i in range(nx):
+			var a := j * (nx + 1) + i
+			idx[k] = a
+			idx[k + 1] = a + 1
+			idx[k + 2] = a + nx + 1
+			idx[k + 3] = a + 1
+			idx[k + 4] = a + nx + 2
+			idx[k + 5] = a + nx + 1
+			k += 6
+	var xs: Array[float] = [-WATER_R, lo, hix, WATER_R + gw.W]
+	var zs: Array[float] = [-WATER_R, lo, hiz, WATER_R + gw.D]
+	for rz in range(3):
+		for rx in range(3):
+			if rx == 1 and rz == 1:
+				continue
+			var b := verts.size()
+			verts.append(Vector3(xs[rx], 0.0, zs[rz]))
+			verts.append(Vector3(xs[rx + 1], 0.0, zs[rz]))
+			verts.append(Vector3(xs[rx], 0.0, zs[rz + 1]))
+			verts.append(Vector3(xs[rx + 1], 0.0, zs[rz + 1]))
+			idx.append_array(PackedInt32Array([b, b + 1, b + 2,
+					b + 1, b + 3, b + 2]))
+	var nrm := PackedVector3Array()
+	nrm.resize(verts.size())
+	nrm.fill(Vector3.UP)
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = verts
+	arr[Mesh.ARRAY_NORMAL] = nrm
+	arr[Mesh.ARRAY_INDEX] = idx
+	var am := ArrayMesh.new()
+	am.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+	return am
 
 func _add_ring(mesh: ArrayMesh, mat: ShaderMaterial, outer: float,
 		dest: Array[MeshInstance3D]) -> void:
@@ -128,6 +178,8 @@ func update_far_mesh(cam_local: Vector2, origin_v: Vector2, terr: bool,
 	far_mat.set_shader_parameter("gen_oy", oy)
 	if water_plane_mat != null:
 		water_plane_mat.set_shader_parameter("gen_oy", oy)
+		water_plane_mat.set_shader_parameter("origin", origin_v)
+		water_plane_mat.set_shader_parameter("terraced", terr)
 	for r in range(far_rings.size()):
 		var cell: float = FAR_RING_CELL[r]
 		var wx := floorf((cam_local.x + origin_v.x) / cell) * cell - origin_v.x

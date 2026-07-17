@@ -4,14 +4,14 @@
 // — erosion, settling and water levels all show up); outside, the same
 // worldgen noise the sim generates from. The two crossfade over BLEND_M just
 // inside the window edge, so there is no renderer boundary anywhere.
+// This shader draws GROUND ONLY — every water surface (sim lakes AND the
+// procedural sea) is the single translucent water mesh (water_mesh.gdshader),
+// so water compositing is identical everywhere and no handoff can show.
 // Shaded PBR: the engine's sun/sky/ACES/shadows light everything uniformly.
 // Units are VOXELS in the local render frame; Y is world-Y voxels.
 shader_type spatial;
 render_mode cull_disabled;
 
-uniform int seed_v = 0;                  // world seed (vox_step p.seedv)
-uniform vec2 origin = vec2(0.0);         // local->world offset (gen_origin), voxels
-uniform bool terraced = false;           // gen_flags bit0 (T toggle)
 uniform float px_angle = 0.0015;         // radians per screen pixel (speckle fade)
 // sim window surface data (Texture2DRD): r = solid ground top, g = fluid top,
 // both in LOCAL band Y (add gen_oy for world-Y). win_size = (W, D); x <= 0
@@ -22,74 +22,13 @@ uniform vec2 win_size = vec2(0.0);
 uniform float gen_oy = 0.0;
 const float BLEND_M = 200.0;             // sim->proc crossfade band (10 m)
 
-const float BLOCK_VOX = 20.0;
-const float RELIEF = 5120.0;
-const float SEA_Y = RELIEF * 0.30;
-
+#include "res://shaders/worldgen.gdshaderinc"
 #include "res://shaders/sim_surface.gdshaderinc"
 
 varying vec3 v_local;                    // local-frame position (displaced)
-varying float v_water;                   // 1 = procedural sea surface
+varying float v_subm;                    // submersion: bed below the sea line
 varying vec3 v_nrm;                      // world-axis surface normal
 varying float v_simf;                    // sim-data weight at this vertex
-
-uint pcg(uint v) {
-	v = v * 747796405u + 2891336453u;
-	v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
-	return (v >> 22u) ^ v;
-}
-
-float vhash(vec2 q) {
-	uint h = pcg(uint(int(q.x)) * 374761393u ^ uint(int(q.y)) * 668265263u ^ uint(seed_v));
-	return float(h) * (1.0 / 4294967296.0);
-}
-
-float vnoise(vec2 q) {
-	vec2 i = floor(q);
-	vec2 f = q - i;
-	vec2 u = f * f * (3.0 - 2.0 * f);
-	float a = vhash(i);
-	float b = vhash(i + vec2(1.0, 0.0));
-	float c = vhash(i + vec2(0.0, 1.0));
-	float d = vhash(i + vec2(1.0, 1.0));
-	return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
-
-float fbm(vec2 q) {
-	float v = 0.0;
-	float amp = 0.5;
-	for (int o = 0; o < 4; o++) {
-		v += vnoise(q) * amp;
-		q *= 2.03;
-		amp *= 0.5;
-	}
-	return v;
-}
-
-float block_height(vec2 bc, vec2 s) {
-	vec2 w = bc * BLOCK_VOX;
-	float cn = fbm(w / 21000.0 + s) - 0.5;
-	float chunk = cn * (1.0 + 2.0 * abs(cn));
-	float hill = fbm(w / 2700.0 + s * 2.0 + 31.7) - 0.5;
-	float det = fbm(w / 600.0 + s * 4.0 + 91.3) - 0.5;
-	return RELIEF * (0.5 + chunk * 0.44 + hill * 0.06 + det * 0.02);
-}
-
-float world_height(vec2 w) {
-	vec2 s = vec2(float(uint(seed_v) & 0xFFFFu), float((uint(seed_v) >> 16u) & 0xFFFFu)) * 0.618;
-	if (terraced) {
-		vec2 bc = floor(w / BLOCK_VOX);
-		return floor(block_height(bc, s) / BLOCK_VOX) * BLOCK_VOX;
-	}
-	vec2 bcf = w / BLOCK_VOX;
-	vec2 i = floor(bcf);
-	vec2 f = bcf - i;
-	vec2 u = f * f * (3.0 - 2.0 * f);
-	return mix(
-		mix(block_height(i, s), block_height(i + vec2(1.0, 0.0), s), u.x),
-		mix(block_height(i + vec2(0.0, 1.0), s), block_height(i + vec2(1.0, 1.0), s), u.x),
-		u.y);
-}
 
 // how strongly this local position uses SIM data (0 outside the window,
 // ramping to 1 over BLEND_M inside its edge)
@@ -99,42 +38,16 @@ float sim_w(vec2 lp) {
 	return clamp(min(e.x, e.y) / BLEND_M, 0.0, 1.0);
 }
 
-// beyond-window zone (voxels) where the translucent water plane's APRON
-// carries the water surface. 48 vox SHORTER than vox_view WATER_APRON: the
-// opaque sea starts under the apron's (slightly sunk) rim, so the handoff
-// overlaps instead of abutting — no hairline cracks along the rect.
-const float APRON_M = 464.0;
-
-// terrain height at a local position: sim ground inside the window,
-// procedural outside, crossfaded. INSIDE the window all water is drawn by
-// the translucent plane, so the band blends bed-to-bed (clamping the proc
-// side to sea level rendered the band as a wedge ramp across lakes). In the
-// APRON just outside a WET window edge the plane still carries the water
-// surface, so terrain stays bed there too — the hard bed->sea handoff
-// happens at the apron's end, where both water surfaces meet at SEA_Y and
-// the submerged step is invisible. Dry edges keep the plain SEA_Y sea.
-float terrain_h(vec2 lp, float f, out float wtr) {
-	wtr = 0.0;
+// GROUND height at a local position: sim ground inside the window,
+// procedural outside, crossfaded bed-to-bed. Water never displaces this
+// surface — the translucent water mesh above carries every water surface.
+float terrain_h(vec2 lp, float f) {
 	if (f > 0.0) {
 		float hs = sim_tex_smooth(sim_terra, lp, win_size).r + gen_oy;
 		if (f >= 1.0) { return hs; }
 		return mix(world_height(lp + origin), hs, f);
 	}
-	float hp = world_height(lp + origin);
-	if (hp < SEA_Y) {
-		if (win_size.x > 0.0) {
-			vec2 e = min(lp, win_size - lp);
-			float dout = -min(e.x, e.y);          // voxels beyond the window
-			if (dout < APRON_M) {
-				vec2 srg = sim_tex_smooth(sim_terra,
-						clamp(lp, vec2(0.5), win_size - 0.5), win_size).rg;
-				if (srg.g - srg.r > 0.6) { return hp; }   // bed; plane covers
-			}
-		}
-		wtr = 1.0;
-		return SEA_Y;
-	}
-	return hp;
+	return world_height(lp + origin);
 }
 
 void vertex() {
@@ -142,17 +55,18 @@ void vertex() {
 	vec2 lp = lp3.xz;
 	float f = sim_w(lp);
 	v_simf = f;
-	float wtr;
-	float h = terrain_h(lp, f, wtr);
-	v_water = wtr;
+	float h = terrain_h(lp, f);
+	// procedural beds below the sea line tint toward wet earth (the sim side
+	// bakes its own bed colours into tcol) — smooth ramp, ~4 vox to full
+	v_subm = clamp((SEA_Y - h) * 0.25, 0.0, 1.0) * (1.0 - f);
 	// finite-difference normals: a fine stride near the camera keeps shading
 	// faithful to small sim relief, but at grazing distance a fine stride
 	// tracks every residual 5 cm quantization step as contour banding — so
 	// widen it with view distance; the procedural far field stays at 20
 	float dist = length(lp3 - INV_VIEW_MATRIX[3].xyz);
 	float ns = mix(20.0, clamp(dist * 0.02, 4.0, 20.0), f);
-	float hx = terrain_h(lp + vec2(ns, 0.0), sim_w(lp + vec2(ns, 0.0)), wtr);
-	float hz = terrain_h(lp + vec2(0.0, ns), sim_w(lp + vec2(0.0, ns)), wtr);
+	float hx = terrain_h(lp + vec2(ns, 0.0), sim_w(lp + vec2(ns, 0.0)));
+	float hz = terrain_h(lp + vec2(0.0, ns), sim_w(lp + vec2(0.0, ns)));
 	v_nrm = normalize(vec3(h - hx, ns, h - hz));
 	v_local = vec3(lp.x, h, lp.y);
 	NORMAL = v_nrm;
@@ -173,40 +87,22 @@ float spek(vec2 w, float scale, float amp, float pxw, uint salt) {
 void fragment() {
 	NORMAL = normalize((VIEW_MATRIX * vec4(v_nrm, 0.0)).xyz) * (FRONT_FACING ? 1.0 : -1.0);
 	vec2 w = v_local.xz + origin;
-	vec3 alb;
-	if (v_water > 0.5) {
-		// depth-shaded with the SAME curve/constants as the sim water plane
-		// (water_mesh.gdshader), over an implied wet-earth bed — a uniform
-		// deep blue made every shallow shelf show the window rect as a tone
-		// rectangle against the plane's translucent shallows. Depth is
-		// PER-FRAGMENT (bed re-derived from the worldgen noise here): the
-		// per-vertex version inherited the clipmap rings' vertex density, so
-		// shallow tint faceting changed at every ring boundary — visible
-		// camera-centred squares crawling over the water while flying.
-		float d = max(SEA_Y - world_height(w), 0.0);
-		float dp = 1.0 - exp(-d * 0.10);
-		vec3 wcol = mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34), dp);
-		float a = clamp(0.55 + dp * 0.45, 0.0, 0.97);
-		alb = mix(vec3(0.20, 0.14, 0.08), wcol, a);
-		ROUGHNESS = mix(0.08, 0.15, dp);
-		SPECULAR = mix(0.55, 0.4, dp);
-	} else {
-		vec3 proc = vec3(0.086, 0.210, 0.052);   // mat_color(GRASS)
-		// smooth reconstruction of the baked column colors too: per-voxel hash
-		// jitter reads as surface roughness at travel height, so average it
-		// over the same ~2-voxel kernel (material boundaries only soften 10 cm)
-		alb = v_simf > 0.0
-				? mix(proc, sim_tex_smooth(sim_col, v_local.xz, win_size).rgb, v_simf)
-				: proc;
-		float pxw = length(VERTEX) * px_angle;
-		float tint = 1.0
-				+ spek(w, 1.0, 0.03, pxw, 0u)
-				+ spek(w, 5.0, 0.02, pxw, 668265263u)
-				+ spek(w, 20.0, 0.03, pxw, 1336530526u)
-				+ spek(w, 100.0, 0.03, pxw, 2004795789u);
-		alb *= max(tint, 0.2);
-		ROUGHNESS = 1.0;
-		SPECULAR = 0.05;
-	}
+	vec3 proc = vec3(0.086, 0.210, 0.052);   // mat_color(GRASS)
+	// smooth reconstruction of the baked column colors too: per-voxel hash
+	// jitter reads as surface roughness at travel height, so average it
+	// over the same ~2-voxel kernel (material boundaries only soften 10 cm)
+	vec3 alb = v_simf > 0.0
+			? mix(proc, sim_tex_smooth(sim_col, v_local.xz, win_size).rgb, v_simf)
+			: proc;
+	alb = mix(alb, vec3(0.13, 0.085, 0.05), v_subm);   // submerged wet earth
+	float pxw = length(VERTEX) * px_angle;
+	float tint = 1.0
+			+ spek(w, 1.0, 0.03, pxw, 0u)
+			+ spek(w, 5.0, 0.02, pxw, 668265263u)
+			+ spek(w, 20.0, 0.03, pxw, 1336530526u)
+			+ spek(w, 100.0, 0.03, pxw, 2004795789u);
+	alb *= max(tint, 0.2);
+	ROUGHNESS = 1.0;
+	SPECULAR = 0.05;
 	ALBEDO = alb;
 }
