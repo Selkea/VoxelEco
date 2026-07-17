@@ -153,15 +153,17 @@ void fragment() {
 				+ spek(w, 20.0, 0.05, pxw, 1336530526u)   // per-block (1 m)
 				+ spek(w, 100.0, 0.03, pxw, 2004795789u); // 5 m (far hills)
 		alb = vec3(0.086, 0.210, 0.052) * max(tint, 0.2);   // mat_color(GRASS)
-		// 1 m contour lines like the window's terrace-step shadows. The height
-		// band scales with SLOPE so the projected line stays ~1 px wide — a
-		// fixed band smeared into metres-wide stripes on gentle ground (real
-		// step risers are always one voxel wide on screen, and flats have no
-		// lines at all). Fades once the line would be subpixel anyway.
-		float cd = abs(v_hraw / 20.0 - round(v_hraw / 20.0)) * 20.0;
+		// step lines at TRUE voxel frequency — the window darkens a riser at
+		// every 5 cm level, not every metre, so slopes carry dense fine
+		// terracing right up to the seam. Width scales with slope (~1 px
+		// projected); when lines would pack tighter than ~2 px they fade out
+		// and the stair-model riser shading below carries the merged average,
+		// exactly like real risers blurring together at distance.
+		float cd = abs(v_hraw - round(v_hraw));
 		float slope = length(vec2(n.x, n.z)) / max(n.y, 0.2);
 		float bw = slope * pxw * 1.5;
-		float cfade = clamp(2.0 / max(pxw, 1e-4) - 0.2, 0.0, 1.0);
+		float sep_px = 1.0 / max(slope * pxw, 1e-4);   // px between voxel levels
+		float cfade = clamp(sep_px * 0.5 - 1.0, 0.0, 1.0);
 		alb *= 1.0 - (1.0 - smoothstep(bw * 0.6, bw * 1.4, cd)) * cfade * 0.30;
 	}
 	// STAIR-MODEL lighting, matching how the rays actually light voxel terrain:
