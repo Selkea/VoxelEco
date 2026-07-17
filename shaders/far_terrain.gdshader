@@ -26,6 +26,8 @@ const float BLOCK_VOX = 20.0;
 const float RELIEF = 5120.0;
 const float SEA_Y = RELIEF * 0.30;
 
+#include "res://shaders/sim_surface.gdshaderinc"
+
 varying vec3 v_local;                    // local-frame position (displaced)
 varying float v_water;                   // 1 = procedural sea surface
 varying vec3 v_nrm;                      // world-axis surface normal
@@ -104,7 +106,7 @@ float terrain_h(vec2 lp, float f, out float wtr) {
 	float hs = 0.0;
 	wtr = 0.0;
 	if (f > 0.0) {
-		hs = texture(sim_terra, (lp + 0.5) / win_size).r + gen_oy;
+		hs = sim_tex_smooth(sim_terra, lp, win_size).r + gen_oy;
 		if (f >= 1.0) { return hs; }
 	}
 	float hp = world_height(lp + origin);
@@ -120,9 +122,15 @@ void vertex() {
 	float wtr;
 	float h = terrain_h(lp, f, wtr);
 	v_water = wtr;
-	float hx = terrain_h(lp + vec2(20.0, 0.0), sim_w(lp + vec2(20.0, 0.0)), wtr);
-	float hz = terrain_h(lp + vec2(0.0, 20.0), sim_w(lp + vec2(0.0, 20.0)), wtr);
-	v_nrm = normalize(vec3(h - hx, 20.0, h - hz));
+	// finite-difference normals: a fine stride near the camera keeps shading
+	// faithful to small sim relief, but at grazing distance a fine stride
+	// tracks every residual 5 cm quantization step as contour banding — so
+	// widen it with view distance; the procedural far field stays at 20
+	float dist = length(lp3 - INV_VIEW_MATRIX[3].xyz);
+	float ns = mix(20.0, clamp(dist * 0.02, 4.0, 20.0), f);
+	float hx = terrain_h(lp + vec2(ns, 0.0), sim_w(lp + vec2(ns, 0.0)), wtr);
+	float hz = terrain_h(lp + vec2(0.0, ns), sim_w(lp + vec2(0.0, ns)), wtr);
+	v_nrm = normalize(vec3(h - hx, ns, h - hz));
 	v_local = vec3(lp.x, h, lp.y);
 	NORMAL = v_nrm;
 	VERTEX = vec3(VERTEX.x, h - MODEL_MATRIX[3].y, VERTEX.z);
@@ -147,13 +155,16 @@ void fragment() {
 		SPECULAR = 0.4;
 	} else {
 		vec3 proc = vec3(0.086, 0.210, 0.052);   // mat_color(GRASS)
+		// smooth reconstruction of the baked column colors too: per-voxel hash
+		// jitter reads as surface roughness at travel height, so average it
+		// over the same ~2-voxel kernel (material boundaries only soften 10 cm)
 		alb = v_simf > 0.0
-				? mix(proc, texture(sim_col, (v_local.xz + 0.5) / win_size).rgb, v_simf)
+				? mix(proc, sim_tex_smooth(sim_col, v_local.xz, win_size).rgb, v_simf)
 				: proc;
 		float pxw = length(VERTEX) * px_angle;
 		float tint = 1.0
-				+ spek(w, 1.0, 0.12, pxw, 0u)
-				+ spek(w, 5.0, 0.05, pxw, 668265263u)
+				+ spek(w, 1.0, 0.05, pxw, 0u)
+				+ spek(w, 5.0, 0.035, pxw, 668265263u)
 				+ spek(w, 20.0, 0.05, pxw, 1336530526u)
 				+ spek(w, 100.0, 0.03, pxw, 2004795789u);
 		alb *= max(tint, 0.2);
