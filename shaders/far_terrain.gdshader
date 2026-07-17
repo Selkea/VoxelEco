@@ -30,6 +30,7 @@ const float SEA_Y = RELIEF * 0.30;
 
 varying vec3 v_local;                    // local-frame position (displaced)
 varying float v_water;                   // 1 = procedural sea surface
+varying float v_wdepth;                  // proc water depth over its bed (vox)
 varying vec3 v_nrm;                      // world-axis surface normal
 varying float v_simf;                    // sim-data weight at this vertex
 
@@ -113,8 +114,9 @@ const float APRON_M = 464.0;
 // surface, so terrain stays bed there too — the hard bed->sea handoff
 // happens at the apron's end, where both water surfaces meet at SEA_Y and
 // the submerged step is invisible. Dry edges keep the plain SEA_Y sea.
-float terrain_h(vec2 lp, float f, out float wtr) {
+float terrain_h(vec2 lp, float f, out float wtr, out float wdep) {
 	wtr = 0.0;
+	wdep = 0.0;
 	if (f > 0.0) {
 		float hs = sim_tex_smooth(sim_terra, lp, win_size).r + gen_oy;
 		if (f >= 1.0) { return hs; }
@@ -132,6 +134,7 @@ float terrain_h(vec2 lp, float f, out float wtr) {
 			}
 		}
 		wtr = 1.0;
+		wdep = SEA_Y - hp;      // water depth over the procedural bed
 		return SEA_Y;
 	}
 	return hp;
@@ -143,16 +146,18 @@ void vertex() {
 	float f = sim_w(lp);
 	v_simf = f;
 	float wtr;
-	float h = terrain_h(lp, f, wtr);
+	float wdep;
+	float h = terrain_h(lp, f, wtr, wdep);
 	v_water = wtr;
+	v_wdepth = wdep;
 	// finite-difference normals: a fine stride near the camera keeps shading
 	// faithful to small sim relief, but at grazing distance a fine stride
 	// tracks every residual 5 cm quantization step as contour banding — so
 	// widen it with view distance; the procedural far field stays at 20
 	float dist = length(lp3 - INV_VIEW_MATRIX[3].xyz);
 	float ns = mix(20.0, clamp(dist * 0.02, 4.0, 20.0), f);
-	float hx = terrain_h(lp + vec2(ns, 0.0), sim_w(lp + vec2(ns, 0.0)), wtr);
-	float hz = terrain_h(lp + vec2(0.0, ns), sim_w(lp + vec2(0.0, ns)), wtr);
+	float hx = terrain_h(lp + vec2(ns, 0.0), sim_w(lp + vec2(ns, 0.0)), wtr, wdep);
+	float hz = terrain_h(lp + vec2(0.0, ns), sim_w(lp + vec2(0.0, ns)), wtr, wdep);
 	v_nrm = normalize(vec3(h - hx, ns, h - hz));
 	v_local = vec3(lp.x, h, lp.y);
 	NORMAL = v_nrm;
@@ -175,9 +180,16 @@ void fragment() {
 	vec2 w = v_local.xz + origin;
 	vec3 alb;
 	if (v_water > 0.5) {
-		alb = vec3(0.024, 0.13, 0.34);        // procedural far sea
-		ROUGHNESS = 0.15;
-		SPECULAR = 0.4;
+		// depth-shaded with the SAME curve/constants as the sim water plane
+		// (water_mesh.gdshader), over an implied wet-earth bed — a uniform
+		// deep blue made every shallow shelf show the window rect as a tone
+		// rectangle against the plane's translucent shallows
+		float dp = 1.0 - exp(-v_wdepth * 0.10);
+		vec3 wcol = mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34), dp);
+		float a = clamp(0.55 + dp * 0.45, 0.0, 0.97);
+		alb = mix(vec3(0.20, 0.14, 0.08), wcol, a);
+		ROUGHNESS = mix(0.08, 0.15, dp);
+		SPECULAR = mix(0.55, 0.4, dp);
 	} else {
 		vec3 proc = vec3(0.086, 0.210, 0.052);   // mat_color(GRASS)
 		// smooth reconstruction of the baked column colors too: per-voxel hash
