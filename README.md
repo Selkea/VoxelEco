@@ -188,17 +188,17 @@ VOX_LEVELS=6 VOX_DITHERSTR=1`.
   the fine detail, and skirts are surface-coloured so distant ridges read like
   the fine render. This decouples draw cost from window size — the draw is
   ~10 ms at a 102 m window, faster than the old 64 m window.
-- **Far field to 8 km**: beyond the sim window, terrain is drawn straight from
-  the worldgen heightfield — a pure function of world (x,z) + seed, needing no
-  cells and no sim — as four square clip-rings of growing tile size (1 m to
-  200 m, 4 m to 800 m, 16 m to 3.2 km, 64 m to 8 km; 1 m = the worldgen's
-  native block resolution) that follow the camera to the horizon. Tiles snap
-  to absolute grids (no swimming), skirt every edge where they're the higher
-  side with a 1 m apron, overlap one tile inward at ring boundaries and under
-  the window edge (no cracks), and colour like the gen surface — grass above
-  the sea line, a flat water plane over basins. The whole 8 km vista costs
-  ~3 ms; `VOX_FAR=0` disables it. What you see out there is the real terrain you can fly to — it
-  streams into the sim window as you approach.
+- **Far field to 8 km — a clipmap MESH**: beyond the sim window, terrain is a
+  continuous heightfield mesh: four static grid rings (1 m cells to 200 m, 4 m
+  to 800 m, 16 m to 3.2 km, 64 m to 8 km) ride the camera, and a vertex shader
+  (`far_terrain.gdshader`) displaces them by evaluating the worldgen noise —
+  the same pure function of world (x,z) + seed the sim generates from, so the
+  vista IS the real terrain and streams into the window as you approach.
+  Smooth connected slopes (no tile terracing), PBR-lit with the scene, smooth/
+  terraced (T) honoured, basins clamp to the sea line as water. Rings snap to
+  absolute grids (no swimming), overlap under the finer ring, and open a hole
+  for the resident window. Whole vista ~1M triangles, ~0 emit instances;
+  `VOX_FARMESH=0` falls back to the old instanced tiles, `VOX_FAR=0` disables.
 - **Ray-cast renderer (experimental, G / `VOX_RENDER=ray`)**: GigaVoxels-inspired
   alternative to the instanced renderer — eye rays march a per-column ground
   heightfield (plus a per-16x16-tile max grid for empty-space skipping) in a
