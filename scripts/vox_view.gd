@@ -76,6 +76,9 @@ func build_far_mesh(gw: GpuWorld, with_sim: bool) -> void:
 	var wt := Texture2DRD.new()
 	wt.texture_rd_rid = gw.terra_s_tex   # smoothed heights (mode 19)
 	water_plane_mat.set_shader_parameter("sim_terra", wt)
+	var wr := Texture2DRD.new()
+	wr.texture_rd_rid = gw.terra_tex     # RAW heights: true waterline for discard
+	water_plane_mat.set_shader_parameter("sim_raw", wr)
 	water_plane_mat.set_shader_parameter("win_size", Vector2(gw.W, gw.D))
 	water_plane_mat.set_shader_parameter("apron", WATER_APRON)
 	water_plane_mat.set_shader_parameter("seed_v", gw.seed_value)
