@@ -9,6 +9,12 @@ const CHUNK := 16
 # Y extent of the instance culling AABB: the full 256 m relief (RELIEF=5120) plus
 # margin, so the vertical-tracking band is never culled wherever it rides.
 const AABB_Y := 5400.0
+# how far (voxels) the sim water plane reaches beyond the window rect. The
+# terrain's opaque sea starts at APRON_M (far_terrain.gdshader, 464) and its
+# first vertex row can land up to a ring cell (~64 vox) later — the plane
+# rides just ABOVE the sea through that whole zone and only dips under in
+# its final 64 vox, so the submerged bed->sea wall rim never pokes through.
+const WATER_APRON := 640.0
 
 var world: VoxWorld
 var solid_mat: StandardMaterial3D
@@ -72,16 +78,21 @@ func build_far_mesh(gw: GpuWorld, with_sim: bool) -> void:
 	wt.texture_rd_rid = gw.terra_s_tex   # smoothed heights (mode 19)
 	water_plane_mat.set_shader_parameter("sim_terra", wt)
 	water_plane_mat.set_shader_parameter("win_size", Vector2(gw.W, gw.D))
+	water_plane_mat.set_shader_parameter("apron", WATER_APRON)
+	# the plane carries an APRON beyond the window rect: wet edges continue
+	# the sim's water level outward, relaxing to SEA_Y, so the terrain's
+	# bed->sea handoff happens under a continuous water surface
 	var pm := PlaneMesh.new()
-	pm.size = Vector2(gw.W, gw.D)
-	pm.subdivide_width = int(gw.W / 8.0) - 1
-	pm.subdivide_depth = int(gw.D / 8.0) - 1
+	pm.size = Vector2(gw.W + 2.0 * WATER_APRON, gw.D + 2.0 * WATER_APRON)
+	pm.subdivide_width = int(pm.size.x / 8.0) - 1
+	pm.subdivide_depth = int(pm.size.y / 8.0) - 1
 	water_plane = MeshInstance3D.new()
 	water_plane.mesh = pm
 	water_plane.material_override = water_plane_mat
 	water_plane.position = Vector3(gw.W * 0.5, 0.0, gw.D * 0.5)
-	water_plane.custom_aabb = AABB(Vector3(-gw.W * 0.5, -10.0, -gw.D * 0.5),
-			Vector3(gw.W, AABB_Y + 10.0, gw.D))
+	water_plane.custom_aabb = AABB(
+			Vector3(-pm.size.x * 0.5, -10.0, -pm.size.y * 0.5),
+			Vector3(pm.size.x, AABB_Y + 10.0, pm.size.y))
 	water_plane.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(water_plane)
 

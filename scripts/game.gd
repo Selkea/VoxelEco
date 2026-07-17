@@ -602,12 +602,31 @@ func _take_screenshot() -> void:
 		# instances. Complements VOX_PERF (which measures the emit/physics compute).
 		var gw := world as GpuWorld
 		var base := 100000
-		var cx := base + world.W * 0.5
-		var cz := base + world.D * 0.5
+		# window placement offsets (voxels): put the resident window over a
+		# specific feature (e.g. a lake shore) instead of the default site
+		var box := int(OS.get_environment("VOX_BASEOX").to_float())
+		var boz := int(OS.get_environment("VOX_BASEOZ").to_float())
+		var cx := base + box + world.W * 0.5
+		var cz := base + boz + world.D * 0.5
+		if OS.get_environment("VOX_FINDSEA") != "":
+			# ASCII relief probe around the window: ~ = sea basin, . = shore
+			# band, # = high ground. VOX_FINDSEA = step in voxels (e.g. 200 =
+			# +-2.6km fine scan, 1000 = +-13km coarse). Edge at +-W/2 offset.
+			var stp := maxi(OS.get_environment("VOX_FINDSEA").to_int(), 100)
+			for dz2 in range(-13 * stp, 13 * stp + 1, stp):
+				var row := ""
+				for dx2 in range(-13 * stp, 13 * stp + 1, stp):
+					var s2 := gw.surface_world_y(cx + dx2, cz + dz2)
+					row += "~" if s2 < 1534.0 else ("." if s2 < 1542.0 else "#")
+				print("FINDSEA z%+06d %s" % [dz2, row])
+		# camera-only offsets (voxels) from the window centre: aim test shots
+		# at specific features (e.g. a lake crossing the window edge)
+		cx += OS.get_environment("VOX_CAMOX").to_float()
+		cz += OS.get_environment("VOX_CAMOZ").to_float()
 		var surf := gw.surface_world_y(cx, cz)
-		gw.gen_oy = gw.band_oy_for(cx, cz)
-		gw.regen(base, base)
-		view.set_stream_origin(base, base)
+		gw.gen_oy = gw.band_oy_for(base + box + world.W * 0.5, base + boz + world.D * 0.5)
+		gw.regen(base + box, base + boz)
+		view.set_stream_origin(base + box, base + boz)
 		_freeze_cam = true
 		speed_mult = 0
 		world.set_rain_mm_hr(0.0)
@@ -618,6 +637,12 @@ func _take_screenshot() -> void:
 			# nadir check: straight down from altitude (surface texture/tint QA)
 			cam.position = Vector3(cx, surf + vy, cz) - ro
 			cam.look_at(Vector3(cx, surf, cz) - ro, Vector3(0, 0, 1))
+		elif vy > 0.0 and OS.get_environment("VOX_CAMPITCH") != "":
+			# oblique check: from vy above the local surface, pitched toward +z
+			var pit := deg_to_rad(OS.get_environment("VOX_CAMPITCH").to_float())
+			cam.position = Vector3(cx, surf + vy, cz) - ro
+			cam.look_at(Vector3(cx, surf + vy + tan(pit) * 1000.0, cz + 1000.0) - ro,
+					Vector3.UP)
 		elif vy > 0.0:
 			# vista check: rise high and look level at the horizon (far field)
 			cam.position = Vector3(cx, surf + vy, cz - 20.0) - ro
@@ -642,6 +667,8 @@ func _take_screenshot() -> void:
 			gw.update_heights()                            # heights for the new origin
 		var cnt: PackedInt32Array = gw.dispatch_emit()
 		view.set_visible_counts(cnt[0], cnt[1])
+		if OS.get_environment("VOX_NOPLANE") != "" and view.water_plane != null:
+			view.water_plane.visible = false      # bare-terrain debug shots
 		if gw.ray_render:
 			# time the ray pass itself (the per-frame cost of the ray renderer)
 			var bb := cam.global_transform.basis
@@ -669,6 +696,18 @@ func _take_screenshot() -> void:
 		var prims := RenderingServer.get_rendering_info(RenderingServer.RENDERING_INFO_TOTAL_PRIMITIVES_IN_FRAME)
 		print("FPSTEST: draw GPU %.2f ms/frame | CPU %.2f ms | %d instances | %.1fM primitives" \
 			% [gpu / N, cpu / N, cnt[0] + cnt[1], prims / 1e6])
+		if OS.get_environment("VOX_WATERDBG") != "":
+			# read back the smoothed surface texture: is the fluid level where
+			# the procedural sea (SEA_Y) thinks it is?
+			var td := gw.rd.texture_get_data(gw.terra_s_tex, 0)
+			for pt: Vector2i in [Vector2i(world.W / 2, world.D / 2),
+					Vector2i(world.W / 2, 4), Vector2i(4, world.D / 2),
+					Vector2i(world.W / 2, world.D - 5)]:
+				var off := (pt.y * world.W + pt.x) * 4
+				var rr := td.decode_half(off)
+				var gg := td.decode_half(off + 2)
+				print("WATERDBG (%d,%d): ground %.1f fluid %.1f (world %.1f/%.1f) SEA_Y %d gen_oy %d" \
+						% [pt.x, pt.y, rr, gg, rr + gw.gen_oy, gg + gw.gen_oy, 1536, gw.gen_oy])
 		get_viewport().get_texture().get_image().save_png("user://shot.png")
 		get_tree().quit()
 		return
