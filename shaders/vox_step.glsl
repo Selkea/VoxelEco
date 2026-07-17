@@ -1442,10 +1442,13 @@ void far_march(vec3 o, vec3 d, float tstart, int px, int py, uint id) {
 	for (int i = 0; i < 320; i++) {
 		float yw = wy0 + d.y * t;
 		if (t > FAR_RAY_END || (d.y >= 0.0 && yw > RELIEF)) { break; }
-		bool sm = t < 4000.0;   // smooth sampling near, block beyond
+		bool sm = t < 3000.0;   // smooth sampling near, block beyond
 		vec2 w = vec2(wx0 + d.x * t, wz0 + d.z * t);
 		float h = max(floor(far_h(w, sm)), SEA_Y);
 		if (yw < h) {
+			// local slope from the pre-bisection bracket (rise over run)
+			float slp = hp < 0.0 ? 0.0
+					: abs(h - hp) / max((t - tp) * max(length(vec2(d.x, d.z)), 1e-3), 1.0);
 			// the bracket [tp, t] crosses the surface: bisect to the crossing
 			for (int b = 0; b < 6; b++) {
 				float tm = (tp + t) * 0.5;
@@ -1466,11 +1469,11 @@ void far_march(vec3 o, vec3 d, float tstart, int px, int py, uint id) {
 			// stair lighting: a tread (top face) unless the crossing jumped
 			// more than a voxel — then it's a riser wall, horizontal normal
 			vec3 sdir = -normalize(cam_sun.xyz);
-			float ndl = max(sdir.y, 0.0);
-			if (!water && hp >= 0.0 && h - hp > (sm ? 1.5 : 21.0)) {
-				vec2 hn = normalize(vec2(-d.x, -d.z));
-				ndl = max(hn.x * sdir.x + hn.y * sdir.z, 0.0);
-			}
+			vec2 hn = normalize(vec2(-d.x, -d.z));
+			float ndl_top = max(sdir.y, 0.0);
+			float ndl_side = max(hn.x * sdir.x + hn.y * sdir.z, 0.0);
+			float ndl = water ? ndl_top
+					: mix(ndl_top, ndl_side, clamp(slp * 1.5, 0.0, 0.5));
 			vec3 lit = base * (vec3(0.28, 0.34, 0.50) + vec3(0.81, 0.79, 0.82) * ndl);
 			lit *= 0.98;
 			vec3 c = clamp((lit * (2.51 * lit + 0.03))
@@ -1480,7 +1483,7 @@ void far_march(vec3 o, vec3 d, float tstart, int px, int py, uint id) {
 		}
 		hp = h;
 		tp = t;
-		t += max(4.0, t * 0.025);
+		t += max(4.0, t * 0.04);
 	}
 	imageStore(out_img, ivec2(px, py), vec4(0.0));   // sky / far mesh beyond
 }
