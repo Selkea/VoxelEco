@@ -1368,7 +1368,11 @@ vec3 ray_shade(int cx, int cy, int cz, vec3 n, vec3 hit) {
 	uint raw = cget(cidx(bx, uint(cy), bz));
 	uint m = MAT(raw);
 	if (m == AIR) { m = SOIL; }
-	uint vid = bx + bz * p.W + uint(cy) * p.W * p.D;
+	// WORLD-anchored jitter id: slot-based ids reshuffled every voxel's tint
+	// each time the toroidal window advanced — a visible "pop" as terrain
+	// entered fine rendering. World coords keep every voxel's tint forever.
+	uint vid = (uint(cx) + p.gen_ox) ^ ((uint(cz) + p.gen_oz) << 11u)
+			^ ((uint(cy) + p.gen_oy) << 22u);
 	vec3 base;
 	if (m == WATER) {
 		// walk to the bed: tint by depth so shallows show the ground through
