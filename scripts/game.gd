@@ -614,7 +614,11 @@ func _take_screenshot() -> void:
 		world.run(40)
 		var ro := _render_off()
 		var vy := OS.get_environment("VOX_CAMY").to_float()
-		if vy > 0.0:
+		if vy > 0.0 and OS.get_environment("VOX_CAMDOWN") != "":
+			# nadir check: straight down from altitude (surface texture/tint QA)
+			cam.position = Vector3(cx, surf + vy, cz) - ro
+			cam.look_at(Vector3(cx, surf, cz) - ro, Vector3(0, 0, 1))
+		elif vy > 0.0:
 			# vista check: rise high and look level at the horizon (far field)
 			cam.position = Vector3(cx, surf + vy, cz - 20.0) - ro
 			cam.look_at(Vector3(cx, surf + vy * 0.6, cz + 8000.0) - ro, Vector3.UP)

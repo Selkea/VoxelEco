@@ -136,13 +136,15 @@ void vertex() {
 	VERTEX = vec3(VERTEX.x, h - MODEL_MATRIX[3].y, VERTEX.z);
 }
 
-// one speckle lattice level: hashed tint at a cell scale, fading in only once
-// the cells cover ~3 px (mirrors real per-voxel jitter averaging)
+// one speckle level: SMOOTH value noise at a cell scale, fading out once the
+// cells shrink toward a pixel. Constant-per-cell hash lattices were tried
+// first and their axis-aligned squares read as a checkerboard from altitude —
+// interpolated noise gives organic mottling at every viewing distance.
 float spek(vec2 w, float scale, float amp, float pxw, uint salt) {
 	float fade = clamp((scale / max(pxw, 1e-4) - 1.0) * 0.5, 0.0, 1.0);
-	uint h = pcg(uint(int(floor(w.x / scale))) * 2654435761u
-			^ uint(int(floor(w.y / scale))) * 40503u ^ salt);
-	return (float(h & 255u) / 255.0 - 0.5) * 2.0 * amp * fade;
+	if (fade <= 0.0) { return 0.0; }
+	vec2 q = w / scale + float(salt & 1023u) * 17.31;
+	return (vnoise(q) - 0.5) * 2.0 * amp * fade;
 }
 
 void fragment() {
