@@ -1406,9 +1406,14 @@ vec3 ray_shade(int cx, int cy, int cz, vec3 n, vec3 hit) {
 			stride *= 1.12;
 		}
 	}
-	// tone tuned against the PBR-lit far mesh (sky ambient + ACES): ambient
-	// lifted so the window/far boundary reads as one continuous surface
-	return base * (0.56 + 0.74 * ndl * sh);
+	// match the PBR pipeline that lights the far mesh: bluish sky ambient +
+	// warm sun (#fff2dd), then an ACES-fit tonemap — a colourless scalar here
+	// left the window a different HUE of green than the far field
+	vec3 lit = base * (vec3(0.30, 0.34, 0.40)
+			+ vec3(0.86, 0.79, 0.65) * (ndl * sh));
+	lit *= 0.98;
+	return clamp((lit * (2.51 * lit + 0.03)) / (lit * (2.43 * lit + 0.59) + 0.14),
+			0.0, 1.0);
 }
 
 // mode 16: one thread per pixel — march the ray through the heightfield.

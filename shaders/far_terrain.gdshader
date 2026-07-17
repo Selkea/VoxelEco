@@ -144,8 +144,8 @@ void fragment() {
 		// mat_color(GRASS) dimmed ~18%: the window's 5 cm voxels average darker
 		// (per-voxel jitter/AO/wetness), so straight grass albedo reads brighter
 		// than the terrain it continues — this meets the window in the middle
-		ALBEDO = vec3(0.086, 0.210, 0.052) * 0.74 * max(tint, 0.2);
+		ALBEDO = vec3(0.086, 0.210, 0.052) * 0.84 * max(tint, 0.2);
 		ROUGHNESS = 1.0;
-		SPECULAR = 0.1;
+		SPECULAR = 0.0;
 	}
 }
