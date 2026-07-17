@@ -37,8 +37,10 @@ layout(set = 0, binding = 13, rgba8) uniform restrict writeonly image2D out_img;
 // terrain/water vertex shaders (the sim is voxels; the render is a surface):
 // terra_img rg16f: r = solid ground top (local band Y, excl), g = fluid top
 // (ground incl. standing water); tcol_img: surface albedo of the top cell.
-layout(set = 0, binding = 16, rg16f) uniform restrict writeonly image2D terra_img;
+layout(set = 0, binding = 16, rg16f) uniform restrict image2D terra_img;
 layout(set = 0, binding = 17, rgba8) uniform restrict writeonly image2D tcol_img;
+// bilaterally smoothed copy of terra_img (mode 19) — what the meshes sample
+layout(set = 0, binding = 18, rg16f) uniform restrict writeonly image2D terra_s_img;
 layout(set = 0, binding = 1, std430) restrict buffer PackBuf { uint packed_out[]; };
 layout(set = 0, binding = 2, std430) restrict buffer StatsBuf { uint rained; uint evaporated; uint absorbed; };
 // Noita-style dirty tracking, one flag per 16x16-column mesh chunk: settled
@@ -1364,6 +1366,35 @@ void do_heights() {
 	imageStore(tcol_img, ivec2(int(lx), int(lz)), vec4(surf_color(raw, m, vid), 1.0));
 }
 
+// mode 19: bilateral smoothing of the world-mesh surface heights, terra_img ->
+// terra_s_img. Column tops are quantized to whole voxels, so the raw heights
+// render as bumpy micro-relief even through the shaders' smoothing spline. A
+// 9x9 gaussian (sigma 2 voxels) flattens +-1..2 voxel differences to
+// millimetres, while the RANGE weight excludes neighbours far away in height —
+// carved banks, channel walls and shorelines keep their edges. Ground (r) and
+// fluid (g) filter with independent range weights so lake levels stay put.
+void do_hsmooth() {
+	uint id = flat_id();
+	if (id >= p.W * p.D) { return; }
+	int x = int(id % p.W);
+	int z = int(id / p.W);
+	vec2 c = imageLoad(terra_img, ivec2(x, z)).rg;
+	vec2 acc = vec2(0.0);
+	vec2 wacc = vec2(0.0);
+	for (int dz = -4; dz <= 4; dz++) {
+		for (int dx = -4; dx <= 4; dx++) {
+			ivec2 q = ivec2(clamp(x + dx, 0, int(p.W) - 1), clamp(z + dz, 0, int(p.D) - 1));
+			vec2 n = imageLoad(terra_img, q).rg;
+			float g = exp(float(dx * dx + dz * dz) * (-1.0 / 8.0));
+			vec2 d = n - c;
+			vec2 w = g * exp(d * d * (-1.0 / 12.5));
+			acc += n * w;
+			wacc += w;
+		}
+	}
+	imageStore(terra_s_img, ivec2(x, z), vec4(acc / wacc, 0.0, 0.0));
+}
+
 // mode 15: per-tile max of the column heights (16x16 columns, the chunk grid)
 void do_hmax() {
 	uint cw = (p.W + CHUNK - 1u) / CHUNK;
@@ -1660,5 +1691,6 @@ void main() {
 	else if (mode == 16u) { do_raycast(); }
 	else if (mode == 17u) { do_compact(); }
 	else if (mode == 18u) { do_step_list(); }
+	else if (mode == 19u) { do_hsmooth(); }
 	else { do_step(); }
 }
