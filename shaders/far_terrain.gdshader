@@ -25,7 +25,6 @@ uniform float gen_oy = 0.0;
 #include "res://shaders/sim_surface.gdshaderinc"
 
 varying vec3 v_local;                    // local-frame position (displaced)
-varying float v_subm;                    // submersion: bed below the sea line
 varying vec3 v_nrm;                      // world-axis surface normal
 varying float v_simf;                    // sim-data weight at this vertex
 
@@ -55,9 +54,6 @@ void vertex() {
 	float f = sim_w(lp);
 	v_simf = f;
 	float h = terrain_h(lp, f);
-	// procedural beds below the sea line tint toward wet earth (the sim side
-	// bakes its own bed colours into tcol) — smooth ramp, ~4 vox to full
-	v_subm = clamp((SEA_Y - h) * 0.25, 0.0, 1.0) * (1.0 - f);
 	// finite-difference normals: a fine stride near the camera keeps shading
 	// faithful to small sim relief, but at grazing distance a fine stride
 	// tracks every residual 5 cm quantization step as contour banding — so
@@ -87,13 +83,21 @@ void fragment() {
 	NORMAL = normalize((VIEW_MATRIX * vec4(v_nrm, 0.0)).xyz) * (FRONT_FACING ? 1.0 : -1.0);
 	vec2 w = v_local.xz + origin;
 	vec3 proc = vec3(0.086, 0.210, 0.052);   // mat_color(GRASS)
+	// wet the procedural grass toward mud BELOW the sea line, BEFORE blending
+	// with the sim's baked bed colour. Applied after the sim/proc blend (and
+	// scaled by 1-f) it left the crossfade band showing dry green grass over
+	// submerged ground — a green square along the whole window rim, obvious
+	// underwater. Pre-wetting the proc endpoint makes a submerged blend band
+	// go mud->mud; at f=1 the sim colour wins so its own baked wet tone is
+	// untouched. Per-fragment (from v_local.y) also kills the old LoD facets.
+	float sub = clamp((SEA_Y - v_local.y) * 0.25, 0.0, 1.0);
+	proc = mix(proc, vec3(0.13, 0.085, 0.05), sub);
 	// smooth reconstruction of the baked column colors too: per-voxel hash
 	// jitter reads as surface roughness at travel height, so average it
 	// over the same ~2-voxel kernel (material boundaries only soften 10 cm)
 	vec3 alb = v_simf > 0.0
 			? mix(proc, sim_tex_smooth(sim_col, v_local.xz, win_size).rgb, v_simf)
 			: proc;
-	alb = mix(alb, vec3(0.13, 0.085, 0.05), v_subm);   // submerged wet earth
 	float pxw = length(VERTEX) * px_angle;
 	float tint = 1.0
 			+ spek(w, 1.0, 0.03, pxw, 0u)
