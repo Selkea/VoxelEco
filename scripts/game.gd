@@ -31,7 +31,11 @@ var _look := 0
 var _toon_mat: ShaderMaterial
 var _pixel_rect: ColorRect
 var _sun: DirectionalLight3D
-var _ray_size := Vector2i.ZERO   # ray output size at the last setup (resize check)
+var _ray_size := Vector2i.ZERO   # viewport size at the last ray setup (resize check)
+# ray supersampling: rays per axis vs viewport pixels; the linear-filtered
+# overlay downsamples = SSAA (the ray path has no MSAA). VOX_RAYSS overrides.
+var _ray_ss := maxf(OS.get_environment("VOX_RAYSS").to_float(), 1.0) \
+		if OS.get_environment("VOX_RAYSS") != "" else 2.0
 var fly_pos := Vector3()
 var fly_yaw := 0.0         # radians, mouse-look
 var fly_pitch := -0.5
@@ -248,7 +252,11 @@ func _ready() -> void:
 		print("center column materials (y 0->%d): %s" % [world.H - 1, col])
 		get_tree().quit()
 		return
-	if OS.get_environment("VOX_RENDER") == "ray":
+	# the ray-cast renderer is the interactive default (G toggles back to the
+	# instanced raster; VOX_RENDER=mesh/block/voxel starts on the raster path).
+	# Shots/tests keep the raster unless they opt in with VOX_RENDER=ray.
+	var rmode_env := OS.get_environment("VOX_RENDER")
+	if rmode_env == "ray" or (interactive and rmode_env == ""):
 		_set_ray(true)
 	if "--sim" in OS.get_cmdline_user_args():
 		_run_sim_test()
@@ -437,7 +445,7 @@ func _process(dt: float) -> void:
 		var gwr := world as GpuWorld
 		var vps := get_viewport().get_visible_rect().size
 		if Vector2i(int(vps.x), int(vps.y)) != _ray_size:
-			gwr.setup_raycast(int(vps.x), int(vps.y))
+			gwr.setup_raycast(int(vps.x * _ray_ss), int(vps.y * _ray_ss))
 			_ray_size = Vector2i(int(vps.x), int(vps.y))
 			view.set_ray_mode(true, gwr.ray_tex)
 		var b := cam.global_transform.basis
@@ -467,7 +475,7 @@ func _set_ray(on: bool) -> void:
 	gw.ray_render = on
 	if on:
 		var vps := get_viewport().get_visible_rect().size
-		gw.setup_raycast(int(vps.x), int(vps.y))
+		gw.setup_raycast(int(vps.x * _ray_ss), int(vps.y * _ray_ss))
 		_ray_size = Vector2i(int(vps.x), int(vps.y))
 		gw.update_heights()
 	view.set_ray_mode(on, gw.ray_tex)

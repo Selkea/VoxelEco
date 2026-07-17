@@ -1320,9 +1320,22 @@ void do_heights() {
 	uint z = id / p.W;
 	uint y = 0u;
 	while (y < p.H && MAT(cget(cidx(x, y, z))) != AIR) { y++; }
+	// true SKY TOP above the contiguous ground: airborne material (falling rain,
+	// avalanching grains) sits between ground and the column's top watermark.
+	// Scan down from the watermark to the first non-air cell and TIGHTEN the
+	// watermark while at it (in ray mode the emit walkers never visit window
+	// columns, so this is what keeps rained-on columns from pinning at H-1).
+	uint sky = y;                        // exclusive top of anything in the column
+	uint tm = min(topmark[z * p.W + x], p.H - 1u);
+	while (tm + 1u > y) {
+		if (MAT(cget(cidx(x, tm, z))) != AIR) { sky = tm + 1u; break; }
+		tm--;
+	}
+	topmark[z * p.W + x] = max(sky, 1u) - 1u;
 	uint lx = world_coord(x, p.gen_ox, p.W) - p.gen_ox;
 	uint lz = world_coord(z, p.gen_oz, p.D) - p.gen_oz;
-	heights[lz * p.W + lx] = y;
+	// packed: ground (exclusive) in the low 16 bits, sky top (exclusive) high
+	heights[lz * p.W + lx] = y | (sky << 16);
 }
 
 // mode 15: per-tile max of the column heights (16x16 columns, the chunk grid)
@@ -1336,10 +1349,61 @@ void do_hmax() {
 	for (uint j = 0u; j < CHUNK; j++) {
 		for (uint i = 0u; i < CHUNK; i++) {
 			uint x = min(x0 + i, p.W - 1u), z = min(z0 + j, p.D - 1u);
-			m = max(m, heights[z * p.W + x]);
+			m = max(m, heights[z * p.W + x] >> 16);   // sky top: covers airborne cells
 		}
 	}
 	hmax[id] = m;
+}
+
+// shade a ray hit: the cell's own colour (same jitter/wetness as the raster
+// emit), a heightfield sun-shadow march, and water rendered by looking down
+// through the column to its bed. Matches the raster look closely enough that
+// toggling G barely shifts the tone.
+vec3 ray_shade(int cx, int cy, int cz, vec3 n, vec3 hit) {
+	uint bx = (uint(cx) + p.gen_ox) % p.W;   // local -> buffer slot (torus)
+	uint bz = (uint(cz) + p.gen_oz) % p.D;
+	uint raw = cget(cidx(bx, uint(cy), bz));
+	uint m = MAT(raw);
+	if (m == AIR) { m = SOIL; }
+	uint vid = bx + bz * p.W + uint(cy) * p.W * p.D;
+	vec3 base;
+	if (m == WATER) {
+		// walk to the bed: tint by depth so shallows show the ground through
+		int by = cy;
+		while (by > 0 && MAT(cget(cidx(bx, uint(by - 1), bz))) == WATER) { by--; }
+		float depth = float(cy - by) + 1.0;
+		uint braw = by > 0 ? cget(cidx(bx, uint(by - 1), bz)) : BEDROCK;
+		uint bm = MAT(braw);
+		if (bm == AIR || bm == WATER) { bm = SOIL; }
+		vec3 bed = surf_color(braw, bm, vid) * 0.8;
+		base = mix(bed, vec3(0.016, 0.09, 0.24), 1.0 - exp(-depth * 0.30));
+	} else {
+		base = surf_color(raw, m, vid);
+	}
+	// sun shadow: march the heightfield toward the sun. Faces away from the sun
+	// skip it (their sun term is zero); the stride grows exponentially so distant
+	// occluders cost little (their shadows soften anyway).
+	vec3 sdir = -normalize(cam_sun.xyz);
+	float ndl = max(dot(n, sdir), 0.0);
+	float sh = 1.0;
+	if (ndl > 0.0 && sdir.y > 0.02) {
+		vec3 sp = hit + n * 0.06 + sdir * 0.5;
+		uint cw = (p.W + CHUNK - 1u) / CHUNK;
+		float st = 0.0;
+		float stride = 1.0;
+		for (int i = 0; i < 48; i++) {
+			vec3 q = sp + sdir * st;
+			if (q.x < 0.0 || q.x >= float(p.W) || q.z < 0.0 || q.z >= float(p.D)
+					|| q.y >= float(p.H)) { break; }
+			int qx = int(q.x), qz = int(q.z);
+			float hcol = float(heights[uint(qz) * p.W + uint(qx)] & 0xFFFFu);
+			if (q.y < hcol) { sh = 0.45; break; }
+			float hmx = float(hmax[uint(qz >> 4) * cw + uint(qx >> 4)]);
+			st += q.y > hmx + 1.0 ? max(16.0, stride) : stride;
+			stride *= 1.12;
+		}
+	}
+	return base * (0.42 + 0.72 * ndl * sh);
 }
 
 // mode 16: one thread per pixel — march the ray through the heightfield.
@@ -1409,44 +1473,52 @@ void do_raycast() {
 		}
 		// per-column test over this column's t-span [t, tNext]
 		float tNext = min(min(tmx, tmz), t1);
-		float h = float(heights[uint(cz) * p.W + uint(cx)]);
+		uint hv = heights[uint(cz) * p.W + uint(cx)];
+		float h = float(hv & 0xFFFFu);           // contiguous ground (exclusive)
+		float sky = float(hv >> 16);              // true top incl. airborne cells
+		// cross-section reveal: columns in front of the cut plane are open air
+		if ((uint(cz) + p.gen_oz) % p.D < p.cut_z) { h = 0.0; sky = 0.0; }
 		float y0 = o.y + d.y * t;
+		float yN = o.y + d.y * tNext;
 		if (y0 < h) {
 			// entered the column below its top: SIDE face hit at t (camera-in-
 			// ground start shades as a top so the screen never goes garbage)
 			int cy = clamp(int(floor(y0)), 0, int(p.H) - 1);
 			vec3 n = axis == 0 ? vec3(float(-sx), 0.0, 0.0)
 					: (axis == 2 ? vec3(0.0, 0.0, float(-sz)) : vec3(0.0, 1.0, 0.0));
-			uint bx = (uint(cx) + p.gen_ox) % p.W;   // local -> buffer slot (torus)
-			uint bz = (uint(cz) + p.gen_oz) % p.D;
-			uint raw = cget(cidx(bx, uint(cy), bz));
-			uint m = MAT(raw);
-			if (m == AIR) { m = SOIL; }
-			uint vid = bx + bz * p.W + uint(cy) * p.W * p.D;
-			vec3 base = m == WATER ? vec3(0.024, 0.13, 0.34) : surf_color(raw, m, vid);
-			float ndl = max(dot(n, -normalize(cam_sun.xyz)), 0.0);
-			vec3 c = base * (0.42 + 0.72 * ndl);
+			vec3 c = ray_shade(cx, cy, cz, n, o + d * t);
 			imageStore(out_img, ivec2(px, py), vec4(pow(c, vec3(1.0 / 2.2)), 1.0));
 			return;
 		}
-		if (d.y < 0.0) {
-			float yN = o.y + d.y * tNext;
-			if (yN < h) {
-				// crosses the top plane inside this column: TOP face hit
-				float tt = (h - o.y) / d.y;
-				int cy = clamp(int(h) - 1, 0, int(p.H) - 1);
-				uint bx = (uint(cx) + p.gen_ox) % p.W;   // local -> buffer slot (torus)
-				uint bz = (uint(cz) + p.gen_oz) % p.D;
-				uint raw = cget(cidx(bx, uint(cy), bz));
-				uint m = MAT(raw);
-				if (m == AIR) { m = SOIL; }
-				uint vid = bx + bz * p.W + uint(cy) * p.W * p.D;
-				vec3 base = m == WATER ? vec3(0.024, 0.13, 0.34) : surf_color(raw, m, vid);
-				float ndl = max(dot(vec3(0.0, 1.0, 0.0), -normalize(cam_sun.xyz)), 0.0);
-				vec3 c = base * (0.42 + 0.72 * ndl);
-				imageStore(out_img, ivec2(px, py), vec4(pow(c, vec3(1.0 / 2.2)), 1.0));
-				return;
+		// airborne material (falling rain / grains) between ground and sky top:
+		// sample the cells the ray actually crosses in this column (capped — a
+		// streak is 1-2 voxels; a steep span through a storm gets a sparse probe)
+		if (sky > h && min(y0, yN) < sky) {
+			int ya = clamp(int(floor(y0)), int(h), int(sky) - 1);
+			int yb = clamp(int(floor(yN)), int(h), int(sky) - 1);
+			int ystep = d.y < 0.0 ? -1 : 1;
+			if ((yb - ya) * ystep < 0) { yb = ya; }
+			int steps = min(abs(yb - ya) + 1, 16);
+			uint bx = (uint(cx) + p.gen_ox) % p.W;
+			uint bz = (uint(cz) + p.gen_oz) % p.D;
+			for (int i = 0; i < steps; i++) {
+				int cy = ya + i * ystep;
+				if (MAT(cget(cidx(bx, uint(cy), bz))) != AIR) {
+					vec3 n = axis == 0 ? vec3(float(-sx), 0.0, 0.0)
+							: (axis == 2 ? vec3(0.0, 0.0, float(-sz)) : vec3(0.0, 1.0, 0.0));
+					vec3 c = ray_shade(cx, cy, cz, n, o + d * (t + tNext) * 0.5);
+					imageStore(out_img, ivec2(px, py), vec4(pow(c, vec3(1.0 / 2.2)), 1.0));
+					return;
+				}
 			}
+		}
+		if (d.y < 0.0 && yN < h) {
+			// crosses the top plane inside this column: TOP face hit
+			int cy = clamp(int(h) - 1, 0, int(p.H) - 1);
+			float tt = (h - o.y) / d.y;
+			vec3 c = ray_shade(cx, cy, cz, vec3(0.0, 1.0, 0.0), o + d * tt);
+			imageStore(out_img, ivec2(px, py), vec4(pow(c, vec3(1.0 / 2.2)), 1.0));
+			return;
 		}
 		// advance to the next column
 		if (tmx < tmz) { t = tmx; cx += sx; tmx += dtx; axis = 0; }
