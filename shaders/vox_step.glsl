@@ -1369,10 +1369,11 @@ void do_heights() {
 // mode 19: bilateral smoothing of the world-mesh surface heights, terra_img ->
 // terra_s_img. Column tops are quantized to whole voxels, so the raw heights
 // render as bumpy micro-relief even through the shaders' smoothing spline. A
-// 9x9 gaussian (sigma 2 voxels) flattens +-1..2 voxel differences to
-// millimetres, while the RANGE weight excludes neighbours far away in height —
-// carved banks, channel walls and shorelines keep their edges. Ground (r) and
-// fluid (g) filter with independent range weights so lake levels stay put.
+// 15x15 gaussian (sigma 3.5 voxels) flattens few-voxel differences to
+// millimetres, while the RANGE weight (sigma 3.5) excludes neighbours far
+// away in height — carved banks, channel walls and shorelines keep their
+// edges. Ground (r) and fluid (g) filter with independent range weights so
+// lake levels stay put. Both sigmas are the smooth-vs-detail knob.
 void do_hsmooth() {
 	uint id = flat_id();
 	if (id >= p.W * p.D) { return; }
@@ -1381,13 +1382,13 @@ void do_hsmooth() {
 	vec2 c = imageLoad(terra_img, ivec2(x, z)).rg;
 	vec2 acc = vec2(0.0);
 	vec2 wacc = vec2(0.0);
-	for (int dz = -4; dz <= 4; dz++) {
-		for (int dx = -4; dx <= 4; dx++) {
+	for (int dz = -7; dz <= 7; dz++) {
+		for (int dx = -7; dx <= 7; dx++) {
 			ivec2 q = ivec2(clamp(x + dx, 0, int(p.W) - 1), clamp(z + dz, 0, int(p.D) - 1));
 			vec2 n = imageLoad(terra_img, q).rg;
-			float g = exp(float(dx * dx + dz * dz) * (-1.0 / 8.0));
+			float g = exp(float(dx * dx + dz * dz) * (-1.0 / 24.5));
 			vec2 d = n - c;
-			vec2 w = g * exp(d * d * (-1.0 / 12.5));
+			vec2 w = g * exp(d * d * (-1.0 / 24.5));
 			acc += n * w;
 			wacc += w;
 		}
