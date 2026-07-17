@@ -18,6 +18,9 @@ uniform bool terraced = false;           // gen_flags bit0 (T toggle)
 uniform vec2 win_min = vec2(1.0);
 uniform vec2 win_max = vec2(-1.0);       // min > max = no exclusion
 uniform float normal_step = 20.0;        // finite-difference step (voxels)
+// radians per screen pixel (2*tan(fov/2)/viewport_h), set by the game — used
+// to fade each speckle lattice as its cells go subpixel without derivatives
+uniform float px_angle = 0.0015;
 
 const float BLOCK_VOX = 20.0;
 const float RELIEF = 5120.0;
@@ -101,6 +104,15 @@ void vertex() {
 	VERTEX = vec3(VERTEX.x, y - MODEL_MATRIX[3].y, VERTEX.z);
 }
 
+// one speckle lattice level: hashed tint at a given cell scale, faded out as
+// the cells go subpixel (pxw = world voxels per pixel)
+float spek(vec2 w, float scale, float amp, float pxw, uint salt) {
+	float fade = clamp(scale / max(pxw, 1e-4) - 0.5, 0.0, 1.0);
+	uint h = pcg(uint(int(floor(w.x / scale))) * 2654435761u
+			^ uint(int(floor(w.y / scale))) * 40503u ^ salt);
+	return (float(h & 255u) / 255.0 - 0.5) * 2.0 * amp * fade;
+}
+
 void fragment() {
 	// the resident window draws itself — open a hole for it
 	if (v_local.x > win_min.x && v_local.x < win_max.x
@@ -117,14 +129,22 @@ void fragment() {
 		ROUGHNESS = 0.15;
 		SPECULAR = 0.6;
 	} else {
-		// grass with the same per-block tint jitter the far tiles used
-		uint hsh = pcg(uint(int(floor(w.x / BLOCK_VOX))) * 2654435761u
-				^ uint(int(floor(w.y / BLOCK_VOX))) * 40503u);
-		float jit = 1.0 + (float(hsh & 255u) / 255.0 * 0.24 - 0.12);
+		// multi-scale tint speckle matching the close-up per-voxel jitter: a
+		// hash lattice per scale (1 voxel, 25 cm, 1 m, 5 m), each fading out
+		// as its cells go subpixel. Near the window edge the mesh speckles
+		// per-voxel exactly like the real terrain; far hills keep a coarser
+		// grain instead of going flat.
+		// world voxels per screen pixel from view distance (no derivatives)
+		float pxw = length(VERTEX) * px_angle;
+		float tint = 1.0
+				+ spek(w, 1.0, 0.12, pxw, 0u)             // per-voxel (5 cm)
+				+ spek(w, 5.0, 0.10, pxw, 668265263u)     // 25 cm
+				+ spek(w, 20.0, 0.12, pxw, 1336530526u)   // per-block (1 m)
+				+ spek(w, 100.0, 0.07, pxw, 2004795789u); // 5 m (far hills)
 		// mat_color(GRASS) dimmed ~18%: the window's 5 cm voxels average darker
 		// (per-voxel jitter/AO/wetness), so straight grass albedo reads brighter
 		// than the terrain it continues — this meets the window in the middle
-		ALBEDO = vec3(0.086, 0.210, 0.052) * 0.82 * jit;
+		ALBEDO = vec3(0.086, 0.210, 0.052) * 0.74 * max(tint, 0.2);
 		ROUGHNESS = 1.0;
 		SPECULAR = 0.1;
 	}
