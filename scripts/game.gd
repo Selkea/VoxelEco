@@ -32,10 +32,11 @@ var _toon_mat: ShaderMaterial
 var _pixel_rect: ColorRect
 var _sun: DirectionalLight3D
 var _ray_size := Vector2i.ZERO   # viewport size at the last ray setup (resize check)
-# ray supersampling: rays per axis vs viewport pixels; the linear-filtered
-# overlay downsamples = SSAA (the ray path has no MSAA). VOX_RAYSS overrides.
+# ray supersampling: rays per axis vs viewport pixels (SSAA — the ray path has
+# no MSAA). DEFAULT 1: at 2 the displayed image comes out vertically shifted /
+# banded (display-path bug, under investigation) — VOX_RAYSS=2 to experiment.
 var _ray_ss := maxf(OS.get_environment("VOX_RAYSS").to_float(), 1.0) \
-		if OS.get_environment("VOX_RAYSS") != "" else 2.0
+		if OS.get_environment("VOX_RAYSS") != "" else 1.0
 var fly_pos := Vector3()
 var fly_yaw := 0.0         # radians, mouse-look
 var fly_pitch := -0.5
