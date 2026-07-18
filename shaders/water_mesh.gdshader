@@ -90,17 +90,21 @@ void fragment() {
 	if (v_wy - grd < 0.05) { discard; }
 	// deepen the blue with depth; shallows stay translucent over the bed
 	float dp = 1.0 - exp(-d * 0.10);
-	// ALPHA ramps from 0 at the waterline to near-opaque within ~1.5 voxels
-	// of depth. This does double duty: it feathers the very edge (no hard
-	// voxel-snapped shoreline, no slivers, and the faint films over dry
-	// sub-sea-level hollows vanish since their RAW depth is exactly 0), AND
-	// it keeps the lake reading as SOLID water. The old fixed 0.55 alpha
-	// floor left the whole shallow shelf half-transparent, so over the brown
-	// mud bed — meters wide on a gentle shelf — it smeared into a milky,
-	// sky-reflecting band up close. A quick ramp leaves only a thin
-	// translucent rim at the shore.
+	// ALPHA rises from 0 at the waterline toward near-opaque as depth grows.
+	// It feathers the very edge (no hard voxel-snapped shoreline, no slivers,
+	// and the faint films over dry sub-sea-level hollows vanish since their RAW
+	// depth is exactly 0) AND keeps the lake reading as SOLID water. Use a
+	// SMOOTH exponential approach, not a linear ramp into a clamp: the old
+	// clamp(d/1.5, 0, 0.95) saturated with a hard CORNER at d=1.5 voxels, and on
+	// a gently sloped shelf — where that corner spreads across many pixels up
+	// close — the slope break read as a distinct line ringing the shore (the bed
+	// abruptly stopped showing through there). The exponential has no knee
+	// anywhere, so the shelf fades into open water as one continuous gradient at
+	// every viewing distance; the rate keeps the translucent rim about as thin
+	// as the old ramp, so the milky half-transparent band the earlier 0.55 floor
+	// caused stays gone.
 	ALBEDO = mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34), dp);
-	ALPHA = clamp(d * (1.0 / 1.5), 0.0, 0.95);
+	ALPHA = 0.95 * (1.0 - exp(-d * 1.5));
 	ROUGHNESS = mix(0.08, 0.15, dp);
 	SPECULAR = mix(0.55, 0.4, dp);
 }
