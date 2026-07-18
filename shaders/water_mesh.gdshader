@@ -87,6 +87,15 @@ void fragment() {
 	// ground channel, so v_wy hugs (just under) the terrain and discards
 	// cleanly — no chording across dry hollows, no film over land. Raw depth
 	// stays for TINT only, where quantization is invisible.
+	// CRISP WATER EXTENT, matching the ray renderer (world-mesh / "ray off" must
+	// look like "ray on"): water exists only where the WORLDGEN surface is below
+	// the sea line, or the sim actually holds water in this column. The smoothed
+	// sim ground dips below the sea line near shores where worldgen is still above
+	// it, so without this the flat sea sheet films over coastal grass — thin
+	// translucent smears that flare at grazing angles and the ray path never draws
+	// (it reads water presence per pixel). draw is the RAW per-column sim depth.
+	float bed_wg = world_height(v_lp + origin);
+	if (bed_wg >= SEA_Y && draw < 0.5) { discard; }
 	if (v_wy - grd < 0.05) { discard; }
 	// deepen the blue with depth; shallows stay translucent over the bed
 	float dp = 1.0 - exp(-d * 0.10);
