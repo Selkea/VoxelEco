@@ -25,11 +25,6 @@ var _band_acc := 0.0       # throttle for the vertical-tracking band check
 var _lod_cam_last := Vector2(1e12, 1e12)   # camera pos at the last LOD emit
 var _emit_dir := Vector2.ZERO              # view direction at the last emit (cone)
 var _env: Environment
-# shader looks, cycled with V: 0 standard, 1 pixel-art, 2 toon, 3 toon+pixel
-const LOOK_NAMES := ["standard", "pixel", "toon", "retro"]
-var _look := 0
-var _toon_mat: ShaderMaterial
-var _pixel_rect: ColorRect
 var _sun: DirectionalLight3D
 var _ray_size := Vector2i.ZERO   # viewport size at the last ray setup (resize check)
 # ray supersampling: rays per axis vs viewport pixels (SSAA — the ray path has
@@ -53,7 +48,6 @@ func _init() -> void:
 	_add_action("cut", [KEY_C])
 	_add_action("genmode", [KEY_T])   # toggle blended / terraced worldgen
 	_add_action("render_toggle", [KEY_B])   # per-voxel <-> 1m blocks (voxel tops)
-	_add_action("look_cycle", [KEY_V])      # cycle shader looks: standard/pixel/toon/retro
 	_add_action("ray_toggle", [KEY_G])      # raster instances <-> ray-cast renderer
 	# creative fly controls (Minecraft-style): WASD move, Space/Shift up/down
 	_add_action("fly_fwd", [KEY_W])
@@ -164,40 +158,6 @@ func _ready() -> void:
 	sun.directional_shadow_max_distance = 340.0
 	add_child(sun)
 	_sun = sun
-
-	# --- shader looks (V cycles; env vars set the starting look/params) ---
-	# Both are built once here and toggled live: VOX_PIXEL=n / VOX_LEVELS=k /
-	# VOX_DITHER=0 configure the pixel-art post; VOX_TOON=1 starts cel-shaded;
-	# VOX_LOOK=0..3 picks the starting look directly.
-	if view.use_instances:
-		_toon_mat = ShaderMaterial.new()
-		_toon_mat.shader = load("res://shaders/toon_terrain.gdshader")
-		_toon_mat.set_shader_parameter("sun_dir", -sun.global_transform.basis.z)
-	var pm := ShaderMaterial.new()
-	pm.shader = load("res://shaders/pixel_post.gdshader")
-	if OS.get_environment("VOX_PIXEL") != "":
-		pm.set_shader_parameter("pixel_size", maxi(1, OS.get_environment("VOX_PIXEL").to_int()))
-	if OS.get_environment("VOX_LEVELS") != "":
-		pm.set_shader_parameter("levels", maxi(2, OS.get_environment("VOX_LEVELS").to_int()))
-	pm.set_shader_parameter("dither", OS.get_environment("VOX_DITHER") != "0")
-	if OS.get_environment("VOX_DITHERSTR") != "":
-		pm.set_shader_parameter("dither_strength", clampf(OS.get_environment("VOX_DITHERSTR").to_float(), 0.0, 1.0))
-	var lay := CanvasLayer.new()
-	lay.layer = 10   # above the ray-cast overlay so the pixel post covers it too
-	_pixel_rect = ColorRect.new()
-	_pixel_rect.set_anchors_preset(Control.PRESET_FULL_RECT)
-	_pixel_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_pixel_rect.material = pm
-	_pixel_rect.visible = false
-	lay.add_child(_pixel_rect)
-	add_child(lay)
-	if OS.get_environment("VOX_LOOK") != "":
-		_look = clampi(OS.get_environment("VOX_LOOK").to_int(), 0, 3)
-	else:
-		var px := OS.get_environment("VOX_PIXEL") != ""
-		var tn := OS.get_environment("VOX_TOON") != ""
-		_look = 3 if px and tn else (1 if px else (2 if tn else 0))
-	_apply_look()
 
 	cam = Camera3D.new()
 	# far plane covers the whole far-field vista (8 km rings + square corners)
@@ -417,9 +377,6 @@ func _process(dt: float) -> void:
 		var gw := world as GpuWorld
 		gw.block_render = not gw.block_render
 		_refresh_view(true)
-	if Input.is_action_just_pressed("look_cycle"):
-		_look = (_look + 1) % 4
-		_apply_look()
 	if Input.is_action_just_pressed("ray_toggle") and world is GpuWorld:
 		_set_ray(not (world as GpuWorld).ray_render)
 	if Input.is_action_just_pressed("restart"):
@@ -481,11 +438,13 @@ func _process(dt: float) -> void:
 		var sim_s := int(world.tick_count / TICK_RATE)
 		var genmode := "terraced" if (world is GpuWorld and (world as GpuWorld).gen_flags & 1) else "blended"
 		var rmode := "blocks" if (world is GpuWorld and (world as GpuWorld).block_render) else "voxels"
+		# which renderer is live (G toggles): ray-cast overlay vs the world mesh
+		var raymode := "ray on" if (world is GpuWorld and (world as GpuWorld).ray_render) else "ray off"
 		# pos + look are WORLD voxel coords / degrees — paste straight into the
 		# FPSTEST player-exact envs (VOX_PX/PY/PZ/YAW/PITCH) to reproduce a shot
 		DisplayServer.window_set_title("VoxelEco — %s | %s | %s | %s | sim %02d:%02d:%02d | %s | rain %d mm/h | %d fps | pos %d %d %d | yaw %d pitch %d" % [
 			"GPU" if world.gpu_ok else "CPU",
-			rmode, genmode, LOOK_NAMES[_look],
+			rmode, genmode, raymode,
 			sim_s / 3600, (sim_s / 60) % 60, sim_s % 60,
 			"paused" if speed_mult == 0 else str(speed_mult) + "x",
 			int(world.rain_mm_hr),
@@ -507,14 +466,6 @@ func _set_ray(on: bool) -> void:
 		gw.update_heights()
 	view.set_ray_mode(on, gw.ray_tex)
 	_refresh_view(true)   # re-emit: far-only in ray mode, full otherwise
-
-## apply the current shader look (V cycles): pixel-art post overlay on/off and
-## the terrain material swapped between standard PBR and the cel/toon shader
-func _apply_look() -> void:
-	if _pixel_rect != null:
-		_pixel_rect.visible = _look == 1 or _look == 3
-	if _toon_mat != null and view.use_instances:
-		view.solid_mm.material_override = _toon_mat if (_look == 2 or _look == 3) else view.solid_mat
 
 func _refresh_view(force := false) -> void:
 	if view.use_instances:
