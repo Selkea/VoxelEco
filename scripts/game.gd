@@ -643,8 +643,17 @@ func _take_screenshot() -> void:
 		view.set_stream_origin(base + box, base + boz)
 		_freeze_cam = true
 		speed_mult = 0
+		# warmup: default is a bare 40-step settle (procedural sea only). To
+		# reproduce a rain-FILLED sim lake like the interactive world, set
+		# VOX_RAIN (mm/hr) + VOX_WARMUP (steps) — e.g. rain 800 for 4000 steps
+		# pools real sim water into the basins before the shot.
+		var warm_rain := OS.get_environment("VOX_RAIN").to_float()
+		var warm_steps := OS.get_environment("VOX_WARMUP").to_int()
+		if warm_steps <= 0:
+			warm_steps = 40
+		world.set_rain_mm_hr(warm_rain)
+		world.run(warm_steps)
 		world.set_rain_mm_hr(0.0)
-		world.run(40)
 		var ro := _render_off()
 		var vy := OS.get_environment("VOX_CAMY").to_float()
 		if player:
