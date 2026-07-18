@@ -126,7 +126,16 @@ void fragment() {
 	// as the old ramp, so the milky half-transparent band the earlier 0.55 floor
 	// caused stays gone.
 	ALBEDO = mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34), dp);
-	ALPHA = 0.95 * (1.0 - exp(-d * 1.5));
+	// OPAQUE water with only a thin shoreline feather — matching the ray path,
+	// which writes one solid colour so shallows read as clean light blue instead
+	// of the bed showing through. The old translucent ramp (0.95*(1-exp(-d*1.5)))
+	// let the green bed bleed through the near-shore shallows, washing them into a
+	// broad pale band that foreshortened into a big smear at grazing angles — the
+	// lake "looked different when approaching". Depth still reads through COLOUR
+	// (light blue -> navy over dp, the SAME ramp the ray uses), so the lake keeps
+	// its shallow/deep gradient; only the bed dilution is gone. The exp feather
+	// still has no knee, so the waterline stays a soft continuous edge.
+	ALPHA = 1.0 - exp(-d * 5.0);
 	ROUGHNESS = mix(0.08, 0.15, dp);
 	SPECULAR = mix(0.55, 0.4, dp);
 }
