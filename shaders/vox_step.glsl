@@ -1413,6 +1413,17 @@ void do_hmax() {
 	hmax[id] = m;
 }
 
+// water SURFACE colour by depth (voxels). ONE ramp shared by the window ray
+// march (ray_shade) and the procedural far field (far_march) so the two never
+// disagree at the window edge — a mismatched deep tone there printed a hard
+// chevron seam where the resident window met the far water. Endpoints/rate
+// match water_mesh.gdshader (world-mesh path): light blue shallows deepening to
+// navy, e-folding over ~10 voxels.
+vec3 water_surf_color(float depth) {
+	return mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34),
+			1.0 - exp(-depth * 0.10));
+}
+
 // shade a ray hit: the cell's own colour (same jitter/wetness as the raster
 // emit), a heightfield sun-shadow march, and water rendered by looking down
 // through the column to its bed. Matches the raster look closely enough that
@@ -1430,15 +1441,14 @@ vec3 ray_shade(int cx, int cy, int cz, vec3 n, vec3 hit) {
 			^ ((uint(cy) + p.gen_oy) << 22u);
 	vec3 base;
 	if (m == WATER) {
-		// walk to the bed: tint by depth so shallows show the ground through
+		// walk down to the bed to measure depth, then the SHARED depth ramp
+		// (water_surf_color) so this window water is identical to the far water
+		// at the window edge — no seam. Opaque here (the ray writes one colour),
+		// so shallows read as light blue rather than showing the bed through.
 		int by = cy;
 		while (by > 0 && MAT(cget(cidx(bx, uint(by - 1), bz))) == WATER) { by--; }
 		float depth = float(cy - by) + 1.0;
-		uint braw = by > 0 ? cget(cidx(bx, uint(by - 1), bz)) : BEDROCK;
-		uint bm = MAT(braw);
-		if (bm == AIR || bm == WATER) { bm = SOIL; }
-		vec3 bed = surf_color(braw, bm, vid) * 0.8;
-		base = mix(bed, vec3(0.016, 0.09, 0.24), 1.0 - exp(-depth * 0.30));
+		base = water_surf_color(depth);
 	} else {
 		base = surf_color(raw, m, vid);
 	}
@@ -1524,12 +1534,15 @@ void far_march(vec3 o, vec3 d, float tstart, int px, int py, uint id) {
 			float r = float(pcg(id * 2246822519u) & 1023u) / 1023.0;
 			if (r >= (FAR_RAY_END - t) / 2000.0) { break; }
 			vec2 wh = vec2(wx0 + d.x * t, wz0 + d.z * t);
-			bool water = far_h(wh, t) < SEA_Y;
+			float bed_h = far_h(wh, t);
+			bool water = bed_h < SEA_Y;
 			uint hsh = pcg(uint(int(floor(wh.x))) * 2654435761u
 					^ uint(int(h)) * 40503u ^ uint(int(floor(wh.y))) * 668265263u);
 			float jit = water ? 1.0 : 1.0 + (float(hsh & 255u) / 255.0 * 0.24 - 0.12);
-			vec3 base = (water ? vec3(0.024, 0.13, 0.34)
-					: vec3(0.086, 0.210, 0.052)) * jit;
+			// water: SHARED depth ramp (surface at SEA_Y, bed at bed_h) so the far
+			// water matches the window water — no seam. grass keeps its jitter.
+			vec3 base = water ? water_surf_color(SEA_Y - bed_h)
+					: vec3(0.086, 0.210, 0.052) * jit;
 			// stair lighting: a tread (top face) unless the crossing jumped
 			// more than a voxel — then it's a riser wall, horizontal normal
 			vec3 sdir = -normalize(cam_sun.xyz);
