@@ -82,22 +82,32 @@ float spek(vec2 w, float scale, float amp, float pxw, uint salt) {
 void fragment() {
 	NORMAL = normalize((VIEW_MATRIX * vec4(v_nrm, 0.0)).xyz) * (FRONT_FACING ? 1.0 : -1.0);
 	vec2 w = v_local.xz + origin;
-	vec3 proc = vec3(0.086, 0.210, 0.052);   // mat_color(GRASS)
-	// wet the procedural grass toward mud BELOW the sea line, BEFORE blending
-	// with the sim's baked bed colour. Applied after the sim/proc blend (and
-	// scaled by 1-f) it left the crossfade band showing dry green grass over
-	// submerged ground — a green square along the whole window rim, obvious
-	// underwater. Pre-wetting the proc endpoint makes a submerged blend band
-	// go mud->mud; at f=1 the sim colour wins so its own baked wet tone is
-	// untouched. Per-fragment (from v_local.y) also kills the old LoD facets.
-	float sub = clamp((SEA_Y - v_local.y) * 0.25, 0.0, 1.0);
-	proc = mix(proc, vec3(0.13, 0.085, 0.05), sub);
-	// smooth reconstruction of the baked column colors too: per-voxel hash
-	// jitter reads as surface roughness at travel height, so average it
-	// over the same ~2-voxel kernel (material boundaries only soften 10 cm)
-	vec3 alb = v_simf > 0.0
-			? mix(proc, sim_tex_smooth(sim_col, v_local.xz, win_size).rgb, v_simf)
-			: proc;
+	vec3 grass = vec3(0.086, 0.210, 0.052);   // mat_color(GRASS)
+	vec3 mud   = vec3(0.13, 0.085, 0.05);
+	// BED colour to show wherever this ground is genuinely submerged: the sim's
+	// baked wet bed inside the window (smooth-reconstructed — per-voxel hash jitter
+	// reads as roughness at travel height, so average it over a ~2-voxel kernel),
+	// generic mud out in the procedural field. Near the window edge it blends
+	// mud->bed so a submerged rim never flips to dry green.
+	vec3 bed = v_simf > 0.0
+			? mix(mud, sim_tex_smooth(sim_col, v_local.xz, win_size).rgb, v_simf)
+			: mud;
+	// height of the water covering this column: sim fluid top inside the window,
+	// the sea line outside, crossfaded by the same weight terrain_h uses.
+	float wsurf = SEA_Y;
+	if (v_simf > 0.0) {
+		wsurf = mix(SEA_Y, sim_tex_smooth(sim_terra, v_local.xz, win_size).g + gen_oy, v_simf);
+	}
+	// grass EXCEPT where water actually covers this ground by more than ~1.5 voxels.
+	// Keying the bed colour on water DEPTH (not height below the sea line) matches
+	// the ray path — dry ground is always grass; bed shows only THROUGH water — and
+	// leaves the top ~1.5 voxels grass so the shoreline reads grass->water. The old
+	// height rule painted baked bed on EVERY column below the sea line, including the
+	// near-shore strip the translucent water mesh can't quite reach, so a bright mud
+	// rim rang the shore with the water visibly lifting above it. Per-fragment (from
+	// v_local.y) also kills the old LoD colour facets.
+	float mud_k = clamp((wsurf - v_local.y - 1.5) * 0.3, 0.0, 1.0);
+	vec3 alb = mix(grass, bed, mud_k);
 	float pxw = length(VERTEX) * px_angle;
 	float tint = 1.0
 			+ spek(w, 1.0, 0.03, pxw, 0u)

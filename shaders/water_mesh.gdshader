@@ -49,10 +49,19 @@ void vertex() {
 		// crack-free only because both sides are bit-identical SEA_Y
 		y = SEA_Y;
 	} else {
-		// dry columns keep the surface hugging the ground slightly below the
-		// terrain (fragments discard anyway) so shoreline tris don't stretch
-		y = hw.g + gen_oy - (sdep < 0.5 ? 0.35 : 0.0);
-		y = mix(y, SEA_Y, t);
+		// water LEVEL to relax toward the sea line across the apron. A WET sim
+		// column carries its own surface (a perched lake keeps a level above the
+		// sea); a DRY column has no water of its own, so the covering water is the
+		// SEA at SEA_Y — NOT the column's ground. Relaxing the dry GROUND toward
+		// SEA_Y instead lifted the sheet into a tall ramp wherever the window edge
+		// sat on land above the sea: the apron clamps to that high edge column and
+		// blends it down, standing the sea surface visibly above the flat lake and
+		// over the bed (the "lifting edge"). At a real shore the ground already
+		// sits at ~SEA_Y, so this matches the old hug there — it only changes the
+		// high-dry-land case. The tiny bias keeps dry columns just under the sea so
+		// they discard cleanly against ground at exactly the sea line.
+		float wlev = (sdep < 0.5) ? (SEA_Y - 0.35) : (hw.g + gen_oy);
+		y = mix(wlev, SEA_Y, t);
 	}
 	v_wy = y;
 	VERTEX = vec3(VERTEX.x, y - MODEL_MATRIX[3].y, VERTEX.z);
@@ -87,15 +96,19 @@ void fragment() {
 	// ground channel, so v_wy hugs (just under) the terrain and discards
 	// cleanly — no chording across dry hollows, no film over land. Raw depth
 	// stays for TINT only, where quantization is invisible.
-	// CRISP WATER EXTENT, matching the ray renderer (world-mesh / "ray off" must
-	// look like "ray on"): water exists only where the WORLDGEN surface is below
-	// the sea line, or the sim actually holds water in this column. The smoothed
-	// sim ground dips below the sea line near shores where worldgen is still above
-	// it, so without this the flat sea sheet films over coastal grass — thin
-	// translucent smears that flare at grazing angles and the ray path never draws
-	// (it reads water presence per pixel). draw is the RAW per-column sim depth.
-	float bed_wg = world_height(v_lp + origin);
-	if (bed_wg >= SEA_Y && draw < 0.5) { discard; }
+	// CRISP WATER EXTENT, agreeing with the TERRAIN's own waterline so the two
+	// meshes never disagree (world-mesh / "ray off" must look like "ray on"):
+	// water exists exactly where the DRAWN ground (grd — the same smoothed-inside,
+	// worldgen-outside height far_terrain rasterizes) sits below the sea line, or
+	// the sim actually holds water here. far_terrain paints submerged bed (mud)
+	// wherever grd < SEA_Y; gating the water on the SAME grd guarantees every
+	// browned strip is covered by water and no dry grass is filmed over. Testing
+	// worldgen height here instead left a band near shore where the smoothed bed
+	// had already dipped below the sea (terrain browned it) but worldgen had not
+	// (water discarded) — an exposed mud rim with the water visibly lifting above
+	// it. draw is the RAW per-column sim depth (sim lakes perched above the sea
+	// line stay through the draw>=0.5 escape).
+	if (grd >= SEA_Y && draw < 0.5) { discard; }
 	if (v_wy - grd < 0.05) { discard; }
 	// deepen the blue with depth; shallows stay translucent over the bed
 	float dp = 1.0 - exp(-d * 0.10);
@@ -113,7 +126,16 @@ void fragment() {
 	// as the old ramp, so the milky half-transparent band the earlier 0.55 floor
 	// caused stays gone.
 	ALBEDO = mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34), dp);
-	ALPHA = 0.95 * (1.0 - exp(-d * 1.5));
+	// OPAQUE water with only a thin shoreline feather — matching the ray path,
+	// which writes one solid colour so shallows read as clean light blue instead
+	// of the bed showing through. The old translucent ramp (0.95*(1-exp(-d*1.5)))
+	// let the green bed bleed through the near-shore shallows, washing them into a
+	// broad pale band that foreshortened into a big smear at grazing angles — the
+	// lake "looked different when approaching". Depth still reads through COLOUR
+	// (light blue -> navy over dp, the SAME ramp the ray uses), so the lake keeps
+	// its shallow/deep gradient; only the bed dilution is gone. The exp feather
+	// still has no knee, so the waterline stays a soft continuous edge.
+	ALPHA = 1.0 - exp(-d * 5.0);
 	ROUGHNESS = mix(0.08, 0.15, dp);
 	SPECULAR = mix(0.55, 0.4, dp);
 }
