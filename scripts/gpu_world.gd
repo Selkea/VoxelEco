@@ -85,6 +85,9 @@ const SEA_Y := 1536         # RELIEF * 0.30
 # analytic-erosion strength (see _fbm_erode / the shaders' ERODE_K). MUST match
 # worldgen.gdshaderinc and vox_step.glsl or the CPU band placement drifts.
 const ERODE_K := 18.0
+# continental domain-warp amplitude (continental-noise cells) — MUST match the
+# shaders' WARP_A. Bends the value-noise lattice so erosion doesn't print a grid.
+const WARP_A := 1.6
 
 ## grids past this size generate on the GPU instead of a GDScript loop
 const CPU_GEN_LIMIT := 400_000
@@ -380,7 +383,15 @@ func _block_height(bcx: float, bcz: float) -> float:
 	# erode ONLY the continental term (see the shaders' block_height): its grid is
 	# at the ~21 km wavelength = imperceptible; hill/detail stay plain fbm so their
 	# fine erosion grids don't print as axis-aligned brickwork.
-	var cn := _fbm_erode(wx / (21000.0 / k) + sx, wz / (21000.0 / k) + sz, ek) - 0.5
+	var wcx := wx / (21000.0 / k) + sx
+	var wcz := wz / (21000.0 / k) + sz
+	# domain warp — compute BOTH offsets from the ORIGINAL wc (matches the GLSL
+	# vec2 += that reads wc before assigning), else the CPU mirror drifts.
+	var dwx := (_fbm(wcx * 1.9 + 5.2, wcz * 1.9 + 5.2) - 0.5) * WARP_A
+	var dwz := (_fbm(wcx * 1.9 + 13.9, wcz * 1.9 + 13.9) - 0.5) * WARP_A
+	wcx += dwx
+	wcz += dwz
+	var cn := _fbm_erode(wcx, wcz, ek) - 0.5
 	var chunk := cn * (1.0 + 2.0 * absf(cn))
 	var hill := _fbm(wx / (2700.0 / k) + sx * 2.0 + 31.7, wz / (2700.0 / k) + sz * 2.0 + 31.7) - 0.5
 	var det := _fbm(wx / (600.0 / k) + sx * 4.0 + 91.3, wz / (600.0 / k) + sz * 4.0 + 91.3) - 0.5
