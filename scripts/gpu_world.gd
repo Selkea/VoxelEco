@@ -84,7 +84,7 @@ const RELIEF := 5120        # 256 m at 5 cm/voxel
 const SEA_Y := 1536         # RELIEF * 0.30
 # analytic-erosion strength (see _fbm_erode / the shaders' ERODE_K). MUST match
 # worldgen.gdshaderinc and vox_step.glsl or the CPU band placement drifts.
-const ERODE_K := 3.0
+const ERODE_K := 18.0
 
 ## grids past this size generate on the GPU instead of a GDScript loop
 const CPU_GEN_LIMIT := 400_000
@@ -347,9 +347,12 @@ func _fbm_erode(qx: float, qy: float, kk: float) -> float:
 	var dy := 0.0
 	for o in range(4):
 		var n := _vnoise_d(qx, qy)
+		# damp by the slope from COARSER octaves ONLY (accumulate AFTER using it) —
+		# see the GLSL fbm_erode: damping an octave by its own axis-aligned value-noise
+		# gradient prints a lattice grid. MUST match the shaders.
+		v += amp * n.x / (1.0 + kk * (dx * dx + dy * dy))
 		dx += n.y
 		dy += n.z
-		v += amp * n.x / (1.0 + kk * (dx * dx + dy * dy))
 		qx *= 2.03
 		qy *= 2.03
 		amp *= 0.5
@@ -374,10 +377,13 @@ func _block_height(bcx: float, bcz: float) -> float:
 	var sz := float((seed_value >> 16) & 0xFFFF) * 0.618
 	var k := terrain_steep
 	var ek := erode_k
+	# erode ONLY the continental term (see the shaders' block_height): its grid is
+	# at the ~21 km wavelength = imperceptible; hill/detail stay plain fbm so their
+	# fine erosion grids don't print as axis-aligned brickwork.
 	var cn := _fbm_erode(wx / (21000.0 / k) + sx, wz / (21000.0 / k) + sz, ek) - 0.5
 	var chunk := cn * (1.0 + 2.0 * absf(cn))
-	var hill := _fbm_erode(wx / (2700.0 / k) + sx * 2.0 + 31.7, wz / (2700.0 / k) + sz * 2.0 + 31.7, ek) - 0.5
-	var det := _fbm_erode(wx / (600.0 / k) + sx * 4.0 + 91.3, wz / (600.0 / k) + sz * 4.0 + 91.3, ek) - 0.5
+	var hill := _fbm(wx / (2700.0 / k) + sx * 2.0 + 31.7, wz / (2700.0 / k) + sz * 2.0 + 31.7) - 0.5
+	var det := _fbm(wx / (600.0 / k) + sx * 4.0 + 91.3, wz / (600.0 / k) + sz * 4.0 + 91.3) - 0.5
 	return float(RELIEF) * (0.5 + chunk * 0.44 + hill * 0.06 + det * 0.02)
 
 ## terrain surface world-Y (voxels) at world column (wx, wz) — blended mode
