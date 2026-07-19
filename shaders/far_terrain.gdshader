@@ -10,7 +10,7 @@
 // Shaded PBR: the engine's sun/sky/ACES/shadows light everything uniformly.
 // Units are VOXELS in the local render frame; Y is world-Y voxels.
 shader_type spatial;
-render_mode cull_disabled;
+render_mode cull_back;
 
 uniform float px_angle = 0.0015;         // radians per screen pixel (speckle fade)
 // sim window surface data (Texture2DRD): r = solid ground top, g = fluid top,
