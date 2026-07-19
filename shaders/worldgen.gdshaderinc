@@ -43,12 +43,58 @@ float fbm(vec2 q) {
 	return v;
 }
 
+// analytic-erosion strength — MUST match gpu_world.gd ERODE_K and vox_step.glsl
+// or the sim band mis-places against this render surface.
+const float ERODE_K = 3.0;
+
+// value noise WITH gradient: (value, d/dx, d/dy) in q-space. Smoothstep weight
+// u = f*f*(3-2f) has derivative du = 6*f*(1-f); the bilinear mix expands to
+// a + k1*ux + k2*uy + k3*ux*uy, whose partials are closed-form. Value channel
+// equals vnoise. Keep bit-identical to gpu_world.gd _vnoise_d.
+vec3 vnoise_d(vec2 q) {
+	vec2 i = floor(q);
+	vec2 f = q - i;
+	vec2 u = f * f * (3.0 - 2.0 * f);
+	vec2 du = 6.0 * f * (1.0 - f);
+	float a = vhash(i);
+	float b = vhash(i + vec2(1.0, 0.0));
+	float c = vhash(i + vec2(0.0, 1.0));
+	float d = vhash(i + vec2(1.0, 1.0));
+	float k1 = b - a;
+	float k2 = c - a;
+	float k3 = a - b - c + d;
+	float val = a + k1 * u.x + k2 * u.y + k3 * u.x * u.y;
+	float gx = du.x * (k1 + k3 * u.y);
+	float gy = du.y * (k2 + k3 * u.x);
+	return vec3(val, gx, gy);
+}
+
+// derivative-damped fbm = ANALYTIC hydraulic erosion (iq / de Carpentier): each
+// octave is divided by (1 + k*|accumulated slope|^2), so already-steep flanks
+// suppress the finer octaves — valleys flatten/widen and ridges stay sharp,
+// breaking plain fbm's fake up/down symmetry. Stays a pure function of world
+// coords (no stateful droplet pass), so it streams seamlessly and evaluates the
+// same here, in the sim, and in the CPU mirror. k=0 == plain fbm.
+float fbm_erode(vec2 q, float k) {
+	float v = 0.0;
+	float amp = 0.5;
+	vec2 d = vec2(0.0);
+	for (int o = 0; o < 4; o++) {
+		vec3 n = vnoise_d(q);
+		d += n.yz;
+		v += amp * n.x / (1.0 + k * dot(d, d));
+		q *= 2.03;
+		amp *= 0.5;
+	}
+	return v;
+}
+
 float block_height(vec2 bc, vec2 s) {
 	vec2 w = bc * BLOCK_VOX;
-	float cn = fbm(w / 21000.0 + s) - 0.5;
+	float cn = fbm_erode(w / 21000.0 + s, ERODE_K) - 0.5;
 	float chunk = cn * (1.0 + 2.0 * abs(cn));
-	float hill = fbm(w / 2700.0 + s * 2.0 + 31.7) - 0.5;
-	float det = fbm(w / 600.0 + s * 4.0 + 91.3) - 0.5;
+	float hill = fbm_erode(w / 2700.0 + s * 2.0 + 31.7, ERODE_K) - 0.5;
+	float det = fbm_erode(w / 600.0 + s * 4.0 + 91.3, ERODE_K) - 0.5;
 	return RELIEF * (0.5 + chunk * 0.44 + hill * 0.06 + det * 0.02);
 }
 
