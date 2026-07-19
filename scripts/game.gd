@@ -22,7 +22,8 @@ var _title_acc := 0.0
 var interactive := false
 var _freeze_cam := false   # non-interactive shots that set their own camera
 var _band_acc := 0.0       # throttle for the vertical-tracking band check
-var _lod_cam_last := Vector2(1e12, 1e12)   # camera pos at the last LOD emit
+var _lod_cam_last := Vector2(1e12, 1e12)   # camera XZ at the last LOD emit
+var _lod_cam_y := 1e12                      # camera Y at the last LOD emit (3D LOD)
 var _emit_dir := Vector2.ZERO              # view direction at the last emit (cone)
 var _env: Environment
 var _sun: DirectionalLight3D
@@ -483,7 +484,12 @@ func _refresh_view(force := false) -> void:
 				lc = Vector3(gw.gen_origin_x + world.W * 0.5, 0.0, gw.gen_origin_z + world.D * 0.5)
 			gw.lod_cx = maxi(0, int(lc.x) - gw.gen_origin_x)
 			gw.lod_cz = maxi(0, int(lc.z) - gw.gen_origin_z)
-			if Vector2(lc.x, lc.z).distance_to(_lod_cam_last) > 40.0:   # 2 m
+			# camera height above the ground below it: the fine-LOD disc is a 3D
+			# sphere, so climbing collapses the view to coarse blocks instead of
+			# pinning a full-detail patch under a high camera.
+			gw.lod_cy = maxi(0, int(lc.y) - int(gw.surface_world_y(lc.x, lc.z)))
+			if Vector2(lc.x, lc.z).distance_to(_lod_cam_last) > 40.0 \
+					or absf(lc.y - _lod_cam_y) > 40.0:   # 2 m horizontal OR vertical
 				force = true
 			# camera-cone emit culling: only geometry near the view cone is
 			# emitted; turning past the margin forces a re-emit. Steep pitches
@@ -506,6 +512,7 @@ func _refresh_view(force := false) -> void:
 						force = true
 			if force or world.any_dirty_and_clear():
 				_lod_cam_last = Vector2(lc.x, lc.z)
+				_lod_cam_y = lc.y
 				_emit_dir = gw.cone_dir
 				if gw.ray_render or gw.world_mesh:
 					gw.update_heights()   # rays read the heightfield; refresh with the sim
@@ -633,6 +640,7 @@ func _take_screenshot() -> void:
 		RenderingServer.viewport_set_measure_render_time(vprid, true)
 		gw.lod_cx = maxi(0, int(cx) - gw.gen_origin_x)     # LOD near disc at the camera
 		gw.lod_cz = maxi(0, int(cz - 20.0) - gw.gen_origin_z)
+		gw.lod_cy = maxi(0, int(cam.position.y + ro.y) - int(surf))   # 3D LOD: camera height
 		if OS.get_environment("VOX_CONE") != "0":
 			# camera-cone emit culling, same margin the interactive path uses
 			var fw := -cam.global_transform.basis.z

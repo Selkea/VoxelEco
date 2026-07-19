@@ -564,6 +564,7 @@ var cone_cos := -2.0
 # (local render frame); coarser 1m block quads beyond. 0 = LOD off (all fine).
 var lod_cx := 0
 var lod_cz := 0
+var lod_cy := 0    # camera height above the local surface (voxels): 3D LOD disc
 var lod_r := 0
 # far field: render-only terrain from the worldgen heightfield out to 8 km,
 # in 3 clip-rings around the camera (see do_far_emit). Rings dispatch side^2
@@ -616,7 +617,7 @@ func _pc(mode: int, offset: int) -> PackedByteArray:
 	pc.encode_float(96, cone_dir.x)    # camera-cone emit culling
 	pc.encode_float(100, cone_dir.y)
 	pc.encode_float(104, cone_cos)
-	pc.encode_u32(108, 0)
+	pc.encode_u32(108, lod_cy)          # camera height above surface (3D LOD)
 	return pc
 
 func step() -> void:
