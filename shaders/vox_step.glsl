@@ -116,7 +116,11 @@ layout(push_constant) uniform Params {
 	// cosine of the cull half-angle (view half-FOV + a generous turn/shadow
 	// margin). Emit passes skip geometry outside the cone; the game re-emits
 	// as the camera turns. cone_cos <= -1.5 disables (tests, shots, top-down).
-	float cone_x; float cone_z; float cone_cos; uint pc_pad;
+	float cone_x; float cone_z; float cone_cos;
+	// camera height above the local surface (voxels): the fine-LOD disc is a 3D
+	// sphere around the eye, so climbing pushes the whole view to coarse blocks
+	// instead of keeping a full-detail patch pinned under a high camera.
+	uint lod_cy;
 } p;
 
 // route a linear cell index to its buffer (see CellsBuf2/3). Spatially adjacent
@@ -679,7 +683,8 @@ void do_face_emit() {
 	if (p.lod_r > 0u) {
 		float ddx = wx - float(p.lod_cx);
 		float ddz = wz - float(p.lod_cz);
-		if (ddx * ddx + ddz * ddz > float(p.lod_r) * float(p.lod_r)) { return; }
+		float cy = float(p.lod_cy);   // 3D distance: high camera => no fine disc
+		if (ddx * ddx + ddz * ddz + cy * cy > float(p.lod_r) * float(p.lod_r)) { return; }
 		if (cone_out(ddx, ddz, 400.0)) { return; }   // 20 m always-emit bubble
 	}
 	uint buried = 0u;
@@ -1006,8 +1011,9 @@ void do_lod_emit() {
 	// lod_r - 28 (one block + margin of overlap into the fine region)
 	float ddx = (wx0 + 10.0) - float(p.lod_cx);
 	float ddz = (wz0 + 10.0) - float(p.lod_cz);
+	float cy = float(p.lod_cy);   // match do_face_emit's 3D disc so no gap/overlap opens
 	float rr = max(float(p.lod_r) - 28.0, 0.0);
-	if (ddx * ddx + ddz * ddz < rr * rr) { return; }
+	if (ddx * ddx + ddz * ddz + cy * cy < rr * rr) { return; }
 	if (cone_out(ddx, ddz, 400.0)) { return; }
 	uvec3 bt = lod_top(bx, bz);
 	uint top = bt.x;
