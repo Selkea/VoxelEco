@@ -82,6 +82,9 @@ var gen_oy := 0
 # and SEA_Y. The surface spans [0, RELIEF]; only a p.H-tall band is ever resident.
 const RELIEF := 5120        # 256 m at 5 cm/voxel
 const SEA_Y := 1536         # RELIEF * 0.30
+# analytic-erosion strength (see _fbm_erode / the shaders' ERODE_K). MUST match
+# worldgen.gdshaderinc and vox_step.glsl or the CPU band placement drifts.
+const ERODE_K := 3.0
 
 ## grids past this size generate on the GPU instead of a GDScript loop
 const CPU_GEN_LIMIT := 400_000
@@ -305,6 +308,53 @@ func _fbm(qx: float, qy: float) -> float:
 		amp *= 0.5
 	return v
 
+# analytic value noise WITH gradient: returns (value, d/dx, d/dy) in q-space.
+# The smoothstep weight u = f*f*(3-2f) has derivative du = 6*f*(1-f); expanding
+# the bilinear mix as a+k1*ux+k2*uy+k3*ux*uy gives the two partials in closed
+# form. Value channel is identical to _vnoise. MUST match the GLSL vnoise_d.
+func _vnoise_d(qx: float, qy: float) -> Vector3:
+	var ix := floorf(qx)
+	var iy := floorf(qy)
+	var fx := qx - ix
+	var fy := qy - iy
+	var ux := fx * fx * (3.0 - 2.0 * fx)
+	var uy := fy * fy * (3.0 - 2.0 * fy)
+	var dux := 6.0 * fx * (1.0 - fx)
+	var duy := 6.0 * fy * (1.0 - fy)
+	var a := _vhash(ix, iy)
+	var b := _vhash(ix + 1.0, iy)
+	var c := _vhash(ix, iy + 1.0)
+	var d := _vhash(ix + 1.0, iy + 1.0)
+	var k1 := b - a
+	var k2 := c - a
+	var k3 := a - b - c + d
+	var val := a + k1 * ux + k2 * uy + k3 * ux * uy
+	var gx := dux * (k1 + k3 * uy)
+	var gy := duy * (k2 + k3 * ux)
+	return Vector3(val, gx, gy)
+
+# derivative-damped fbm = ANALYTIC hydraulic erosion (iq / de Carpentier). Each
+# octave is divided by (1 + kk*|accumulated slope|^2), so where the surface is
+# already steep the finer octaves are suppressed — flanks flatten into valleys
+# and ridge crests stay sharp, breaking plain fbm's fake up/down symmetry
+# without any stateful droplet pass (stays a pure function of world coords, so
+# it evaluates the same in-shader and streams seamlessly). kk=0 == plain _fbm.
+# MUST match the GLSL fbm_erode exactly or the CPU band placement drifts.
+func _fbm_erode(qx: float, qy: float, kk: float) -> float:
+	var v := 0.0
+	var amp := 0.5
+	var dx := 0.0
+	var dy := 0.0
+	for o in range(4):
+		var n := _vnoise_d(qx, qy)
+		dx += n.y
+		dy += n.z
+		v += amp * n.x / (1.0 + kk * (dx * dx + dy * dy))
+		qx *= 2.03
+		qy *= 2.03
+		amp *= 0.5
+	return v
+
 # terrain_steep multiplies steepness on top of the shipped baseline (1.0 = shipped
 # "gentle-plus"): higher packs ridges & valleys closer together = steeper per view.
 # At 1.0 the wavelengths below MUST match the shader's block_height exactly, or the
@@ -312,16 +362,22 @@ func _fbm(qx: float, qy: float) -> float:
 # overview, VOX_RELIEFSHOT — it does not change the shader gen).
 var terrain_steep := 1.0
 
+# analytic-erosion strength (see _fbm_erode). MUST match the shaders' ERODE_K
+# const or the CPU band placement drifts from the GPU surface. VOX_ERODE (relief
+# preview) overrides this for tuning sweeps only.
+var erode_k := ERODE_K
+
 func _block_height(bcx: float, bcz: float) -> float:
 	var wx := bcx * 20.0
 	var wz := bcz * 20.0
 	var sx := float(seed_value & 0xFFFF) * 0.618
 	var sz := float((seed_value >> 16) & 0xFFFF) * 0.618
 	var k := terrain_steep
-	var cn := _fbm(wx / (21000.0 / k) + sx, wz / (21000.0 / k) + sz) - 0.5
+	var ek := erode_k
+	var cn := _fbm_erode(wx / (21000.0 / k) + sx, wz / (21000.0 / k) + sz, ek) - 0.5
 	var chunk := cn * (1.0 + 2.0 * absf(cn))
-	var hill := _fbm(wx / (2700.0 / k) + sx * 2.0 + 31.7, wz / (2700.0 / k) + sz * 2.0 + 31.7) - 0.5
-	var det := _fbm(wx / (600.0 / k) + sx * 4.0 + 91.3, wz / (600.0 / k) + sz * 4.0 + 91.3) - 0.5
+	var hill := _fbm_erode(wx / (2700.0 / k) + sx * 2.0 + 31.7, wz / (2700.0 / k) + sz * 2.0 + 31.7, ek) - 0.5
+	var det := _fbm_erode(wx / (600.0 / k) + sx * 4.0 + 91.3, wz / (600.0 / k) + sz * 4.0 + 91.3, ek) - 0.5
 	return float(RELIEF) * (0.5 + chunk * 0.44 + hill * 0.06 + det * 0.02)
 
 ## terrain surface world-Y (voxels) at world column (wx, wz) — blended mode

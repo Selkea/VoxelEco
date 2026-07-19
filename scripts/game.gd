@@ -697,6 +697,8 @@ func _take_screenshot() -> void:
 		# how tightly ridges/valleys are packed (1 = shipped/gentle).
 		var gw := world as GpuWorld
 		gw.terrain_steep = float(OS.get_environment("VOX_STEEP")) if OS.get_environment("VOX_STEEP") != "" else 1.0
+		if OS.get_environment("VOX_ERODE") != "":
+			gw.erode_k = float(OS.get_environment("VOX_ERODE"))   # analytic-erosion sweep
 		_freeze_cam = true
 		speed_mult = 0
 		view.visible = false                               # hide the band's multimesh
