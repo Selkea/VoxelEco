@@ -125,7 +125,21 @@ void fragment() {
 	// every viewing distance; the rate keeps the translucent rim about as thin
 	// as the old ramp, so the milky half-transparent band the earlier 0.55 floor
 	// caused stays gone.
-	ALBEDO = mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34), dp);
+	// water BODY colour: light-blue shallows deepening to navy over the depth ramp.
+	vec3 body = mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34), dp);
+	// FRESNEL sky reflection (Schlick, de Greve 2006 — see Learning/): a water/air
+	// interface reflects almost nothing looking straight down (R0≈0.02, you see the
+	// body colour) and rises to a near-mirror at grazing angles (reflecting the sky).
+	// cosT is the view elevation against the ~horizontal surface — world-up is robust
+	// to the water grid's coarse normals, and the floating-origin offset cancels in a
+	// direction (camera − fragment). This is what makes distant water read as bright
+	// sky and near water as deep blue, the physically-correct version of "grazing
+	// water looks different". SKY_TINT ≈ the ProceduralSky horizon.
+	vec3 wpos = (INV_VIEW_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	float cosT = clamp(normalize(INV_VIEW_MATRIX[3].xyz - wpos).y, 0.0, 1.0);
+	float fres = 0.02 + 0.98 * pow(1.0 - cosT, 5.0);
+	const vec3 SKY_TINT = vec3(0.62, 0.76, 0.92);
+	ALBEDO = mix(body, SKY_TINT, fres);
 	// OPAQUE water with only a thin shoreline feather — matching the ray path,
 	// which writes one solid colour so shallows read as clean light blue instead
 	// of the bed showing through. The old translucent ramp (0.95*(1-exp(-d*1.5)))
