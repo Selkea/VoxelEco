@@ -1087,6 +1087,10 @@ float fbm(vec2 q) {
 // analytic-erosion strength — MUST match gpu_world.gd ERODE_K and
 // worldgen.gdshaderinc or the sim band mis-places against the render surface.
 const float ERODE_K = 18.0;
+// continental domain-warp amplitude (continental-noise cells) — MUST match the
+// other two mirrors. Bends the value-noise lattice the erosion damping rides so
+// it reads as organic landforms, not an axis-aligned grid (squares from altitude).
+const float WARP_A = 1.6;
 
 // value noise WITH gradient: (value, d/dx, d/dy) in q-space. Smoothstep weight
 // u = f*f*(3-2f) has derivative du = 6*f*(1-f); the bilinear mix expands to
@@ -1172,7 +1176,9 @@ float block_height(vec2 bc, float H, vec2 s) {
 	// Erode ONLY the continental term (drives landmass shape; its grid is at the
 	// ~21 km wavelength = imperceptible). hill/detail stay plain fbm so their
 	// 2700/600-vox erosion grids don't print as axis-aligned brickwork relief.
-	float cn = fbm_erode(w / 21000.0 + s, ERODE_K) - 0.5;               // ~1.05 km continental
+	vec2 wc = w / 21000.0 + s;
+	wc += (vec2(fbm(wc * 1.9 + 5.2), fbm(wc * 1.9 + 13.9)) - 0.5) * WARP_A;   // domain warp
+	float cn = fbm_erode(wc, ERODE_K) - 0.5;                            // ~1.05 km continental
 	float chunk = cn * (1.0 + 2.0 * abs(cn));             // plains & peaks
 	float hill = fbm(w / 2700.0 + s * 2.0 + 31.7) - 0.5;  // ~135 m hills
 	float det = fbm(w / 600.0 + s * 4.0 + 91.3) - 0.5;    // ~30 m detail
