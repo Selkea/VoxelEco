@@ -1086,7 +1086,7 @@ float fbm(vec2 q) {
 
 // analytic-erosion strength — MUST match gpu_world.gd ERODE_K and
 // worldgen.gdshaderinc or the sim band mis-places against the render surface.
-const float ERODE_K = 3.0;
+const float ERODE_K = 18.0;
 
 // value noise WITH gradient: (value, d/dx, d/dy) in q-space. Smoothstep weight
 // u = f*f*(3-2f) has derivative du = 6*f*(1-f); the bilinear mix expands to
@@ -1122,8 +1122,14 @@ float fbm_erode(vec2 q, float k) {
 	vec2 d = vec2(0.0);
 	for (int o = 0; o < 4; o++) {
 		vec3 n = vnoise_d(q);
-		d += n.yz;
+		// damp by the slope from COARSER octaves ONLY (accumulate AFTER using it):
+		// value noise has axis-aligned separable gradients, so damping an octave by
+		// its OWN gradient prints a lattice grid at that octave's wavelength (visible
+		// as axis-aligned "brickwork" relief from altitude). Damping by only the
+		// coarser slope keeps the damping field smoother than the octave it shapes —
+		// fine detail still fades on steep terrain (erosion), no same-frequency grid.
 		v += amp * n.x / (1.0 + k * dot(d, d));
+		d += n.yz;
 		q *= 2.03;
 		amp *= 0.5;
 	}
@@ -1163,10 +1169,13 @@ float block_height(vec2 bc, float H, vec2 s) {
 	// "gentle-plus" steepness (~1.5x the widest setting): a few hills & valleys per
 	// view, still well inside the resident band. Widths must match the gpu_world.gd
 	// CPU mirror (_block_height) exactly or the band mis-places.
-	float cn = fbm_erode(w / 21000.0 + s, ERODE_K) - 0.5;                // ~1.05 km continental
+	// Erode ONLY the continental term (drives landmass shape; its grid is at the
+	// ~21 km wavelength = imperceptible). hill/detail stay plain fbm so their
+	// 2700/600-vox erosion grids don't print as axis-aligned brickwork relief.
+	float cn = fbm_erode(w / 21000.0 + s, ERODE_K) - 0.5;               // ~1.05 km continental
 	float chunk = cn * (1.0 + 2.0 * abs(cn));             // plains & peaks
-	float hill = fbm_erode(w / 2700.0 + s * 2.0 + 31.7, ERODE_K) - 0.5; // ~135 m hills
-	float det = fbm_erode(w / 600.0 + s * 4.0 + 91.3, ERODE_K) - 0.5;   // ~30 m detail
+	float hill = fbm(w / 2700.0 + s * 2.0 + 31.7) - 0.5;  // ~135 m hills
+	float det = fbm(w / 600.0 + s * 4.0 + 91.3) - 0.5;    // ~30 m detail
 	return RELIEF * (0.5 + chunk * 0.44 + hill * 0.06 + det * 0.02);
 }
 
