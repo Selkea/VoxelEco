@@ -184,6 +184,8 @@ const uint SAND = 4u;
 const uint WATER = 5u;
 const uint MUD = 6u;      // waterlogged soil: soft, flows, washes away fast
 const uint GRASS = 7u;    // vegetated soil: roots bind it, drink the ground dry
+const uint PLANT = 8u;    // standing foliage (tufts/reeds): immovable, holds no
+                          // water; grows UP from watered, lit grass (see do_vegetate)
 
 // A cell is one uint: material in byte 0, ground-water SATURATION
 // (0..sat_cap, phenomenological % of pore space) in byte 1. Wetness therefore
@@ -267,6 +269,15 @@ const uint MUD_DRY = 55u;  // ...and mud below this dries back to soil
 const uint UPTAKE = 3u;    // saturation a grass cell draws from the ground per tick
 const uint GRASS_FLOOR = 24u; // grass draws surrounding moisture down only to here
 const float GROW = 0.004;  // per-tick chance moist surface soil sprouts grass
+
+// STANDING VEGETATION (mode 9, do_vegetate). A soft PLANT voxel is immovable
+// foliage that grows UP from well-watered, sunlit GRASS — short tufts on dry
+// meadow, taller reeds where the ground stays wet near water. It is not soil and
+// holds no water, and (dens 3, immovable) simply obstructs water like a solid.
+const uint VEG_MIN_SAT = 26u;  // grass moisture below which no tuft stands
+const uint VEG_LUSH    = 100u; // grass moisture at which tufts reach full height
+const uint VEG_MAXH    = 5u;   // tallest tuft (voxels) — 25 cm reeds at 5 cm/voxel
+const float VEG_GROW   = 0.25; // per-pass chance a tuft extends up one voxel
 
 // SUSPENDED SEDIMENT (byte 2). Flowing water lifts bed material into a suspended
 // LOAD carried in the water cell (rides along on Margolus swaps), which then
@@ -642,8 +653,10 @@ void do_step_at(uvec3 base) {
 		if (mb == SOIL && mt == AIR && SAT(c[b]) >= 8u && SAT(c[b]) <= 108u
 				&& rnd() < GROW) {
 			c[b] = PACK3(GRASS, SAT(c[b]), B2(c[b]));
-		} else if (mb == GRASS && mt != AIR) {
-			// drowned or buried (no light) -> vegetation dies back to soil
+		} else if (mb == GRASS && mt != AIR && mt != PLANT) {
+			// drowned or buried (no light) -> vegetation dies back to soil. A PLANT
+			// tuft standing on the grass is exempt: it's the vegetation this grass
+			// feeds, not a light-blocking burial (see do_vegetate).
 			c[b] = PACK3(SOIL, SAT(c[b]), B2(c[b]));
 		}
 
@@ -726,6 +739,7 @@ vec3 mat_color(uint m) {
 	if (m == SAND) return vec3(0.552, 0.423, 0.174);
 	if (m == MUD) return vec3(0.115, 0.072, 0.040);
 	if (m == GRASS) return vec3(0.086, 0.210, 0.052);
+	if (m == PLANT) return vec3(0.175, 0.365, 0.085);   // fresher green than the grass mat below
 	return vec3(1.0);
 }
 
@@ -1527,7 +1541,10 @@ void do_heights() {
 	while (y < p.H) {
 		uint cc = cget(cidx(x, y, z));
 		uint m = MAT(cc);
-		if (m == AIR) { break; }
+		// PLANT is standing foliage above the ground, not terrain: stop the ground
+		// surface below it so tufts never bulge or tint the world-mesh surface
+		// (they render as voxels in the instanced paths instead).
+		if (m == AIR || m == PLANT) { break; }
 		if (m == WATER) {
 			if (!wseen) { wseen = true; ysolid = y; }
 			maxload = max(maxload, B2(cc));   // muddiest cell drives the tint
@@ -1591,6 +1608,77 @@ void do_hsmooth() {
 		}
 	}
 	imageStore(terra_s_img, ivec2(x, z), vec4(acc / wacc, 0.0, 0.0));
+}
+
+// mode 9: STANDING VEGETATION. One thread per column grows soft PLANT voxels UP
+// from watered, sunlit GRASS and prunes them when the ground dries, floods, is
+// buried or grazed. A per-column walk (like do_emit/do_heights) gives full
+// vertical context — plant HEIGHT and sky exposure are trivial — and is race-free:
+// each thread writes only cells in its own (x,z) column, so it can't collide with
+// another. Dispatched every few ticks (plants are slow) between the step and the
+// emit. Touches only AIR<->PLANT, so it moves no water or sediment and can't
+// affect those ledgers. A settled meadow at target height writes nothing and so
+// wakes nothing — steady state is a pure read.
+void do_vegetate() {
+	uint id = flat_id();
+	if (id >= p.W * p.D) { return; }
+	uint x = id % p.W;
+	uint z = id / p.W;
+	if (z < p.cut_z) { return; }
+	// find the ground surface: walk down from the column top past sky, foliage and
+	// any standing water (which drowns vegetation) to the first firm cell.
+	uint yy = min(topmark[id] + 1u, p.H);
+	uint gy = 0u; uint gm = AIR; bool found = false; bool flooded = false;
+	while (yy > 0u) {
+		yy--;
+		uint m = MAT(cget(cidx(x, yy, z)));
+		if (m == AIR || m == PLANT) { continue; }
+		if (m == WATER) { flooded = true; continue; }
+		gy = yy; gm = m; found = true; break;
+	}
+	if (!found) { return; }
+	// how tall the tuft already standing on this surface is (contiguous PLANT)
+	uint ph = 0u;
+	while (gy + 1u + ph < p.H && MAT(cget(cidx(x, gy + 1u + ph, z))) == PLANT) { ph++; }
+	uint capy = gy + 1u + ph;                          // first cell above the tuft
+	uint capm = capy < p.H ? MAT(cget(cidx(x, capy, z))) : AIR;
+	bool buried = capm != AIR && capm != WATER;        // soil/sand fell onto the tuft
+	// target height: taller where the grass is wetter, with a stable per-column
+	// scatter (bare gaps + varied canopy) so the meadow isn't a flat-topped hedge.
+	uint gsat = SAT(cget(cidx(x, gy, z)));
+	uint tgt = 0u;
+	if (gm == GRASS && !flooded && !buried && capm == AIR && gsat >= VEG_MIN_SAT) {
+		float f = float(min(gsat, VEG_LUSH) - VEG_MIN_SAT) / float(VEG_LUSH - VEG_MIN_SAT);
+		uint base = 1u + uint(f * float(VEG_MAXH - 1u) + 0.5);
+		uint wx = world_coord(x, p.gen_ox, p.W);       // stable per-location across streaming
+		uint wz = world_coord(z, p.gen_oz, p.D);
+		uint hsh = pcg(wx * 73856093u ^ (wz * 83492791u) ^ p.seedv) % 100u;
+		if (hsh < 24u) { base = 0u; }                        // bare grass gaps (clumping)
+		else if (hsh < 44u && base > 1u) { base -= 1u; }     // shorter tufts
+		else if (hsh < 60u && base > 2u) { base -= 2u; }
+		tgt = min(base, VEG_MAXH);
+	}
+	g_state = pcg(id ^ pcg(p.tick * 2654435761u + p.seedv));
+	bool wrote = false;
+	if (ph > tgt) {
+		// die back: dried out, drowned, buried, or grazed above the new target
+		for (uint y = gy + 1u + tgt; y < gy + 1u + ph; y++) { cset(cidx(x, y, z), AIR); }
+		wrote = true;
+	} else if (ph < tgt) {
+		// grow one voxel if the next cell up is clear sky (air, with air above it)
+		uint ny = gy + 1u + ph;
+		if (MAT(cget(cidx(x, ny, z))) == AIR
+				&& (ny + 1u >= p.H || MAT(cget(cidx(x, ny + 1u, z))) == AIR)
+				&& rnd() < VEG_GROW) {
+			cset(cidx(x, ny, z), PLANT);
+			atomicMax(topmark[id], ny);
+			wrote = true;
+		}
+	}
+	if (wrote) {
+		mark_dirty(x, gy + 1u, z);
+		mark_dirty(x, min(gy + VEG_MAXH, p.H - 1u), z);
+	}
 }
 
 // mode 15: per-tile max of the column heights (16x16 columns, the chunk grid)
@@ -1894,6 +1982,7 @@ void main() {
 	else if (mode == 6u) { do_skin_emit(); }
 	else if (mode == 7u) { do_decay(); }
 	else if (mode == 8u) { do_face_emit(); }
+	else if (mode == 9u) { do_vegetate(); }
 	else if (mode == 11u) { do_lod_emit(); }
 	else if (mode == 12u) { do_far_emit(); }
 	else if (mode == 13u) { do_holes(); }

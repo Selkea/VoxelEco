@@ -9,12 +9,14 @@ extends RefCounted
 ## (water + unsettled solids) are simulated each tick, so a settled landscape
 ## is cheap and the water is where the work goes.
 
-enum { AIR, BEDROCK, STONE, SOIL, SAND, WATER, MUD, GRASS }
+enum { AIR, BEDROCK, STONE, SOIL, SAND, WATER, MUD, GRASS, PLANT }
 
 # density indexed by material (heavier sinks through lighter; BEDROCK immovable).
 # a plain Array, not a Dictionary — indexing is far faster in the hot loop.
-# indices: AIR BEDROCK STONE SOIL SAND WATER MUD GRASS
-const DENS := [0, 99, 9, 3, 3, 1, 3, 3]
+# indices: AIR BEDROCK STONE SOIL SAND WATER MUD GRASS PLANT
+# PLANT is immovable standing foliage (GPU-only, see vox_step.glsl do_vegetate);
+# dens 3 keeps it consistent with the shader's fall-through if ever referenced.
+const DENS := [0, 99, 9, 3, 3, 1, 3, 3, 3]
 # the 4 horizontal directions, as parallel arrays (no per-cell allocation)
 const DX := [1, -1, 0, 0]
 const DZ := [0, 0, 1, -1]
