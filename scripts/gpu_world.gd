@@ -787,6 +787,21 @@ func reset_water_stats() -> void:
 	if gpu_ok:
 		rd.buffer_update(stats_buf, 0, 12, PackedByteArray([0,0,0,0,0,0,0,0,0,0,0,0]))
 
+## TEST SCAFFOLDING: force every 16^3 physics chunk awake for one keepalive
+## window. upload_cells() writes cells but never touches the awake grid, so a
+## hand-built scenario would be skipped by the active-block gate and sit frozen
+## (a false "settled"). Call this after uploading a scene; real movement then
+## self-sustains via mark_dirty. Call again each batch to keep re-waking a scene
+## that is still collapsing toward rest.
+func wake_all() -> void:
+	if not gpu_ok:
+		return
+	var n := chunk_w * chunk_d * chunk_h
+	var vals := PackedInt32Array()
+	vals.resize(n)
+	vals.fill(4)   # == KEEPALIVE in vox_step.glsl
+	rd.buffer_update(active_buf, 0, n * 4, vals.to_byte_array())
+
 func free_gpu() -> void:
 	if rd == null:
 		return

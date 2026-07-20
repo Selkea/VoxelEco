@@ -1357,6 +1357,152 @@ func _run_sim_test() -> void:
 		print("SETTLE STILL" if moved < 20 else "SETTLE RESTLESS (%d)" % moved)
 		get_tree().quit()
 		return
+	if OS.get_environment("VOX_VESSELTEST") != "":
+		# WATER LEVELLING / communicating vessels: a compact block of water on a
+		# flat floor must SPREAD OUT and level to a near-uniform sheet (equal
+		# surface height everywhere), not sit frozen as a tower nor slump into a
+		# 45-degree talus wedge. Gravity + down-diagonals can only shed water where
+		# a strictly LOWER air cell exists, so on flat ground they leave a sloped
+		# pile; the pressure rule (sub-surface water spreads sideways into an
+		# adjacent free surface) is what actually levels it. It must then come fully
+		# to REST — a discrete swap rule can ring-oscillate, so we also check churn.
+		for i in range(w.cell.size()):
+			w.cell[i] = VoxWorld.AIR
+		for z in range(w.D):
+			for x in range(w.W):
+				w.cell[w.idx(x, 0, z)] = VoxWorld.STONE   # flat impermeable floor
+		var lo := 24
+		for dz in range(16):
+			for dx in range(16):
+				for y in range(1, 17):
+					w.cell[w.idx(lo + dx, y, lo + dz)] = VoxWorld.WATER
+		w.upload_cells()
+		w.set_rain_mm_hr(0.0)
+		var total_water := 16 * 16 * 16
+		# [max surface y, min surface y over wet cols, wet col count, water voxels]
+		var surf := func() -> Array:
+			w.sync_cells()
+			var mx := 0
+			var mn := 9999
+			var wet := 0
+			var cnt := 0
+			for z in range(w.D):
+				for x in range(w.W):
+					var top := -1
+					for y in range(w.H - 1, 0, -1):
+						if w.cell[w.idx(x, y, z)] == VoxWorld.WATER:
+							if top < 0:
+								top = y
+							cnt += 1
+					if top > 0:
+						wet += 1
+						mx = maxi(mx, top)
+						mn = mini(mn, top)
+			return [mx, (mn if wet > 0 else 0), wet, cnt]
+		print("VESSEL: %d water voxels (16x16x16 cube, top y=16) on a flat floor" % total_water)
+		# collapse phase: re-wake every batch so the active-gate can't fall asleep
+		# mid-collapse (upload_cells never wakes chunks) — we measure the physics
+		for cp in range(6):
+			w.wake_all()
+			w.run(40)
+			var s: Array = surf.call()
+			print("  +%3d ticks: surface max=%d min=%d over %d wet cols, water=%d" % [(cp + 1) * 40, s[0], s[1], s[2], s[3]])
+		# stillness: let it sleep naturally and count churn (catches oscillation —
+		# a ringing swap keeps waking itself, so churn stays high instead of -> 0)
+		var before := w.cell.duplicate()
+		w.run(1)
+		w.sync_cells()
+		var moved := 0
+		for i in range(w.cell.size()):
+			if (before[i] == VoxWorld.WATER) != (w.cell[i] == VoxWorld.WATER):
+				moved += 1
+		var fin: Array = surf.call()
+		# dump a 1-D cross-section (water surface height along the centre Z row) so
+		# the resulting water SHAPE can be plotted, not just summarised
+		var prof := PackedInt32Array()
+		prof.resize(w.W)
+		var zc := w.D / 2
+		for x in range(w.W):
+			var top := 0
+			for y in range(w.H - 1, 0, -1):
+				if w.cell[w.idx(x, y, zc)] == VoxWorld.WATER:
+					top = y
+					break
+			prof[x] = top
+		print("VESSEL_PROFILE z=%d %s" % [zc, str(prof)])
+		var rng: int = fin[0] - fin[1]
+		print("  residual churn in 1 settled tick: %d water cells" % moved)
+		print("  final: surface range=%d (max %d - min %d), wet cols=%d, water=%d" % [rng, fin[0], fin[1], fin[2], fin[3]])
+		# CHARACTERISATION, not a levelling gate: a conflict-free LOCAL Margolus rule
+		# cannot re-level integer voxels, so the pile settles into a ~45-degree talus
+		# WEDGE (surface range grows) rather than a flat sheet. What we DO assert are
+		# the real physics invariants that must always hold: water is CONSERVED (no
+		# leak/gain) and the body comes fully to REST (no oscillation). If a future
+		# change ever makes this actually level (small range + low max), that's a
+		# deliberate win worth noticing — update this test then.
+		var ok: bool = fin[3] == total_water and moved < 30 and fin[2] >= 100
+		print("VESSEL OK (conserved + settled; wedge is expected)" if ok else "VESSEL FAIL (want water==%d, churn<30, wet>=100)" % total_water)
+		get_tree().quit()
+		return
+	if OS.get_environment("VOX_UTUBE") != "":
+		# COMMUNICATING VESSELS: two open chambers joined by a SEALED bottom channel
+		# (solid roof over it), water filling only the LEFT chamber. True hydrostatic
+		# pressure would push water through the channel so it RISES in the right
+		# chamber until both surfaces match. Voxel falling-sand can't: gravity and
+		# down-diagonals need a lower air cell (none in a flat channel), the drain
+		# rule needs air below the target (channel floor is solid), and the pressure
+		# rule needs air ABOVE the target (channel roof is solid) — so water can't
+		# traverse a submerged pipe at all. This is the case only a level field solves.
+		for i in range(w.cell.size()):
+			w.cell[i] = VoxWorld.AIR
+		for z in range(w.D):
+			for x in range(w.W):
+				w.cell[w.idx(x, 0, z)] = VoxWorld.STONE   # floor
+		# solid everywhere in [1,30) except: left chamber x[8,22), right chamber
+		# x[42,56), and the sealed connecting channel y[1,4) across x[8,56)
+		for z in range(w.D):
+			for x in range(w.W):
+				for y in range(1, 30):
+					var open_left := x >= 8 and x < 22
+					var open_right := x >= 42 and x < 56
+					var open_channel := y >= 1 and y < 4 and x >= 8 and x < 56
+					if not (open_left or open_right or open_channel):
+						w.cell[w.idx(x, y, z)] = VoxWorld.STONE
+		# fill ONLY the left chamber with water (up to y=25)
+		for z in range(w.D):
+			for x in range(8, 22):
+				for y in range(1, 26):
+					w.cell[w.idx(x, y, z)] = VoxWorld.WATER
+		w.upload_cells()
+		w.set_rain_mm_hr(0.0)
+		var uprof := func() -> PackedInt32Array:
+			w.sync_cells()
+			var p := PackedInt32Array()
+			p.resize(w.W)
+			var zc := w.D / 2
+			for x in range(w.W):
+				var top := 0
+				for y in range(w.H - 1, 0, -1):
+					if w.cell[w.idx(x, y, zc)] == VoxWorld.WATER:
+						top = y
+						break
+				p[x] = top
+			return p
+		print("UTUBE: left chamber x[8,22) filled to y=25, right chamber x[42,56) empty, sealed channel y[1,4)")
+		for cp in range(6):
+			w.wake_all()
+			w.run(40)
+		var up: PackedInt32Array = uprof.call()
+		var lmax := 0
+		var rmax := 0
+		for x in range(8, 22):
+			lmax = maxi(lmax, up[x])
+		for x in range(42, 56):
+			rmax = maxi(rmax, up[x])
+		print("UTUBE_PROFILE z=%d %s" % [w.D / 2, str(up)])
+		print("UTUBE: after 240 ticks  left surface=%d  right surface=%d  (equalised => both ~13)" % [lmax, rmax])
+		get_tree().quit()
+		return
 	if OS.get_environment("VOX_DROPTEST") != "":
 		# rain must fall STRAIGHT: drop water voxels in one column of open air
 		# and confirm they don't drift sideways over several ticks
