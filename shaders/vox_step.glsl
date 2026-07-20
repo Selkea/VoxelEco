@@ -37,12 +37,12 @@ layout(set = 0, binding = 13, rgba8) uniform restrict writeonly image2D out_img;
 // terrain/water vertex shaders (the sim is voxels; the render is a surface):
 // terra_img rg16f: r = solid ground top (local band Y, excl), g = fluid top
 // (ground incl. standing water); tcol_img: surface albedo of the top cell.
-layout(set = 0, binding = 16, rg16f) uniform restrict image2D terra_img;
+layout(set = 0, binding = 16, rgba16f) uniform restrict image2D terra_img;
 layout(set = 0, binding = 17, rgba8) uniform restrict writeonly image2D tcol_img;
 // bilaterally smoothed copy of terra_img (mode 19) — what the meshes sample
 layout(set = 0, binding = 18, rg16f) uniform restrict writeonly image2D terra_s_img;
 layout(set = 0, binding = 1, std430) restrict buffer PackBuf { uint packed_out[]; };
-layout(set = 0, binding = 2, std430) restrict buffer StatsBuf { uint rained; uint evaporated; uint absorbed; };
+layout(set = 0, binding = 2, std430) restrict buffer StatsBuf { uint rained; uint evaporated; uint absorbed; uint deposited; };
 // Noita-style dirty tracking, one flag per 16x16-column mesh chunk: settled
 // regions are never remeshed. Flags are set here, read+cleared by the CPU.
 layout(set = 0, binding = 3, std430) restrict buffer DirtyBuf { uint dirty[]; };
@@ -417,11 +417,15 @@ void do_step_at(uvec3 base) {
 	// the byte-2 sediment bookkeeping below is a no-op (byte 2 stays 0 everywhere), so
 	// the tuned water/soil/mud behaviour is byte-for-byte the classic sim.
 	if (rules == 0u) { rules = 0xFFu; }
-	// which local cells actually MOVED this tick (a gravity/diagonal/lateral swap).
-	// This is what the sediment rule reads for "flowing": a conformal water sheet
-	// over a bed looks locally full (no in-block air below, so water_flowing can't
-	// see it), but the water in it swaps downhill every tick — so motion, not a
-	// static shape, is the honest signal that water is running and can erode.
+	// which local cells FLOWED this tick — set ONLY by the down-DIAGONAL swap
+	// (genuine downhill runoff), NOT by pure-vertical gravity nor by lateral
+	// levelling. This is what the sediment rule reads for "flowing": a conformal
+	// water sheet over a bed looks locally full (no in-block air below, so
+	// water_flowing can't see it), but a running current swaps downhill every tick —
+	// so down-diagonal motion, not a static shape, is the honest signal of an
+	// erosive current. Excluded on purpose: falling rain (vertical) doesn't scour,
+	// and water merely spreading to find its level (lateral) carries too little
+	// energy to erode — so pooled rain stays CLEAR, soaks in, and mud can form.
 	bool moved[8];
 	for (uint mi = 0u; mi < 8u; mi++) { moved[mi] = false; }
 	// 1. gravity: heavier sinks into lighter directly below (in-block pairs)
@@ -431,7 +435,9 @@ void do_step_at(uvec3 base) {
 		uint t = b + 2u;
 		if (movable(MAT(c[t])) && dens(MAT(c[t])) > dens(MAT(c[b]))) {
 			uint tmp = c[t]; c[t] = c[b]; c[b] = tmp;   // swap carries wetness
-			moved[t] = true; moved[b] = true;
+			// NOTE: pure-vertical gravity does NOT set moved[] — only horizontal flow
+			// (diagonal/lateral, below) counts as an erosive current (see the moved[]
+			// comment above). Falling/settling water alone must not scour or muddy.
 		}
 	}
 
@@ -483,7 +489,10 @@ void do_step_at(uvec3 base) {
 				&& MAT(c[b ^ 2u]) != AIR && MAT(c[a ^ 2u]) == AIR;
 		if (ab || ba) {
 			uint tmp = c[a]; c[a] = c[b]; c[b] = tmp;
-			moved[a] = true; moved[b] = true;
+			// NOTE: lateral LEVELLING does NOT set moved[] — only genuine downhill
+			// runoff (the down-diagonal above) is an erosive current. Water spreading
+			// out to find its level on near-flat ground carries little energy; tagging
+			// it would scour every transient puddle and turn the whole surface to sand.
 		}
 	}
 
@@ -608,6 +617,7 @@ void do_step_at(uvec3 base) {
 			// unworn soil/sand — a lake/sea bed) settles out a sediment voxel; the
 			// water cell becomes that sand, its remaining solid == the load it held.
 			c[t] = PACK3(SAND, 0u, 255u - load);
+			atomicAdd(deposited, 1u);   // a WATER cell became SAND (water-conservation sink)
 		}
 	}
 
@@ -1512,11 +1522,16 @@ void do_heights() {
 	uint z = id / p.W;
 	uint y = 0u;
 	uint ysolid = 0u;          // top of contiguous SOLID ground (excl. water)
+	uint maxload = 0u;         // peak suspended-sediment load over the water column
 	bool wseen = false;
 	while (y < p.H) {
-		uint m = MAT(cget(cidx(x, y, z)));
+		uint cc = cget(cidx(x, y, z));
+		uint m = MAT(cc);
 		if (m == AIR) { break; }
-		if (m == WATER && !wseen) { wseen = true; ysolid = y; }
+		if (m == WATER) {
+			if (!wseen) { wseen = true; ysolid = y; }
+			maxload = max(maxload, B2(cc));   // muddiest cell drives the tint
+		}
 		y++;
 	}
 	if (!wseen) { ysolid = y; }
@@ -1543,7 +1558,8 @@ void do_heights() {
 	uint m = MAT(raw);
 	if (m == AIR || m == WATER) { m = SOIL; }
 	uint vid = (lx + p.gen_ox) ^ ((lz + p.gen_oz) << 11u) ^ ((cy + p.gen_oy) << 22u);
-	imageStore(terra_img, ivec2(int(lx), int(lz)), vec4(float(ysolid), float(y), 0.0, 0.0));
+	// b = peak water-column sediment load (0..1) for the water shader's muddy tint
+	imageStore(terra_img, ivec2(int(lx), int(lz)), vec4(float(ysolid), float(y), float(maxload) / 255.0, 0.0));
 	imageStore(tcol_img, ivec2(int(lx), int(lz)), vec4(surf_color(raw, m, vid), 1.0));
 }
 

@@ -53,6 +53,7 @@ var erode_prob := 0.0            # per soil-water contact per tick
 var water_added := 0
 var water_evaporated := 0
 var water_absorbed := 0          # water voxels that soaked into the ground
+var water_deposited := 0         # water voxels that settled out as a sediment (SAND) voxel
 
 func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	W = w; D = d; H = h; wd = W * D
@@ -101,6 +102,7 @@ func reset_water_stats() -> void:
 	water_added = 0
 	water_evaporated = 0
 	water_absorbed = 0
+	water_deposited = 0
 
 func free_gpu() -> void:
 	pass

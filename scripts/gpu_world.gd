@@ -153,7 +153,7 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	# never in the interactive/render path — allocate a stub and grow it on the
 	# first sync_cells so huge worlds don't pay for it.
 	pack_buf = rd.storage_buffer_create(64)
-	stats_buf = rd.storage_buffer_create(12, PackedByteArray([0,0,0,0,0,0,0,0,0,0,0,0]))
+	stats_buf = rd.storage_buffer_create(16, PackedByteArray([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]))
 	var zeros := PackedByteArray()
 	zeros.resize(chunk_w * chunk_d * 4)
 	dirty_buf = rd.storage_buffer_create(zeros.size(), zeros)
@@ -449,7 +449,15 @@ func _make_world_tex() -> void:
 	fmt.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT \
 			| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT \
 			| RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
-	terra_tex = rd.texture_create(fmt, RDTextureView.new(), [])
+	# terra_tex (RAW) carries an extra channel: b = the water column's peak
+	# suspended-sediment load (0..1), so the water shader can tint muddy water.
+	# terra_s_tex (smoothed) only needs r,g (heights), so it stays rg16f.
+	var fmtr := RDTextureFormat.new()
+	fmtr.width = W
+	fmtr.height = D
+	fmtr.format = RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT
+	fmtr.usage_bits = fmt.usage_bits
+	terra_tex = rd.texture_create(fmtr, RDTextureView.new(), [])
 	terra_s_tex = rd.texture_create(fmt, RDTextureView.new(), [])
 	var fmt2 := RDTextureFormat.new()
 	fmt2.width = W
@@ -742,6 +750,7 @@ func sync_cells() -> void:
 	water_added = st[0]
 	water_evaporated = st[1]
 	water_absorbed = st[2]
+	water_deposited = st[3]
 	dirty_chunks = rd.buffer_get_data(dirty_buf).to_int32_array()
 	var zeros := PackedByteArray()
 	zeros.resize(chunk_w * chunk_d * 4)
@@ -785,7 +794,7 @@ func count_holes() -> int:
 func reset_water_stats() -> void:
 	super.reset_water_stats()
 	if gpu_ok:
-		rd.buffer_update(stats_buf, 0, 12, PackedByteArray([0,0,0,0,0,0,0,0,0,0,0,0]))
+		rd.buffer_update(stats_buf, 0, 16, PackedByteArray([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]))
 
 ## TEST SCAFFOLDING: force every 16^3 physics chunk awake for one keepalive
 ## window. upload_cells() writes cells but never touches the awake grid, so a

@@ -110,12 +110,10 @@ func _ready() -> void:
 		# (VOX_FAR=0 disables). Needs the LOD camera, so it rides lod_r.
 		(world as GpuWorld).far_field = OS.get_environment("VOX_FAR") != "0" \
 				and (world as GpuWorld).lod_r > 0
-	# SEDIMENT (opt-in): suspended-sediment erosion / transport / deposition (rule
-	# bit 256, muddy-water tint in the instanced renderers). Off by default so the
-	# tuned classic water/soil/mud sim is unchanged; VOX_SEDIMENT=1 turns it on
-	# (0x1FF = the classic 0xFF ruleset plus sediment).
-	if OS.get_environment("VOX_SEDIMENT") != "":
-		world.rules_mask = 0x1FF
+	# SEDIMENT: suspended-sediment erosion / transport / deposition (rule bit 256,
+	# muddy-water tint). ON by default now — 0x1FF = the classic 0xFF ruleset plus
+	# sediment. VOX_NOSEDIMENT=1 falls back to the tuned classic water/soil/mud sim.
+	world.rules_mask = 0xFF if OS.get_environment("VOX_NOSEDIMENT") != "" else 0x1FF
 	if not world.gpu_ok:
 		world.prime()      # the CPU fallback path needs its active set
 	view = VoxView.new()
@@ -656,8 +654,8 @@ func _take_screenshot() -> void:
 				var asp := get_viewport().get_visible_rect().size.aspect()
 				gw.cone_cos = cos(minf(atan(tan(deg_to_rad(cam.fov * 0.5)) * asp) \
 						+ 0.7 + (1.0 - fx.length()), PI))
-		if gw.ray_render:
-			gw.update_heights()                            # heights for the new origin
+		if gw.ray_render or gw.world_mesh:
+			gw.update_heights()                            # heights/surface textures for the new origin
 		var cnt: PackedInt32Array = gw.dispatch_emit()
 		view.set_visible_counts(cnt[0], cnt[1])
 		if OS.get_environment("VOX_NOPLANE") != "" and view.water_plane != null:
@@ -1827,12 +1825,13 @@ func _run_sim_test() -> void:
 				elif mm == VoxWorld.SAND:
 					sand += 1
 	print("materials: mud=%d grass=%d sand=%d (sand=erosion product under flow)" % [mud, grass, sand])
-	# conservation now has three sinks: standing surface water, water absorbed
-	# into the ground, and evaporation. added = standing + absorbed + evaporated.
-	var expected: int = initial + w.water_added - w.water_evaporated - w.water_absorbed
+	# conservation now has FOUR sinks: standing surface water, water absorbed
+	# into the ground, evaporation, and sediment DEPOSITION (a laden water cell
+	# that settled out as a sand voxel — 0 when sediment is off).
+	var expected: int = initial + w.water_added - w.water_evaporated - w.water_absorbed - w.water_deposited
 	var leak: int = standing - expected
-	print("water: standing=%d  pooled=%d  min_y=%d  added=%d absorbed=%d evap=%d leak=%d" % [
-		standing, pooled, min_water_y, w.water_added, w.water_absorbed, w.water_evaporated, leak])
+	print("water: standing=%d  pooled=%d  min_y=%d  added=%d absorbed=%d evap=%d deposited=%d leak=%d" % [
+		standing, pooled, min_water_y, w.water_added, w.water_absorbed, w.water_evaporated, w.water_deposited, leak])
 	var ok := true
 	if standing < 500:
 		ok = false; print("FAIL: no surface water at all")
