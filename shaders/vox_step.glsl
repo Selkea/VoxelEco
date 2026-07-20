@@ -82,6 +82,14 @@ layout(set = 0, binding = 14, std430) restrict buffer AwakeListBuf { uint awake_
 // tighten it back to exact when they run. Never below the true top = never a
 // missed voxel; too high just costs the old scan.
 layout(set = 0, binding = 15, std430) restrict buffer TopMarkBuf { uint topmark[]; };
+// HERBIVORE agents (mobile grazers). A flat uint array: a 4-uint HEADER
+// [cap, seed_cohort, live_count, reserved] followed by `cap` agent records of
+// HERB_STRIDE uints each [alive, x, y, z, energy, rng]. The seed pass (mode 20)
+// places an initial cohort on grass and marks the rest dead; the agent pass
+// (mode 21, one thread per record) moves/grazes/breeds/starves them. Agents are
+// WINDOW-LOCAL (buffer-slot coords) — fine for static test/shot worlds; a
+// streaming window would re-seed (a v1 limitation, documented).
+layout(set = 0, binding = 19, std430) restrict buffer HerbBuf { uint herb[]; };
 
 layout(push_constant) uniform Params {
 	uint W; uint H; uint D; uint tick;
@@ -135,6 +143,15 @@ void cset(uint i, uint v) {
 	else if (i < p.cells_split2) { cells2[i - p.cells_split] = v; }
 	else { cells3[i - p.cells_split2] = v; }
 }
+// atomically claim cell i: swap `val` in only if it currently holds `expect`;
+// returns the cell's prior value (== expect means we won it). Herbivore agents
+// use this to grab an AIR/PLANT cell as their next body voxel without two agents
+// ever landing on the same cell (routed through the split buffers like cget/cset).
+uint cclaim(uint i, uint expect, uint val) {
+	if (i < p.cells_split) { return atomicCompSwap(cells[i], expect, val); }
+	if (i < p.cells_split2) { return atomicCompSwap(cells2[i - p.cells_split], expect, val); }
+	return atomicCompSwap(cells3[i - p.cells_split2], expect, val);
+}
 
 const uint CHUNK = 16u;
 
@@ -186,6 +203,11 @@ const uint MUD = 6u;      // waterlogged soil: soft, flows, washes away fast
 const uint GRASS = 7u;    // vegetated soil: roots bind it, drink the ground dry
 const uint PLANT = 8u;    // standing foliage (tufts/reeds): immovable, holds no
                           // water; grows UP from watered, lit grass (see do_vegetate)
+const uint HERB = 9u;     // HERBIVORE body voxel: a mobile grazing agent's occupied
+                          // cell (see do_herbivore). Like PLANT it is immovable and
+                          // holds no water (dens 3 fall-through), so the physics and
+                          // vegetation rules leave it alone with no edits; the agent
+                          // pass moves it by claiming AIR cells and clearing old ones.
 
 // A cell is one uint: material in byte 0, ground-water SATURATION
 // (0..sat_cap, phenomenological % of pore space) in byte 1. Wetness therefore
@@ -740,6 +762,7 @@ vec3 mat_color(uint m) {
 	if (m == MUD) return vec3(0.115, 0.072, 0.040);
 	if (m == GRASS) return vec3(0.086, 0.210, 0.052);
 	if (m == PLANT) return vec3(0.175, 0.365, 0.085);   // fresher green than the grass mat below
+	if (m == HERB) return vec3(0.640, 0.575, 0.470);    // woolly cream — a grazer stands out on green
 	return vec3(1.0);
 }
 
@@ -786,7 +809,7 @@ void write_quad(bool water, uint slot, vec3 ax, vec3 ay, vec3 az, vec3 org, vec4
 // emit a 1x1 quad on face k of a voxel at local (wx, Y, wz). k: 0 +X 1 -X 2 +Y
 // 3 -Y 4 +Z 5 -Z. Stage 1a: one quad per exposed face (per-voxel, not yet merged),
 // which should render identically to the cube emit but as flat faces.
-void emit_face(bool water, uint k, float wx, float Y, float wz, vec4 col) {
+void emit_face(bool water, uint k, float wx, float Y, float wz, vec4 col, float grow) {
 	vec3 ax, ay, az, org;
 	if (k == 0u)      { ax = vec3(0,1,0); az = vec3(0,0,1); ay = vec3( 1,0,0); org = vec3(wx+1.0, Y, wz); }
 	else if (k == 1u) { ax = vec3(0,1,0); az = vec3(0,0,1); ay = vec3(-1,0,0); org = vec3(wx, Y, wz); }
@@ -794,6 +817,15 @@ void emit_face(bool water, uint k, float wx, float Y, float wz, vec4 col) {
 	else if (k == 3u) { ax = vec3(1,0,0); az = vec3(0,0,1); ay = vec3(0,-1,0); org = vec3(wx, Y, wz); }
 	else if (k == 4u) { ax = vec3(1,0,0); az = vec3(0,1,0); ay = vec3(0,0, 1); org = vec3(wx, Y, wz+1.0); }
 	else              { ax = vec3(1,0,0); az = vec3(0,1,0); ay = vec3(0,0,-1); org = vec3(wx, Y, wz); }
+	// grow > 0 (herbivore bodies): push the face out along its normal and expand it
+	// in-plane, centred — a slim HERB column inflates into a chunky, rounded grazer
+	// so it reads as a little animal, not a fence post. Render-only; the sim body
+	// stays a single 1x1 column.
+	if (grow > 0.0) {
+		org += ay * grow - ax * grow - az * grow;
+		ax *= (1.0 + 2.0 * grow);
+		az *= (1.0 + 2.0 * grow);
+	}
 	if (water) { uint s = atomicAdd(n_water, 1u); if (s < cap_water) { write_quad(true, s, ax, ay, az, org, col); } }
 	else       { uint s = atomicAdd(n_solid, 1u); if (s < cap_solid) { write_quad(false, s, ax, ay, az, org, col); } }
 }
@@ -864,10 +896,11 @@ void do_face_emit() {
 			}
 			col = vec4(base * jit * ao, 1.0);
 		}
+		float grow = (m == HERB) ? 0.45 : 0.0;   // inflate grazer bodies into chunky critters
 		for (uint k = 0u; k < 6u; k++) {
 			uint nm = nbr[k];
 			bool open = is_water ? (nm == AIR) : (nm == AIR || nm == WATER);
-			if (open) { emit_face(is_water, k, wx, Y, wz, col); }
+			if (open) { emit_face(is_water, k, wx, Y, wz, col, grow); }
 		}
 		if (solid_n == 6) { buried += 1u; if (buried >= 2u) { break; } }
 		else { buried = 0u; }
@@ -1543,8 +1576,9 @@ void do_heights() {
 		uint m = MAT(cc);
 		// PLANT is standing foliage above the ground, not terrain: stop the ground
 		// surface below it so tufts never bulge or tint the world-mesh surface
-		// (they render as voxels in the instanced paths instead).
-		if (m == AIR || m == PLANT) { break; }
+		// (they render as voxels in the instanced paths instead). HERB (a grazer
+		// standing on the ground) is treated the same — it isn't terrain either.
+		if (m == AIR || m == PLANT || m == HERB) { break; }
 		if (m == WATER) {
 			if (!wseen) { wseen = true; ysolid = y; }
 			maxload = max(maxload, B2(cc));   // muddiest cell drives the tint
@@ -1610,6 +1644,225 @@ void do_hsmooth() {
 	imageStore(terra_s_img, ivec2(x, z), vec4(acc / wacc, 0.0, 0.0));
 }
 
+// ===================== HERBIVORES (modes 20-21) =====================
+// Mobile grazing agents held in HerbBuf. Each agent is a slim HERB column standing
+// on the ground (rendered chunky — see emit_face's grow). Every dispatch (a few ticks apart) an
+// agent senses nearby foliage, steps toward it, EATS the PLANT voxels its body
+// passes through (grazing = energy IN), burns energy to exist (energy OUT), breeds
+// into a free record when well fed, and dies when it starves. Grazing pressure vs
+// do_vegetate regrowth is the vegetation<->herbivore coupling — the actual ecosystem
+// loop. Agents only ever touch AIR / PLANT / HERB cells, so they move no water or
+// sediment and cannot perturb those ledgers.
+const uint HERB_HDR    = 4u;    // header uints [cap, cohort, live_count, reserved]
+const uint HERB_STRIDE = 6u;    // uints per record: alive, x, y, z, energy, rng
+// The agent OWNS one column (atomic anchor claim), so its sim body is a single
+// 1x1xHERB_BODY column — it forages and collides cleanly with no self-blocking. The
+// emit inflates the HERB faces (see emit_face's grow arg) so it READS as a chunky
+// grazer, not a thin post, without giving the sim a multi-column footprint to fight.
+const uint HERB_BODY   = 3u;    // body height in voxels (15 cm)
+const int  HERB_CLIMB  = 3;     // max voxels an agent can step up/down in one move
+const uint HERB_START  = 140u;  // a seeded agent's starting energy
+const uint HERB_METAB  = 3u;    // energy burned per pass (existence cost) — higher
+                                // upkeep => a lower, sparser carrying capacity
+const uint HERB_BITE   = 16u;   // energy gained per PLANT voxel eaten
+const uint HERB_MAXE   = 235u;  // energy cap: bounds the reserve, so a well-fed
+                                // grazer still starves ~75 passes after food runs out
+const uint HERB_REPRO  = 205u;  // at/above this energy an agent MAY breed
+                                // (must stay below HERB_MAXE or breeding never fires)
+const uint HERB_CHILD  = 150u;  // a child's starting energy (the parent pays it):
+                                // costly, so a parent must refill fully to breed again
+const float HERB_BREED_P = 0.04;// per-pass birth chance when eligible — throttles the
+                                // irruption to a believable rate instead of doubling
+                                // every couple of passes on a rich meadow
+
+uint hbase(uint i) { return HERB_HDR + i * HERB_STRIDE; }
+
+// top solid ground y of a column, skipping air / foliage / grazer bodies; sets
+// `flooded` if standing water covers the ground (agents avoid it) and returns the
+// surface material in `gm`. -1 if the column has no ground at all.
+int ground_y(uint x, uint z, out bool flooded, out uint gm) {
+	flooded = false; gm = AIR;
+	uint yy = min(topmark[z * p.W + x] + 1u, p.H);
+	while (yy > 0u) {
+		yy--;
+		uint m = MAT(cget(cidx(x, yy, z)));
+		if (m == AIR || m == PLANT || m == HERB) { continue; }
+		if (m == WATER) { flooded = true; continue; }
+		gm = m; return int(yy);
+	}
+	return -1;
+}
+
+// stamp a HERB body up to HERB_BODY tall from the anchor (x,ay,z), eating any PLANT
+// it fills (adds to energy) and stopping at the first solid cell. The anchor cell
+// itself is claimed by the caller. Raises the column watermark so the emit walkers
+// see the body. Returns true if it changed any cell (so the caller can mark_dirty).
+bool herb_stamp(uint x, uint ay, uint z, inout uint energy) {
+	bool wrote = false;
+	for (uint b = 1u; b < HERB_BODY; b++) {
+		uint yy = ay + b;
+		if (yy >= p.H) { break; }
+		uint hc = MAT(cget(cidx(x, yy, z)));
+		if (hc == PLANT) { energy = min(energy + HERB_BITE, HERB_MAXE); cset(cidx(x, yy, z), HERB); wrote = true; }
+		else if (hc == AIR) { cset(cidx(x, yy, z), HERB); wrote = true; }
+		else { break; }   // blocked by solid — a shorter body here
+	}
+	atomicMax(topmark[z * p.W + x], min(ay + HERB_BODY - 1u, p.H - 1u));
+	return wrote;
+}
+
+// clear this agent's HERB body voxels (up from anchor) back to AIR
+bool herb_clear(uint x, uint ay, uint z) {
+	bool wrote = false;
+	for (uint b = 0u; b < HERB_BODY; b++) {
+		uint yy = ay + b;
+		if (yy >= p.H) { break; }
+		if (MAT(cget(cidx(x, yy, z))) == HERB) { cset(cidx(x, yy, z), AIR); wrote = true; }
+	}
+	return wrote;
+}
+
+// mode 20: seed the initial cohort. Thread i owns record i: the first `cohort`
+// records look for a grass column with clear air above and stand an agent there;
+// the rest are marked dead (spare capacity for later births).
+void do_herb_seed() {
+	uint cap = herb[0];
+	uint cohort = herb[1];
+	uint i = flat_id();
+	if (i >= cap) { return; }
+	uint base = hbase(i);
+	if (i >= cohort) { herb[base] = 0u; return; }       // spare record: dead
+	g_state = pcg(i * 2654435761u ^ pcg(p.seedv + 0x51ed2701u));
+	for (uint t = 0u; t < 8u; t++) {
+		uint x = pcg(g_state) % p.W; g_state = pcg(g_state);
+		uint z = pcg(g_state) % p.D; g_state = pcg(g_state);
+		bool flooded; uint gm;
+		int gy = ground_y(x, z, flooded, gm);
+		if (gy < 0 || flooded || gm != GRASS) { continue; }
+		uint ay = uint(gy) + 1u;
+		if (ay >= p.H) { continue; }
+		if (cclaim(cidx(x, ay, z), AIR, HERB) != AIR) { continue; }   // column already taken
+		uint energy = HERB_START;
+		herb_stamp(x, ay, z, energy);
+		mark_dirty(x, ay, z);
+		herb[base + 1u] = x; herb[base + 2u] = ay; herb[base + 3u] = z;
+		herb[base + 4u] = energy; herb[base + 5u] = pcg(g_state ^ (i * 40503u));
+		herb[base] = 1u;                                  // publish alive last
+		atomicAdd(herb[2], 1u);
+		return;
+	}
+	herb[base] = 0u;                                      // couldn't place — dead
+}
+
+// mode 21: one thread per record. sense -> move+graze -> metabolize -> breed/die.
+void do_herbivore() {
+	uint cap = herb[0];
+	uint i = flat_id();
+	if (i >= cap) { return; }
+	uint base = hbase(i);
+	if (herb[base] != 1u) { return; }                     // dead or mid-birth: skip
+	uint x = herb[base + 1u];
+	uint ay = herb[base + 2u];
+	uint z = herb[base + 3u];
+	uint energy = herb[base + 4u];
+	g_state = herb[base + 5u] ^ pcg(p.tick * 2654435761u + i);
+	// safety: if our anchor is no longer HERB (e.g. an adjacent grazer's body-clear
+	// clipped it), clear whatever body remains and retire the record — never leave
+	// orphaned HERB voxels behind.
+	if (MAT(cget(cidx(x, ay, z))) != HERB) {
+		herb_clear(x, ay, z); mark_dirty(x, ay, z);
+		herb[base] = 0u; atomicAdd(herb[2], 0xFFFFFFFFu); return;
+	}
+
+	const int NDX[4] = int[4](1, -1, 0, 0);
+	const int NDZ[4] = int[4](0, 0, 1, -1);
+	// sense the 4 neighbour columns for a reachable, dry standing spot
+	uint vnx[4]; uint vnz[4]; uint vny[4]; uint nv = 0u;
+	uint food_ix[4]; uint nf = 0u;
+	for (uint d = 0u; d < 4u; d++) {
+		int nxi = int(x) + NDX[d];
+		int nzi = int(z) + NDZ[d];
+		if (nxi < 0 || nxi >= int(p.W) || nzi < 0 || nzi >= int(p.D)) { continue; }
+		uint nx = uint(nxi); uint nz = uint(nzi);
+		bool fl; uint gm;
+		int gy = ground_y(nx, nz, fl, gm);
+		if (gy < 0 || fl) { continue; }
+		uint nay = uint(gy) + 1u;
+		if (nay >= p.H || abs(int(nay) - int(ay)) > HERB_CLIMB) { continue; }
+		uint hc = MAT(cget(cidx(nx, nay, nz)));
+		if (hc != AIR && hc != PLANT) { continue; }        // blocked (solid / herb / water)
+		vnx[nv] = nx; vnz[nv] = nz; vny[nv] = nay;
+		if (hc == PLANT) { food_ix[nf] = nv; nf++; }        // a tuft at the stepping cell
+		nv++;
+	}
+
+	// choose: strongly prefer a food cell, else wander, else stay put
+	int pick = -1;
+	if (nf > 0u && rnd() < 0.82) { pick = int(food_ix[uint(rnd() * float(nf)) % nf]); }
+	else if (nv > 0u && rnd() < 0.5) { pick = int(uint(rnd() * float(nv)) % nv); }
+
+	bool moved = false;
+	if (pick >= 0) {
+		uint nx = vnx[pick]; uint nz = vnz[pick]; uint nay = vny[pick];
+		uint want = cget(cidx(nx, nay, nz));               // AIR (0) or a bare PLANT (8)
+		if ((want == AIR || want == PLANT) && cclaim(cidx(nx, nay, nz), want, HERB) == want) {
+			if (want == PLANT) { energy = min(energy + HERB_BITE, HERB_MAXE); }
+			herb_clear(x, ay, z); mark_dirty(x, ay, z);    // vacate the old column
+			x = nx; z = nz; ay = nay;
+			herb_stamp(x, ay, z, energy); mark_dirty(x, ay, z);   // eats plants in the new body
+			moved = true;
+		}
+	}
+	if (!moved) {
+		// graze in place: eat any foliage that has regrown into the body cells
+		if (herb_stamp(x, ay, z, energy)) { mark_dirty(x, ay, z); }
+	}
+
+	// metabolism, death, reproduction
+	energy = energy > HERB_METAB ? energy - HERB_METAB : 0u;
+	if (energy == 0u) {
+		herb_clear(x, ay, z); mark_dirty(x, ay, z);
+		herb[base] = 0u;
+		atomicAdd(herb[2], 0xFFFFFFFFu);                   // live_count -= 1
+		return;
+	}
+	if (energy >= HERB_REPRO && rnd() < HERB_BREED_P) {
+		// birth a child onto an adjacent clear grass spot in a free record
+		for (uint d = 0u; d < 4u; d++) {
+			uint dd = (d + uint(rnd() * 4.0)) & 3u;
+			int nxi = int(x) + NDX[dd];
+			int nzi = int(z) + NDZ[dd];
+			if (nxi < 0 || nxi >= int(p.W) || nzi < 0 || nzi >= int(p.D)) { continue; }
+			uint nx = uint(nxi); uint nz = uint(nzi);
+			bool fl; uint gm;
+			int gy = ground_y(nx, nz, fl, gm);
+			if (gy < 0 || fl || gm != GRASS) { continue; }
+			uint nay = uint(gy) + 1u;
+			if (nay >= p.H || abs(int(nay) - int(ay)) > HERB_CLIMB) { continue; }
+			if (MAT(cget(cidx(nx, nay, nz))) != AIR) { continue; }
+			// find a free record via a short random CAS scan (alive 0 -> 2 "claiming")
+			int slot = -1;
+			for (uint s = 0u; s < 6u; s++) {
+				uint cand = pcg(g_state) % cap; g_state = pcg(g_state);
+				if (atomicCompSwap(herb[hbase(cand)], 0u, 2u) == 0u) { slot = int(cand); break; }
+			}
+			if (slot < 0) { break; }                        // population at capacity
+			if (cclaim(cidx(nx, nay, nz), AIR, HERB) != AIR) { herb[hbase(uint(slot))] = 0u; continue; }
+			uint cbase = hbase(uint(slot));
+			uint cen = HERB_CHILD;
+			herb_stamp(nx, nay, nz, cen); mark_dirty(nx, nay, nz);
+			herb[cbase + 1u] = nx; herb[cbase + 2u] = nay; herb[cbase + 3u] = nz;
+			herb[cbase + 4u] = cen; herb[cbase + 5u] = pcg(g_state ^ (uint(slot) * 2246822519u));
+			herb[cbase] = 1u;                               // publish alive last
+			atomicAdd(herb[2], 1u);
+			energy = energy > HERB_CHILD ? energy - HERB_CHILD : 1u;
+			break;
+		}
+	}
+	herb[base + 1u] = x; herb[base + 2u] = ay; herb[base + 3u] = z;
+	herb[base + 4u] = energy; herb[base + 5u] = g_state;
+}
+
 // mode 9: STANDING VEGETATION. One thread per column grows soft PLANT voxels UP
 // from watered, sunlit GRASS and prunes them when the ground dries, floods, is
 // buried or grazed. A per-column walk (like do_emit/do_heights) gives full
@@ -1632,7 +1885,7 @@ void do_vegetate() {
 	while (yy > 0u) {
 		yy--;
 		uint m = MAT(cget(cidx(x, yy, z)));
-		if (m == AIR || m == PLANT) { continue; }
+		if (m == AIR || m == PLANT || m == HERB) { continue; }
 		if (m == WATER) { flooded = true; continue; }
 		gy = yy; gm = m; found = true; break;
 	}
@@ -1992,5 +2245,7 @@ void main() {
 	else if (mode == 17u) { do_compact(); }
 	else if (mode == 18u) { do_step_list(); }
 	else if (mode == 19u) { do_hsmooth(); }
+	else if (mode == 20u) { do_herb_seed(); }
+	else if (mode == 21u) { do_herbivore(); }
 	else { do_step(); }
 }
