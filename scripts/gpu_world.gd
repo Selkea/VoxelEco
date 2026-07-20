@@ -628,6 +628,11 @@ func _pc(mode: int, offset: int) -> PackedByteArray:
 	pc.encode_u32(108, lod_cy)          # camera height above surface (3D LOD)
 	return pc
 
+# standing vegetation (do_vegetate, mode 9) runs once every this many ticks —
+# plants change slowly, and a settled meadow's pass is a pure read, so this is
+# cheap. Growth of a full tuft still takes only a few sim-seconds.
+const VEG_EVERY := 16
+
 func step() -> void:
 	if not gpu_ok:
 		super.step()
@@ -676,6 +681,10 @@ func run(n: int) -> void:
 		rd.compute_list_set_push_constant(cl, _pc(7, 0), PC_SIZE)               # sleep/wake decay
 		rd.compute_list_dispatch(cl, _decay_groups, 1, 1)                       # (+count reset)
 		rd.compute_list_add_barrier(cl)
+		if tick_count % VEG_EVERY == 0:
+			rd.compute_list_set_push_constant(cl, _pc(9, 0), PC_SIZE)           # standing vegetation
+			rd.compute_list_dispatch(cl, _col_groups, 1, 1)
+			rd.compute_list_add_barrier(cl)
 	rd.compute_list_end()
 
 ## did the physics change any cell since the last check? (reads + clears the
