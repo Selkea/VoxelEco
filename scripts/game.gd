@@ -615,6 +615,15 @@ func _take_screenshot() -> void:
 			warm_steps = 40
 		world.set_rain_mm_hr(warm_rain)
 		world.run(warm_steps)
+		# HERBIVORES: seed a cohort of grazers onto the grown meadow, then let them
+		# spread and graze for VOX_HERBRUN ticks under the SAME weather (so the ground
+		# stays moist and the plant tier persists) before the shot. VOX_HERB = cohort.
+		var shot_herb := OS.get_environment("VOX_HERB").to_int()
+		if shot_herb > 0 and world is GpuWorld:
+			(world as GpuWorld).seed_herbivores(shot_herb)
+			var hrun := OS.get_environment("VOX_HERBRUN").to_int()
+			world.run(hrun if hrun > 0 else 500)
+			print("SHOT: seeded %d grazers, population now %d" % [shot_herb, (world as GpuWorld).herb_population()])
 		world.set_rain_mm_hr(0.0)
 		var ro := _render_off()
 		var vy := OS.get_environment("VOX_CAMY").to_float()
@@ -1657,6 +1666,105 @@ func _run_sim_test() -> void:
 		var ok: bool = dled == 0 and c1["wear"] > 0 and c1["sand"] > 0 and aggraded > 0
 		print("SEDTEST OK (mass conserved + bed scoured + sediment deposited as a basin fan)" if ok
 			else "SEDTEST FAIL (want ledger delta 0, wear>0, sand>0, basin aggradation>0)")
+		get_tree().quit()
+		return
+	if OS.get_environment("VOX_HERBTEST") != "":
+		# HERBIVORES: mobile grazers eat the PLANT tier, burn energy, breed and starve.
+		# Two identical worlds are grown to a lush meadow; one is then seeded with a
+		# cohort of grazers, the other left as a control. We assert (a) grazing — the
+		# grazed world ends with FEWER plants than the control; (b) motion — a tracked
+		# agent changes position; (c) population dynamics — the live count moves off the
+		# seed number (births/deaths); (d) water is conserved despite the agents (leak~0,
+		# the same ledger the main --sim uses). Agents touch only AIR/PLANT/HERB.
+		var hsz := OS.get_environment("VOX_SIZE").to_int()
+		if hsz <= 0: hsz = 96
+		var hh := maxi(48, hsz * 3 / 4)
+		var rules := OS.get_environment("VOX_RULES").to_int() if OS.get_environment("VOX_RULES") != "" else 0x1FF
+		var rain := OS.get_environment("VOX_RAIN").to_float() if OS.get_environment("VOX_RAIN") != "" else 40.0
+		var warm := OS.get_environment("VOX_WARMUP").to_int() if OS.get_environment("VOX_WARMUP") != "" else 1200
+		var cohort := OS.get_environment("VOX_HERBN").to_int() if OS.get_environment("VOX_HERBN") != "" else 60
+		var hw := GpuWorld.new(12345, hsz, hsz, hh)   # grazed world
+		var cw := GpuWorld.new(12345, hsz, hsz, hh)   # control (no grazers)
+		if not hw.gpu_ok or not cw.gpu_ok:
+			print("HERBTEST: no GPU"); get_tree().quit(); return
+		hw.rules_mask = rules; cw.rules_mask = rules
+		var count_mat := func(wld: GpuWorld) -> Dictionary:
+			var raw := wld.read_cells_raw()
+			var d := {"plant": 0, "herb": 0, "water": 0, "grass": 0}
+			for c in raw:
+				match c & 0xFF:
+					VoxWorld.PLANT: d.plant += 1
+					VoxWorld.HERB: d.herb += 1
+					VoxWorld.WATER: d.water += 1
+					VoxWorld.GRASS: d.grass += 1
+			return d
+		print("HERBTEST: %dx%dx%d  rules=0x%x rain=%.0f warm=%d cohort=%d cap=%d" % [
+			hsz, hsz, hh, rules, rain, warm, cohort, hw.herb_cap])
+		# grow both worlds to the SAME lush meadow (deterministic -> identical state)
+		for wld: GpuWorld in [hw, cw]:
+			wld.regen_tracked(100000, 100000)
+			wld.set_rain_mm_hr(rain)
+			wld.run(warm)
+		var pre: Dictionary = count_mat.call(hw)
+		var ctrl_pre: Dictionary = count_mat.call(cw)
+		print("HERBTEST: meadow grown — plants=%d grass=%d water=%d (control plants=%d, must match)" % [
+			pre.plant, pre.grass, pre.water, ctrl_pre.plant])
+		# capture water baseline on the grazed world for a leak check over the graze run
+		var standing0: int = pre.water
+		hw.reset_water_stats()
+		hw.seed_herbivores(cohort)
+		var seeded := hw.herb_population()
+		print("HERBTEST: seeded %d grazers (of cohort %d)" % [seeded, cohort])
+		var panel_prev := {}                   # record index -> last pos key, for a panel
+		var moved := false
+		var peak_pop := seeded
+		var min_plant: int = pre.plant
+		var batch := 350
+		for b in range(12):
+			hw.run(batch)
+			cw.run(batch)                       # control grows/regrows plants freely
+			var m: Dictionary = count_mat.call(hw)
+			var pop := hw.herb_population()
+			peak_pop = maxi(peak_pop, pop)
+			min_plant = mini(min_plant, m.plant)
+			var herbs := hw.read_herbs()
+			# movement: track a panel of records (0..15); if any stays alive across two
+			# batches yet changes position, the herd is genuinely roaming (robust to
+			# any single tracked agent dying)
+			for j in range(16):
+				var bse := GpuWorld.HERB_HDR + j * GpuWorld.HERB_STRIDE
+				if herbs[bse] == 1:
+					var key: int = herbs[bse + 1] * 100000 + herbs[bse + 2] * 300 + herbs[bse + 3]
+					if panel_prev.has(j) and panel_prev[j] != key:
+						moved = true
+					panel_prev[j] = key
+				else:
+					panel_prev.erase(j)
+			print("  +%5d: pop=%d herb_cells=%d | plants=%d grass=%d moved=%s" % [
+				(b + 1) * batch, pop, m.herb, m.plant, m.grass, moved])
+		var fin: Dictionary = count_mat.call(hw)
+		var finc: Dictionary = count_mat.call(cw)
+		hw.sync_cells()                          # pull water stats for the leak ledger
+		var standing: int = fin.water
+		var expected: int = standing0 + hw.water_added - hw.water_evaporated - hw.water_absorbed - hw.water_deposited
+		var leak: int = standing - expected
+		var finpop := hw.herb_population()
+		print("HERBTEST: final plants grazed=%d control=%d (grazers suppress %d plants)" % [
+			fin.plant, finc.plant, finc.plant - fin.plant])
+		print("HERBTEST: population %d -> peak %d -> %d (cap %d; food-limited if peak < cap)" % [
+			seeded, peak_pop, finpop, hw.herb_cap])
+		print("HERBTEST: water standing=%d expected=%d leak=%d (added=%d evap=%d absorbed=%d deposited=%d)" % [
+			standing, expected, leak, hw.water_added, hw.water_evaporated, hw.water_absorbed, hw.water_deposited])
+		var grazed_ok: bool = fin.plant < finc.plant
+		var pop_ok := finpop != seeded and finpop >= 0
+		var water_ok := absi(leak) <= maxi(50, standing / 50)
+		var embodied_ok: bool = fin.herb > 0 or finpop == 0
+		var ok: bool = grazed_ok and moved and pop_ok and water_ok and embodied_ok
+		print("HERBTEST: grazed=%s moved=%s pop_dynamics=%s water_conserved=%s embodied=%s" % [
+			grazed_ok, moved, pop_ok, water_ok, embodied_ok])
+		print("HERBTEST OK (grazers roam, eat the plant tier, breed/starve; water conserved)" if ok
+			else "HERBTEST FAIL")
+		hw.free_gpu(); cw.free_gpu()
 		get_tree().quit()
 		return
 	if OS.get_environment("VOX_DROPTEST") != "":

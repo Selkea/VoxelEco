@@ -38,6 +38,17 @@ var _solid_target: RID    # multimesh buffers (bound by the view) or placeholder
 var _water_target: RID
 var _placeholder_a: RID
 var _placeholder_b: RID
+# HERBIVORES (binding 19): a persistent agent buffer — 4-uint header
+# [cap, cohort, live_count, reserved] + herb_cap records of HERB_STRIDE uints
+# [alive, x, y, z, energy, rng]. Seeded on demand (seed_herbivores) and stepped
+# every HERB_EVERY ticks. See vox_step.glsl do_herb_seed / do_herbivore.
+var herb_buf: RID
+var herb_cap := 0
+var herb_seeded := false
+var _herb_groups := 0
+const HERB_HDR := 4        # header uints (must match the shader's HERB_HDR)
+const HERB_STRIDE := 6     # uints per record (must match the shader's HERB_STRIDE)
+const HERB_EVERY := 3      # ticks between herbivore updates (motion pace)
 
 var chunk_w := 0
 var chunk_d := 0
@@ -206,6 +217,16 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	_placeholder_b = rd.storage_buffer_create(64)
 	_solid_target = _placeholder_a
 	_water_target = _placeholder_b
+	# herbivore agent pool: ~one potential grazer per 40 columns, clamped. Created
+	# zeroed (every record dead) with the cap in header slot 0; seed_herbivores fills
+	# a cohort. Sized off the resident window, so streaming worlds keep it bounded.
+	herb_cap = clampi(W * D / 12, 512, 40000)
+	var herb_words := HERB_HDR + herb_cap * HERB_STRIDE
+	var hz := PackedInt32Array()
+	hz.resize(herb_words)          # all zero -> all records alive=0 (dead)
+	hz[0] = herb_cap               # header: cap
+	herb_buf = rd.storage_buffer_create(herb_words * 4, hz.to_byte_array())
+	_herb_groups = ceili(herb_cap / 64.0)
 	_rebuild_uniform_set()
 
 	_step_groups = Vector3i(
@@ -544,7 +565,7 @@ func _rebuild_uniform_set() -> void:
 		iu.binding = ipair[0]
 		iu.add_id(ipair[1])
 		us.append(iu)
-	for pair: Array in [[14, awake_list_buf], [15, topmark_buf]]:
+	for pair: Array in [[14, awake_list_buf], [15, topmark_buf], [19, herb_buf]]:
 		var bu := RDUniform.new()
 		bu.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
 		bu.binding = pair[0]
@@ -685,7 +706,42 @@ func run(n: int) -> void:
 			rd.compute_list_set_push_constant(cl, _pc(9, 0), PC_SIZE)           # standing vegetation
 			rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 			rd.compute_list_add_barrier(cl)
+		if herb_seeded and tick_count % HERB_EVERY == 0:
+			rd.compute_list_set_push_constant(cl, _pc(21, 0), PC_SIZE)          # herbivores graze/move/breed
+			rd.compute_list_dispatch(cl, _herb_groups, 1, 1)
+			rd.compute_list_add_barrier(cl)
 	rd.compute_list_end()
+
+## place an initial cohort of `n` grazers on grass columns. Call AFTER the world
+## has grown some grass/vegetation (they seek grass surfaces with clear air above);
+## thereafter births and deaths run autonomously in the per-tick agent pass.
+func seed_herbivores(n: int) -> void:
+	if not gpu_ok:
+		return
+	n = clampi(n, 0, herb_cap)
+	# header: [cap, cohort, live_count=0, reserved]
+	rd.buffer_update(herb_buf, 0, 16, PackedInt32Array([herb_cap, n, 0, 0]).to_byte_array())
+	var cl := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(cl, pipeline)
+	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
+	rd.compute_list_set_push_constant(cl, _pc(20, 0), PC_SIZE)   # seed cohort
+	rd.compute_list_dispatch(cl, _herb_groups, 1, 1)
+	rd.compute_list_end()
+	herb_seeded = true
+
+## live grazer count (header live_count, maintained by births/deaths in the pass)
+func herb_population() -> int:
+	if not gpu_ok:
+		return 0
+	return rd.buffer_get_data(herb_buf, 8, 4).to_int32_array()[0]
+
+## TEST SCAFFOLDING: pull the whole herbivore buffer to the CPU (small worlds).
+## Decode: header[0..4) = [cap, cohort, live_count, reserved]; then per record i
+## at HERB_HDR + i*HERB_STRIDE: [alive(1=live), x, y, z, energy, rng].
+func read_herbs() -> PackedInt32Array:
+	if not gpu_ok:
+		return PackedInt32Array()
+	return rd.buffer_get_data(herb_buf).to_int32_array()
 
 ## did the physics change any cell since the last check? (reads + clears the
 ## dirty-chunk flags). Lets the renderer skip re-emitting a static world — no
@@ -858,7 +914,7 @@ func free_gpu() -> void:
 	# free our resources, never the shared main device
 	for r in [uniform_set, pipeline, shader, cells_buf, cells_buf2, cells_buf3, pack_buf,
 			stats_buf, dirty_buf, active_buf, step_args_buf, awake_list_buf, topmark_buf,
-			inst_count_buf, _placeholder_a, _placeholder_b,
+			inst_count_buf, _placeholder_a, _placeholder_b, herb_buf,
 			heights_buf, hmax_buf, cam_buf, ray_tex, terra_tex, terra_s_tex, tcol_tex]:
 		if r.is_valid():
 			rd.free_rid(r)
