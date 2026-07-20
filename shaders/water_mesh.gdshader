@@ -78,6 +78,7 @@ void fragment() {
 	// depth compare below and the Fresnel term. VERTEX is view-space in fragment.
 	vec3 wpos = (INV_VIEW_MATRIX * vec4(VERTEX, 1.0)).xyz;
 	float d;
+	float load = 0.0;   // suspended-sediment load (0..1) — drives the muddy tint
 	if (v_pw >= 1.0) {
 		// ---- CHEAP FAR-SEA PATH: the flat SEA_Y skirt past the apron ----
 		// This skirt fills the whole screen from altitude, and the near path would
@@ -109,7 +110,8 @@ void fragment() {
 	} else {
 	vec2 lpc = clamp(v_lp, vec2(0.5), win_size - 0.5);
 	vec2 hs = sim_tex_smooth(sim_terra, lpc, win_size).rg;
-	vec2 raw = texture(sim_raw, (lpc + 0.5) / win_size).rg;
+	vec3 raw = texture(sim_raw, (lpc + 0.5) / win_size).rgb;
+	load = raw.b;   // b channel = the column's peak suspended sediment (do_heights)
 	// tint depth, PER-PIXEL: inside the window the RAW sim texture gives the
 	// true per-column depth; outside, the blended surface over the worldgen
 	// bed (per-vertex values inherit mesh density and print LoD artefacts)
@@ -167,6 +169,13 @@ void fragment() {
 	// caused stays gone.
 	// water BODY colour: light-blue shallows deepening to navy over the depth ramp.
 	vec3 body = mix(vec3(0.10, 0.30, 0.45), vec3(0.024, 0.13, 0.34), dp);
+	// SEDIMENT: suspended load turns the body muddy brown. Silty water scatters
+	// light back near the surface, so mud shows most in the shallows and washes out
+	// with depth (the deep column self-shadows) — fade the tint by (1-dp*0.5). The
+	// curve is deliberately eager (a little load already browns visibly) so thin
+	// runoff and river plumes read as muddy, not just saturated deltas.
+	float mud = clamp(load * 2.2, 0.0, 1.0) * (1.0 - dp * 0.5);
+	body = mix(body, vec3(0.32, 0.22, 0.12), mud * 0.88);
 	// FRESNEL sky reflection (Schlick, de Greve 2006 — see Learning/): a water/air
 	// interface reflects almost nothing looking straight down (R0≈0.02, you see the
 	// body colour) and rises to a near-mirror at grazing angles (reflecting the sky).
