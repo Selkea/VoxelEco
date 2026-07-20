@@ -802,6 +802,38 @@ func wake_all() -> void:
 	vals.fill(4)   # == KEEPALIVE in vox_step.glsl
 	rd.buffer_update(active_buf, 0, n * 4, vals.to_byte_array())
 
+## TEST SCAFFOLDING: read the RAW cell uints (material + saturation + byte-2
+## sediment) straight out of the cells buffer, bypassing the pack pass (which
+## keeps only the material byte). Small test worlds only — this pulls the whole
+## buffer to the CPU. Returns one uint per cell in linear (x + z*W + y*W*D) order;
+## decode with c & 0xFF (material), (c>>8)&0xFF (saturation), (c>>16)&0xFF (LOAD
+## on water / WEAR on solid). Assumes a single-buffer world (cells_split == n).
+func read_cells_raw() -> PackedInt32Array:
+	if not gpu_ok:
+		return PackedInt32Array()
+	var n := W * D * H
+	return rd.buffer_get_data(cells_buf, 0, n * 4).to_int32_array()
+
+## TEST SCAFFOLDING: overwrite a box of cells with a raw uint value straight in the
+## cells buffer, WITHOUT the global upload_cells() (which rebuilds every cell from
+## the material-only mirror and so zeroes saturation + byte-2 sediment everywhere).
+## Used to inject a steady water source mid-run without wiping accumulated sediment.
+## Single-buffer test worlds only (cells_split == cell count). x is contiguous, so
+## each (y,z) row is one buffer_update.
+func set_region(x0: int, x1: int, z0: int, z1: int, y0: int, y1: int, value: int) -> void:
+	if not gpu_ok:
+		return
+	var run_len := x1 - x0
+	if run_len <= 0:
+		return
+	var row := PackedInt32Array()
+	row.resize(run_len)
+	row.fill(value)
+	var bytes := row.to_byte_array()
+	for y in range(y0, y1):
+		for z in range(z0, z1):
+			rd.buffer_update(cells_buf, idx(x0, y, z) * 4, run_len * 4, bytes)
+
 func free_gpu() -> void:
 	if rd == null:
 		return

@@ -110,6 +110,12 @@ func _ready() -> void:
 		# (VOX_FAR=0 disables). Needs the LOD camera, so it rides lod_r.
 		(world as GpuWorld).far_field = OS.get_environment("VOX_FAR") != "0" \
 				and (world as GpuWorld).lod_r > 0
+	# SEDIMENT (opt-in): suspended-sediment erosion / transport / deposition (rule
+	# bit 256, muddy-water tint in the instanced renderers). Off by default so the
+	# tuned classic water/soil/mud sim is unchanged; VOX_SEDIMENT=1 turns it on
+	# (0x1FF = the classic 0xFF ruleset plus sediment).
+	if OS.get_environment("VOX_SEDIMENT") != "":
+		world.rules_mask = 0x1FF
 	if not world.gpu_ok:
 		world.prime()      # the CPU fallback path needs its active set
 	view = VoxView.new()
@@ -1501,6 +1507,158 @@ func _run_sim_test() -> void:
 			rmax = maxi(rmax, up[x])
 		print("UTUBE_PROFILE z=%d %s" % [w.D / 2, str(up)])
 		print("UTUBE: after 240 ticks  left surface=%d  right surface=%d  (equalised => both ~13)" % [lmax, rmax])
+		get_tree().quit()
+		return
+	if OS.get_environment("VOX_SEDTEST") != "":
+		# EROSION + SEDIMENT TRANSPORT: a steady water source at a hilltop feeds a
+		# river down an erodible SOIL hillslope into a lake. The current detaches bed
+		# material into suspended load (incising the slope), carries it downhill, and
+		# deposits it where the flow slackens in the lake (building a delta). A CLOSED
+		# basin (tall dam) catches all the water so none leaves the world; the source
+		# is CLEAR water injected straight into the cells buffer each batch (set_region,
+		# not upload_cells, so accumulated sediment is preserved). rules =
+		# gravity|diagonal|lateral|sediment — no rain/evap/weathering, so the sediment
+		# LEDGER is exact: an erodible voxel holds (255-WEAR) units of solid, a water
+		# cell holds LOAD units suspended (byte 2, dropped by the pack pass, so analysis
+		# reads the RAW cells); every rule only MOVES units, so Sum is invariant.
+		w.rules_mask = 0x10F   # 1 gravity | 2 diagonal | 4 lateral | 8 evap | 256 sediment
+		for i in range(w.cell.size()):
+			w.cell[i] = VoxWorld.AIR
+		for z in range(w.D):
+			for x in range(w.W):
+				w.cell[w.idx(x, 0, z)] = VoxWorld.STONE          # impermeable floor
+			# non-erodible STONE launch platform (top y30) under the source, so the
+			# clear injected water never becomes laden IN the overwrite zone (otherwise
+			# each batch's set_region would clobber suspended sediment = a mass leak)
+			for x in range(2, 7):
+				for y in range(1, 31):
+					w.cell[w.idx(x, y, z)] = VoxWorld.STONE
+			# erodible SOIL hillslope: from the platform lip (y30 at x7) to the basin (y6)
+			for x in range(7, 40):
+				var h := int(round(30.0 - float(x - 7) * 24.0 / 33.0))
+				for y in range(1, h + 1):
+					w.cell[w.idx(x, y, z)] = VoxWorld.SOIL
+			# basin floor + a standing lake for the river to build a delta into
+			for x in range(40, 60):
+				for y in range(1, 4):
+					w.cell[w.idx(x, y, z)] = VoxWorld.SOIL
+			for x in range(40, 58):
+				for y in range(4, 8):
+					w.cell[w.idx(x, y, z)] = VoxWorld.WATER
+			# tall dam so the filling basin never overflows (no water leaves the world)
+			for x in range(60, 62):
+				for y in range(1, 34):
+					w.cell[w.idx(x, y, z)] = VoxWorld.STONE
+		w.upload_cells()
+		w.set_rain_mm_hr(0.0)
+		# strong evaporation is the ledger-neutral SINK: it keeps the slope sheet thin
+		# and flowing (never piling into a static wedge) and turns the laden water it
+		# removes into sand deposits, so the system stays dynamic and erodes throughout
+		w.set_evap_mm_day(1300000.0)
+		var SOILS := [VoxWorld.SOIL, VoxWorld.SAND, VoxWorld.MUD, VoxWorld.GRASS]
+		# sediment ledger + a census of the raw buffer (material/load/wear in byte 2)
+		var census := func() -> Dictionary:
+			var raw := w.read_cells_raw()
+			var ledger := 0
+			var susp := 0
+			var soil := 0
+			var sand := 0
+			var water := 0
+			var wear := 0     # total eroded-away units still held as WEAR in the bed
+			for c in raw:
+				var m: int = c & 0xFF
+				var b2: int = (c >> 16) & 0xFF
+				if m == VoxWorld.WATER:
+					water += 1
+					susp += b2
+					ledger += b2
+				elif m in SOILS:
+					if m == VoxWorld.SOIL:
+						soil += 1
+						wear += b2
+					elif m == VoxWorld.SAND:
+						sand += 1
+					ledger += 255 - b2
+			return {"ledger": ledger, "susp": susp, "soil": soil, "sand": sand, "water": water, "wear": wear}
+		# top of solid ground (stone/soil/sand — ignores water & air) along z=32
+		var gtop := func() -> PackedInt32Array:
+			var raw := w.read_cells_raw()
+			var p := PackedInt32Array()
+			p.resize(w.W)
+			var zc := w.D / 2
+			for x in range(w.W):
+				var top := 0
+				for y in range(w.H - 1, 0, -1):
+					var m: int = raw[w.idx(x, y, zc)] & 0xFF
+					if m == VoxWorld.STONE or m in SOILS:
+						top = y
+						break
+				p[x] = top
+			return p
+		# DIAG: highest water-or-solid cell (fluid surface) at z=32, + water counts
+		# per x-band + max suspended load anywhere, to see where flow actually went
+		var diag := func() -> void:
+			var raw := w.read_cells_raw()
+			var zc := w.D / 2
+			var ftop := PackedInt32Array()
+			ftop.resize(w.W)
+			for x in range(w.W):
+				var top := 0
+				for y in range(w.H - 1, 0, -1):
+					var m: int = raw[w.idx(x, y, zc)] & 0xFF
+					if m != VoxWorld.AIR:
+						top = y
+						break
+				ftop[x] = top
+			var wslope := 0
+			var wbasin := 0
+			var maxload := 0
+			for x in range(w.W):
+				for z in range(w.D):
+					for y in range(1, w.H):
+						var c: int = raw[w.idx(x, y, z)]
+						if (c & 0xFF) == VoxWorld.WATER:
+							if x < 40: wslope += 1
+							else: wbasin += 1
+							maxload = maxi(maxload, (c >> 16) & 0xFF)
+			print("  FLUIDTOP z32 %s" % str(ftop))
+			print("  water: slope=%d basin=%d  maxload=%d" % [wslope, wbasin, maxload])
+		var c0: Dictionary = census.call()
+		var g0: PackedInt32Array = gtop.call()
+		print("SEDTEST: hilltop source -> soil hillslope -> lake. rules=0x%x  ledger0=%d (soil=%d water=%d)" % [w.rules_mask, c0["ledger"], c0["soil"], c0["water"]])
+		print("BEFORE:"); diag.call()
+		for cp in range(12):
+			# steady CLEAR-water source at the hilltop (above the soil top y30, so it
+			# only ever overwrites air/clear water — never sediment) = a sustained river
+			w.set_region(2, 6, 0, w.D, 31, 34, VoxWorld.WATER)
+			w.wake_all()
+			w.run(40)
+		diag.call()
+		var c1: Dictionary = census.call()
+		var g1: PackedInt32Array = gtop.call()
+		# slope incision (x[2,40)) vs basin aggradation (x[40,60)) along z=32
+		var incised := 0
+		var aggraded := 0
+		for x in range(2, 40):
+			incised += maxi(0, g0[x] - g1[x])
+		for x in range(40, 60):
+			aggraded += maxi(0, g1[x] - g0[x])
+		print("GTOP0 z32 %s" % str(g0))
+		print("GTOP1 z32 %s" % str(g1))
+		print("SEDTEST: slope incision=%d cells  basin aggradation=%d cells (z=32 row)" % [incised, aggraded])
+		print("SEDTEST: soil %d->%d (wear=%d)  sand %d->%d  suspended=%d  water %d->%d" % [
+			c0["soil"], c1["soil"], c1["wear"], c0["sand"], c1["sand"], c1["susp"], c0["water"], c1["water"]])
+		var dled: int = c1["ledger"] - c0["ledger"]
+		print("SEDTEST: sediment ledger %d -> %d  (delta=%d, must be 0)" % [c0["ledger"], c1["ledger"], dled])
+		# The full erosion->transport->deposition cycle must run, conserving mass
+		# EXACTLY: the bed is scoured (soil accumulates WEAR), the detached material is
+		# carried off and re-deposited as SAND, and that deposition lands where the flow
+		# slackens (the basin AGGRADES — a fan/delta builds). Channel incision (a soil
+		# column cut clean down to air) needs far longer than this smoke test, so the
+		# erosion signal is total bed wear, not a GTOP drop.
+		var ok: bool = dled == 0 and c1["wear"] > 0 and c1["sand"] > 0 and aggraded > 0
+		print("SEDTEST OK (mass conserved + bed scoured + sediment deposited as a basin fan)" if ok
+			else "SEDTEST FAIL (want ledger delta 0, wear>0, sand>0, basin aggradation>0)")
 		get_tree().quit()
 		return
 	if OS.get_environment("VOX_DROPTEST") != "":

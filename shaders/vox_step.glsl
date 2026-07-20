@@ -188,12 +188,23 @@ const uint GRASS = 7u;    // vegetated soil: roots bind it, drink the ground dry
 // A cell is one uint: material in byte 0, ground-water SATURATION
 // (0..sat_cap, phenomenological % of pore space) in byte 1. Wetness therefore
 // travels with the material when it moves, and needs no extra buffer.
-// Bytes 2-3 are free — reserved for a planned per-cell TEMPERATURE field
-// (drives freezing/thawing, evaporation rate, snow) with the same
-// travels-with-the-cell property.
+// Byte 2 carries SEDIMENT, meaning-per-material (same travels-with-the-cell
+// trick): on a WATER cell it is suspended LOAD (0..255, sediment being carried);
+// on an erodible SOLID (soil/sand/mud/grass) it is WEAR (how much of the voxel
+// has eroded away — solid mass remaining = 255-WEAR). Byte 3 on a WATER cell is a
+// FLOW AGE: it is topped up whenever the water moves and decays otherwise, and it
+// rides along on swaps — so a cell that ran downhill a tick ago still reads as a
+// live current even once it settles onto the bed a Margolus phase later (which is
+// how bed scour bridges the two-tick partition). (Temperature, planned for byte 3,
+// will need its own home once it lands.)
 uint MAT(uint c) { return c & 0xFFu; }
 uint SAT(uint c) { return (c >> 8u) & 0xFFu; }
+uint B2(uint c) { return (c >> 16u) & 0xFFu; }   // sediment: LOAD (water) / WEAR (solid)
+uint B3(uint c) { return (c >> 24u) & 0xFFu; }   // flow age (water)
 uint PACK(uint m, uint s) { return (m & 0xFFu) | (min(s, 255u) << 8u); }
+uint PACK3(uint m, uint s, uint b2) { return PACK(m, s) | (min(b2, 255u) << 16u); }
+// set only the LOAD byte, keeping material/saturation/flow-age (for water cells)
+uint SET_LOAD(uint c, uint load) { return (c & 0xFF00FFFFu) | (min(load, 255u) << 16u); }
 
 bool is_soil(uint m) { return m == SOIL || m == SAND || m == MUD || m == GRASS; }
 
@@ -256,6 +267,19 @@ const uint MUD_DRY = 55u;  // ...and mud below this dries back to soil
 const uint UPTAKE = 3u;    // saturation a grass cell draws from the ground per tick
 const uint GRASS_FLOOR = 24u; // grass draws surrounding moisture down only to here
 const float GROW = 0.004;  // per-tick chance moist surface soil sprouts grass
+
+// SUSPENDED SEDIMENT (byte 2). Flowing water lifts bed material into a suspended
+// LOAD carried in the water cell (rides along on Margolus swaps), which then
+// sinks toward the bed and re-deposits where the flow slackens — so rivers cut
+// channels and rebuild the eroded material as beds, bars and deltas downstream.
+// Mass is conserved as a strict LEDGER: an erodible voxel holds (255-WEAR) units
+// of solid, a water cell holds LOAD units of suspended solid; every rule below
+// only MOVES units between the two, never creates or destroys them.
+const uint SED_ERODE = 20u;  // units a flowing water cell lifts off the bed below per tick
+const uint SED_CAP = 190u;   // max load erosion alone can build (headroom under the 255 byte)
+const uint SED_SETTLE = 24u; // units of load that sink one cell per tick (concentrates at the bed)
+const uint SED_DEPO = 40u;   // resting water this laden settles its load out as a sediment voxel
+const uint FLOW_TAG = 6u;    // flow-age stamped on moving water; decays 1/tick when it rests
 
 uint dens(uint m) {
 	if (m == AIR) return 0u;
@@ -388,7 +412,18 @@ void do_step_at(uvec3 base) {
 	const uint bottoms[4] = uint[4](0u, 1u, 4u, 5u);
 
 	uint rules = p.mode >> 8u;
+	// default = the classic ruleset (0xFF). SEDIMENT (bit 256) is opt-in: enable it by
+	// setting rules_mask to include 0x100 (e.g. VOX_SEDIMENT / VOX_RULES). Left off, all
+	// the byte-2 sediment bookkeeping below is a no-op (byte 2 stays 0 everywhere), so
+	// the tuned water/soil/mud behaviour is byte-for-byte the classic sim.
 	if (rules == 0u) { rules = 0xFFu; }
+	// which local cells actually MOVED this tick (a gravity/diagonal/lateral swap).
+	// This is what the sediment rule reads for "flowing": a conformal water sheet
+	// over a bed looks locally full (no in-block air below, so water_flowing can't
+	// see it), but the water in it swaps downhill every tick — so motion, not a
+	// static shape, is the honest signal that water is running and can erode.
+	bool moved[8];
+	for (uint mi = 0u; mi < 8u; mi++) { moved[mi] = false; }
 	// 1. gravity: heavier sinks into lighter directly below (in-block pairs)
 	if ((rules & 1u) != 0u)
 	for (uint k = 0u; k < 4u; k++) {
@@ -396,6 +431,7 @@ void do_step_at(uvec3 base) {
 		uint t = b + 2u;
 		if (movable(MAT(c[t])) && dens(MAT(c[t])) > dens(MAT(c[b]))) {
 			uint tmp = c[t]; c[t] = c[b]; c[b] = tmp;   // swap carries wetness
+			moved[t] = true; moved[b] = true;
 		}
 	}
 
@@ -418,6 +454,7 @@ void do_step_at(uvec3 base) {
 			if (pick == 2u) { cand = (below ^ 1u) ^ 4u; } // differs in both
 			if (is_water ? (MAT(c[cand]) == AIR) : (dens(MAT(c[cand])) < dens(m))) {
 				uint tmp = c[t]; c[t] = c[cand]; c[cand] = tmp;
+				moved[t] = true; moved[cand] = true;
 				break;
 			}
 		}
@@ -446,6 +483,7 @@ void do_step_at(uvec3 base) {
 				&& MAT(c[b ^ 2u]) != AIR && MAT(c[a ^ 2u]) == AIR;
 		if (ab || ba) {
 			uint tmp = c[a]; c[a] = c[b]; c[b] = tmp;
+			moved[a] = true; moved[b] = true;
 		}
 	}
 
@@ -458,11 +496,13 @@ void do_step_at(uvec3 base) {
 		uint t = b + 2u;
 		uint mb = MAT(c[b]);
 		uint mt = MAT(c[t]);
-		if (mt == WATER && permeable(mb) && SAT(c[b]) < sat_cap(mb)
+		if (mt == WATER && B2(c[t]) == 0u && permeable(mb) && SAT(c[b]) < sat_cap(mb)
 				&& rnd() < permeability(mb)) {
 			// water resting on thirsty ground soaks in at the ground's seepage
-			// rate (not instantly), so it can level out first
-			c[b] = PACK(mb, min(SAT(c[b]) + ABSORB, sat_cap(mb)));
+			// rate (not instantly), so it can level out first. Only CLEAR water
+			// infiltrates — laden water settles its sediment out (rule 7) first, so
+			// soaking-in never has to swallow a suspended load and lose that mass.
+			c[b] = PACK3(mb, min(SAT(c[b]) + ABSORB, sat_cap(mb)), B2(c[b]));
 			c[t] = AIR;
 			atomicAdd(absorbed, 1u);
 		} else if (permeable(mt) && permeable(mb)
@@ -471,8 +511,8 @@ void do_step_at(uvec3 base) {
 			// only water above field capacity drains, at the material's seepage
 			// rate; the rest is held by capillary action (keeps ground moist)
 			uint mv = min(min(SAT(c[t]) - FIELD_CAP, PERC), sat_cap(mb) - SAT(c[b]));
-			c[t] = PACK(mt, SAT(c[t]) - mv);
-			c[b] = PACK(mb, SAT(c[b]) + mv);
+			c[t] = PACK3(mt, SAT(c[t]) - mv, B2(c[t]));
+			c[b] = PACK3(mb, SAT(c[b]) + mv, B2(c[b]));
 		}
 	}
 
@@ -481,7 +521,9 @@ void do_step_at(uvec3 base) {
 	for (uint k = 0u; k < 4u; k++) {
 		uint b = bottoms[k];
 		if (MAT(c[b]) == WATER && MAT(c[b + 2u]) == AIR && rnd() < p.evap_prob) {
-			c[b] = AIR;
+			// evaporating water leaves its suspended sediment behind as a deposit
+			// (a drying laden puddle crusts over) rather than destroying that mass
+			c[b] = B2(c[b]) > 0u ? PACK3(SAND, 0u, 255u - B2(c[b])) : AIR;
 			atomicAdd(evaporated, 1u);
 		}
 	}
@@ -500,7 +542,72 @@ void do_step_at(uvec3 base) {
 		if ((water_flowing(c, l ^ 1u) || water_flowing(c, l ^ 2u) || water_flowing(c, l ^ 4u))
 				&& rnd() < p.erode_prob * em) {
 			uint into = ml == STONE ? SOIL : SAND;
-			c[l] = PACK(into, min(SAT(c[l]), sat_cap(into)));
+			c[l] = PACK3(into, min(SAT(c[l]), sat_cap(into)), B2(c[l]));   // carry WEAR
+		}
+	}
+
+	// 7. SEDIMENT: transport + deposition (see SED_* consts). Vertical in-block
+	// pairs only (b = bottom, t = top = b+2), so every unit transfer is between
+	// two cells of the same block and therefore race-free. The four cases are
+	// mutually exclusive on the bed cell's state, so the ledger stays exact.
+	// FLOW AGE: stamp moving water to FLOW_TAG, decay resting water by 1/tick. The
+	// age rides along on swaps, so water that ran downhill stays "flowing" for a few
+	// ticks after it settles onto the bed — which is how the erosion below sees the
+	// current at all: the water that MOVES is at the flow surface (a top cell running
+	// into air), while the water TOUCHING the bed is momentarily supported and still;
+	// they meet only across the Margolus phase flip, and the age bridges it. A truly
+	// still lake never moves, so its water keeps age 0 and never scours its banks.
+	if ((rules & 256u) != 0u) {
+		// A block where any water MOVED is a live current: stamp ALL its water to the
+		// full flow age so the bed-contact cell (which is itself momentarily supported
+		// and still, yet part of the same current) is tagged too. The age rides on
+		// swaps and decays 1/tick at rest, so it also persists a few ticks downstream.
+		// A truly still lake has no motion in any of its blocks, so nothing is stamped
+		// and its floor/banks are left intact.
+		bool blkmove = false;
+		for (uint l = 0u; l < 8u; l++) { if (moved[l] && MAT(c[l]) == WATER) { blkmove = true; } }
+		for (uint l = 0u; l < 8u; l++) {
+			if (MAT(c[l]) == WATER) {
+				uint age = blkmove ? FLOW_TAG : (B3(c[l]) > 0u ? B3(c[l]) - 1u : 0u);
+				c[l] = (c[l] & 0x00FFFFFFu) | (age << 24u);
+			}
+		}
+	}
+	if ((rules & 256u) != 0u)
+	for (uint k = 0u; k < 4u; k++) {
+		uint b = bottoms[k];
+		uint t = b + 2u;
+		if (MAT(c[t]) != WATER) { continue; }
+		uint mb = MAT(c[b]);
+		uint load = B2(c[t]);
+		bool flowing = B3(c[t]) > 0u;   // this water is a live current (see FLOW AGE)
+		if (is_soil(mb) && flowing) {
+			// (a) DETACH: moving water lifts grains off the bed below. The bed loses
+			// solid (WEAR up); when fully worn it turns to AIR so the channel deepens.
+			uint bw = B2(c[b]);
+			uint room = load < SED_CAP ? SED_CAP - load : 0u;
+			uint amt = min(min(uint(float(SED_ERODE) * erosion_mult(mb)), room), 255u - bw);
+			if (amt > 0u) {
+				c[t] = SET_LOAD(c[t], load + amt);
+				uint nw = bw + amt;
+				c[b] = nw >= 255u ? AIR : PACK3(mb, SAT(c[b]), nw);
+			}
+		} else if (mb == WATER && !flowing) {
+			// (b) SETTLE: in STILL water, suspended load sinks toward the bed so it can
+			// pile up and deposit. In FLOWING water we leave it in suspension (the
+			// current carries it) — settling it there would just re-deposit at the
+			// erosion site instead of transporting it downstream to the delta.
+			uint lb = B2(c[b]);
+			uint amt = min(min(SED_SETTLE, load), 255u - lb);
+			if (amt > 0u) {
+				c[t] = SET_LOAD(c[t], load - amt);
+				c[b] = SET_LOAD(c[b], lb + amt);
+			}
+		} else if (mb != AIR && mb != WATER && !flowing && load >= SED_DEPO) {
+			// (d) DEPOSIT-NEW: heavily laden RESTING water on firm support (stone, or
+			// unworn soil/sand — a lake/sea bed) settles out a sediment voxel; the
+			// water cell becomes that sand, its remaining solid == the load it held.
+			c[t] = PACK3(SAND, 0u, 255u - load);
 		}
 	}
 
@@ -514,9 +621,9 @@ void do_step_at(uvec3 base) {
 		// don't become sliding mud. Mud dries back to soil anywhere. Formation
 		// is tested on the bottom cell, whose 'above' is the in-block top cell.
 		if (MAT(c[b]) == SOIL && SAT(c[b]) >= MUD_WET && MAT(c[t]) == AIR)
-			c[b] = PACK(MUD, SAT(c[b]));
-		else if (MAT(c[b]) == MUD && SAT(c[b]) <= MUD_DRY) c[b] = PACK(SOIL, SAT(c[b]));
-		if (MAT(c[t]) == MUD && SAT(c[t]) <= MUD_DRY) c[t] = PACK(SOIL, SAT(c[t]));
+			c[b] = PACK3(MUD, SAT(c[b]), B2(c[b]));
+		else if (MAT(c[b]) == MUD && SAT(c[b]) <= MUD_DRY) c[b] = PACK3(SOIL, SAT(c[b]), B2(c[b]));
+		if (MAT(c[t]) == MUD && SAT(c[t]) <= MUD_DRY) c[t] = PACK3(SOIL, SAT(c[t]), B2(c[t]));
 
 		// grass on the bottom cell (its 'above' is the in-block top cell):
 		// grows on moist, lit surface soil; reverts if drowned/buried/parched
@@ -524,17 +631,17 @@ void do_step_at(uvec3 base) {
 		uint mt = MAT(c[t]);
 		if (mb == SOIL && mt == AIR && SAT(c[b]) >= 8u && SAT(c[b]) <= 108u
 				&& rnd() < GROW) {
-			c[b] = PACK(GRASS, SAT(c[b]));
+			c[b] = PACK3(GRASS, SAT(c[b]), B2(c[b]));
 		} else if (mb == GRASS && mt != AIR) {
 			// drowned or buried (no light) -> vegetation dies back to soil
-			c[b] = PACK(SOIL, SAT(c[b]));
+			c[b] = PACK3(SOIL, SAT(c[b]), B2(c[b]));
 		}
 
 		// grass roots draw surrounding ground moisture down toward GRASS_FLOOR
 		// (absorbing water from nearby voxels) — it never drinks itself dry,
 		// and by lowering saturation it holds waterlogging/mud at bay
 		if (MAT(c[t]) == GRASS && SAT(c[b]) > GRASS_FLOOR) {
-			c[b] = PACK(MAT(c[b]), max(SAT(c[b]) - UPTAKE, GRASS_FLOOR));
+			c[b] = PACK3(MAT(c[b]), max(SAT(c[b]) - UPTAKE, GRASS_FLOOR), B2(c[b]));
 		}
 	}
 
@@ -719,7 +826,10 @@ void do_face_emit() {
 			if (nm != AIR && nm != WATER) { solid_n += 1; }
 		}
 		vec4 col;
-		if (is_water) { col = vec4(1.0); }
+		if (is_water) {
+			float ld = float(B2(raw)) / 255.0;
+			col = vec4(mix(vec3(1.0), vec3(0.46, 0.34, 0.19), ld * 0.9), 1.0);
+		}
 		else {
 			float jit = 1.0 + (float(pcg(cid * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
 			float ao = 1.0 - float(solid_n) * 0.05;
@@ -792,8 +902,12 @@ void do_emit() {
 					float(int(yy) + int(p.gen_oy)) + 0.5,
 					float(world_coord(z, p.gen_oz, p.D) - p.gen_oz) + 0.5);
 			if (is_water) {
+				// tint muddy by suspended sediment load (byte 2) — a laden river
+				// reads brown, clearing to white where it drops its load
+				float ld = float(B2(raw)) / 255.0;
+				vec4 wcol = vec4(mix(vec3(1.0), vec3(0.46, 0.34, 0.19), ld * 0.9), 1.0);
 				uint slot = atomicAdd(n_water, 1u);
-				if (slot < cap_water) { write_inst(true, slot, origin, vec4(1.0), 1.0); }
+				if (slot < cap_water) { write_inst(true, slot, origin, wcol, 1.0); }
 			} else {
 				// per-voxel tint jitter + crude AO from buried-ness
 				float jit = 1.0 + (float(pcg(cid * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
