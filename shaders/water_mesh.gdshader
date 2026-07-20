@@ -24,6 +24,12 @@ uniform float gen_oy = 0.0;
 // the sim water level relaxes to the sea line and sim depth crossfades to
 // procedural depth
 uniform float apron = 0.0;
+// scene depth from the OPAQUE pass. The far-sea path reads it to place the
+// flat skirt on the sea floor the far-terrain clipmap already rasterized,
+// instead of re-evaluating the per-pixel worldgen. Godot 4.7 removed the
+// built-in DEPTH_TEXTURE in favour of this explicit hint uniform; filter_nearest
+// so the reconstructed depth never bleeds land into sea across silhouettes.
+uniform sampler2D DEPTH_TEXTURE : hint_depth_texture, filter_nearest;
 
 #include "res://shaders/worldgen.gdshaderinc"
 #include "res://shaders/sim_surface.gdshaderinc"
@@ -68,6 +74,39 @@ void vertex() {
 }
 
 void fragment() {
+	// world (render-space) position of this water fragment; used by the far-sea
+	// depth compare below and the Fresnel term. VERTEX is view-space in fragment.
+	vec3 wpos = (INV_VIEW_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	float d;
+	if (v_pw >= 1.0) {
+		// ---- CHEAP FAR-SEA PATH: the flat SEA_Y skirt past the apron ----
+		// This skirt fills the whole screen from altitude, and the near path would
+		// re-evaluate the per-pixel worldgen (world_height ~= 80 noise samples/pixel)
+		// just to find the sea floor here. But the OPAQUE far-terrain clipmap already
+		// rasterized that exact sea floor into the depth buffer (its reach matches
+		// the skirt's WATER_R), so we read the floor from DEPTH_TEXTURE instead:
+		// exact-consistent with the drawn terrain (no mud rims), and almost free.
+		// (On a 4090 the skipped worldgen is ~0 ms, so this is a defensive cleanup,
+		// not a measured win — see the water-overdraw commit message.)
+		float sd = texture(DEPTH_TEXTURE, SCREEN_UV).x;
+		if (sd <= 0.0) {
+			// reverse-Z far plane == sky behind the water (the thin horizon strip
+			// where terrain ends): open ocean, render it deep.
+			d = 64.0;
+		} else {
+			// reconstruct the opaque surface's world-Y from the depth buffer
+			vec3 ndc = vec3(SCREEN_UV * 2.0 - 1.0, sd);
+			vec4 vp = INV_PROJECTION_MATRIX * vec4(ndc, 1.0);
+			vp.xyz /= vp.w;
+			float floor_y = (INV_VIEW_MATRIX * vec4(vp.xyz, 1.0)).y;
+			d = wpos.y - floor_y;
+			// the drawn surface sits AT/ABOVE the sea plane => it is land in front
+			// of the skirt (a hill base the flat plane would otherwise film blue),
+			// not a submerged bed. No water here — same result world_height gave.
+			if (d < 0.05) { discard; }
+		}
+		// tint/alpha below run off d exactly as the near path; skip to shading.
+	} else {
 	vec2 lpc = clamp(v_lp, vec2(0.5), win_size - 0.5);
 	vec2 hs = sim_tex_smooth(sim_terra, lpc, win_size).rg;
 	vec2 raw = texture(sim_raw, (lpc + 0.5) / win_size).rg;
@@ -75,7 +114,7 @@ void fragment() {
 	// true per-column depth; outside, the blended surface over the worldgen
 	// bed (per-vertex values inherit mesh density and print LoD artefacts)
 	float draw = raw.g - raw.r;
-	float d = draw;
+	d = draw;
 	// the GROUND the terrain mesh draws at this pixel — smoothed sim inside
 	// the window, worldgen outside, crossfaded over BLEND_M inside the edge
 	// (mirrors far_terrain's terrain_h exactly)
@@ -110,6 +149,7 @@ void fragment() {
 	// line stay through the draw>=0.5 escape).
 	if (grd >= SEA_Y && draw < 0.5) { discard; }
 	if (v_wy - grd < 0.05) { discard; }
+	}
 	// deepen the blue with depth; shallows stay translucent over the bed
 	float dp = 1.0 - exp(-d * 0.10);
 	// ALPHA rises from 0 at the waterline toward near-opaque as depth grows.
@@ -134,8 +174,8 @@ void fragment() {
 	// to the water grid's coarse normals, and the floating-origin offset cancels in a
 	// direction (camera − fragment). This is what makes distant water read as bright
 	// sky and near water as deep blue, the physically-correct version of "grazing
-	// water looks different". SKY_TINT ≈ the ProceduralSky horizon.
-	vec3 wpos = (INV_VIEW_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	// water looks different". SKY_TINT ≈ the ProceduralSky horizon. wpos is the
+	// fragment world pos hoisted to the top of fragment() (shared with the far path).
 	float cosT = clamp(normalize(INV_VIEW_MATRIX[3].xyz - wpos).y, 0.0, 1.0);
 	float fres = 0.02 + 0.98 * pow(1.0 - cosT, 5.0);
 	const vec3 SKY_TINT = vec3(0.62, 0.76, 0.92);
