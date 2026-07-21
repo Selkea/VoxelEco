@@ -832,6 +832,13 @@ func dispatch_emit() -> PackedInt32Array:
 			if lod_r > 0:
 				rd.compute_list_set_push_constant(cl, _pc(11, 0), PC_SIZE)   # coarse far block quads
 				rd.compute_list_dispatch(cl, _block_groups, 1, 1)
+		elif world_mesh and not ray_render:
+			# the world mesh draws the terrain; overlay only the living layer
+			# (foliage + animals) as instanced faces so the ecosystem is visible in
+			# the interactive default render (see do_agent_emit). update_heights (which
+			# the mesh path already runs before this) keeps the column watermark tight.
+			rd.compute_list_set_push_constant(cl, _pc(24, 0), PC_SIZE)   # agent/foliage overlay
+			rd.compute_list_dispatch(cl, _col_groups, 1, 1)
 		if far_field and far_tiles and lod_r > 0:
 			for ring in range(FAR_SIDES.size()):   # heightfield vista rings out to 8 km
 				rd.compute_list_set_push_constant(cl, _pc(12, ring), PC_SIZE)
