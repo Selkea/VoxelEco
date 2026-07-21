@@ -27,6 +27,12 @@ var cd := 0
 var use_instances := false
 var solid_mm: MultiMeshInstance3D
 var water_mm: MultiMeshInstance3D
+# living layer over the world mesh: grass tufts (blade clusters) and animals
+# (low-poly critters), each its own MultiMesh written by the compute emit
+var grass_mm: MultiMeshInstance3D
+var grass_mat: ShaderMaterial
+var animal_mm: MultiMeshInstance3D
+var animal_mat: StandardMaterial3D
 # ray-cast renderer overlay: the compute pass writes an rgba8 image; this shows
 # it over the 3D view (alpha 0 where rays miss, so the sky/far field show through)
 var ray_layer: CanvasLayer
@@ -292,6 +298,16 @@ func _ready() -> void:
 		# terrain uses the greedy-mesh QUAD; water stays a small overlapping cube.
 		solid_mm = _make_mm(solid_mat, world.solid_cap, true)
 		water_mm = _make_mm(water_mat, world.water_cap, true)
+		# grass tufts overlaid on the world mesh (world_mesh render): the compute
+		# emit writes one instance per plant-bearing column near the camera
+		grass_mat = ShaderMaterial.new()
+		grass_mat.shader = load("res://shaders/grass.gdshader")
+		grass_mm = _make_life_mm(grass_mat, world.grass_cap, _grass_tuft_mesh())
+		# grazers + predators as low-poly critters (per-instance colour = trophic role)
+		animal_mat = StandardMaterial3D.new()
+		animal_mat.vertex_color_use_as_albedo = true
+		animal_mat.roughness = 0.8
+		animal_mm = _make_life_mm(animal_mat, world.animal_cap, _critter_mesh())
 	else:
 		_alloc_chunks()
 
@@ -343,16 +359,117 @@ func _inst_aabb() -> AABB:
 	return AABB(Vector3(-16, -16, -16),
 			Vector3(world.W + 32, AABB_Y, world.D + 32))
 
+## a MultiMesh for the living layer (grass/animals): a real base mesh (blades /
+## critter body) instanced by the compute emit's per-instance transform + colour.
+func _make_life_mm(mat: Material, cap: int, base_mesh: Mesh) -> MultiMeshInstance3D:
+	var mmi := MultiMeshInstance3D.new()
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_colors = true
+	mm.mesh = base_mesh
+	mm.instance_count = cap
+	mm.visible_instance_count = 0
+	mmi.multimesh = mm
+	mmi.material_override = mat
+	mmi.custom_aabb = _inst_aabb()
+	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF   # tufts/critters don't cast
+	add_child(mmi)
+	return mmi
+
+## one grass tuft: a fan of tapered blades (opaque geometry, no alpha) rooted at the
+## origin, rising ~2.6 voxels with an outward bend. UV.y carries the height fraction
+## (0 base .. 1 tip) for the shader's colour gradient and sway weight.
+func _grass_tuft_mesh() -> ArrayMesh:
+	const BLADES := 5
+	const H := 1.7            # blade height (voxels) — meadow, not prairie
+	const BASE_W := 0.34      # half-width at the base
+	const TIP_W := 0.03
+	const BEND := 0.55        # outward lean at the tip
+	const ROOT_R := 0.12      # how far blades root from the tuft centre
+	var verts := PackedVector3Array()
+	var uvs := PackedVector2Array()
+	var nrm := PackedVector3Array()
+	var idx := PackedInt32Array()
+	var levels: Array[float] = [0.0, 0.5, 1.0]
+	for b in range(BLADES):
+		var yaw := float(b) / float(BLADES) * TAU + float((b * 2654435761) & 255) / 255.0 * 0.7
+		var d := Vector2(cos(yaw), sin(yaw))
+		var perp := Vector2(-d.y, d.x)
+		var ring := []
+		for f in levels:
+			var y := f * H
+			var out: float = ROOT_R + BEND * f * f
+			var c := Vector2(d.x * out, d.y * out)
+			var w: float = lerpf(BASE_W, TIP_W, f)
+			var l := Vector3(c.x + perp.x * w, y, c.y + perp.y * w)
+			var r := Vector3(c.x - perp.x * w, y, c.y - perp.y * w)
+			ring.append([l, r, f])
+		for s in range(levels.size() - 1):
+			var lo: Array = ring[s]
+			var hi: Array = ring[s + 1]
+			var base_i := verts.size()
+			for pt: Array in [[lo[0], lo[2]], [lo[1], lo[2]], [hi[1], hi[2]], [hi[0], hi[2]]]:
+				verts.append(pt[0])
+				uvs.append(Vector2(0.0, pt[1]))
+				nrm.append(Vector3.UP)
+			idx.append_array([base_i, base_i + 1, base_i + 2,
+					base_i, base_i + 2, base_i + 3])
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = verts
+	arr[Mesh.ARRAY_TEX_UV] = uvs
+	arr[Mesh.ARRAY_NORMAL] = nrm
+	arr[Mesh.ARRAY_INDEX] = idx
+	var m := ArrayMesh.new()
+	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+	return m
+
+## one low-poly critter: an ellipsoid body + head + four stub legs, feet at y=0,
+## facing +X. Rounded primitives (not boxes) so a grazer reads as an animal, not a
+## voxel. Per-instance colour (grazer cream / predator rust) comes from the MultiMesh.
+func _critter_mesh() -> ArrayMesh:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	st.set_color(Color.WHITE)   # instance colour modulates this
+	var body := SphereMesh.new()
+	body.radius = 0.6
+	body.height = 1.2
+	body.radial_segments = 9
+	body.rings = 5
+	st.append_from(body, 0, Transform3D(Basis().scaled(Vector3(2.0, 1.0, 1.15)), Vector3(0.0, 0.95, 0.0)))
+	var head := SphereMesh.new()
+	head.radius = 0.44
+	head.height = 0.88
+	head.radial_segments = 8
+	head.rings = 4
+	st.append_from(head, 0, Transform3D(Basis(), Vector3(1.18, 1.28, 0.0)))
+	var leg := BoxMesh.new()
+	leg.size = Vector3(0.26, 0.95, 0.26)
+	for lp in [Vector3(0.72, 0.47, 0.4), Vector3(0.72, 0.47, -0.4),
+			Vector3(-0.72, 0.47, 0.4), Vector3(-0.72, 0.47, -0.4)]:
+		st.append_from(leg, 0, Transform3D(Basis(), lp))
+	return st.commit()
+
 func solid_buffer_rid() -> RID:
 	return RenderingServer.multimesh_get_buffer_rd_rid(solid_mm.multimesh.get_rid())
 
 func water_buffer_rid() -> RID:
 	return RenderingServer.multimesh_get_buffer_rd_rid(water_mm.multimesh.get_rid())
 
+func grass_buffer_rid() -> RID:
+	return RenderingServer.multimesh_get_buffer_rd_rid(grass_mm.multimesh.get_rid())
+
+func animal_buffer_rid() -> RID:
+	return RenderingServer.multimesh_get_buffer_rd_rid(animal_mm.multimesh.get_rid())
+
 ## per-frame: the buffers are already written GPU-side; just set the counts
-func set_visible_counts(ns: int, nw: int) -> void:
+func set_visible_counts(ns: int, nw: int, ng: int = 0, na: int = 0) -> void:
 	solid_mm.multimesh.visible_instance_count = ns
 	water_mm.multimesh.visible_instance_count = nw
+	if grass_mm != null:
+		grass_mm.multimesh.visible_instance_count = ng
+	if animal_mm != null:
+		animal_mm.multimesh.visible_instance_count = na
 
 ## FLOATING ORIGIN: the emit writes voxels in the LOCAL frame [0, W) (relative to
 ## the window origin), so the culling AABB is a fixed local box — the whole scene
@@ -364,6 +481,10 @@ func set_stream_origin(_ox: int, _oz: int) -> void:
 	var a := _inst_aabb()
 	solid_mm.custom_aabb = a
 	water_mm.custom_aabb = a
+	if grass_mm != null:
+		grass_mm.custom_aabb = a
+	if animal_mm != null:
+		animal_mm.custom_aabb = a
 
 func _alloc_chunks() -> void:
 	for mi in solid_chunks + water_chunks:
