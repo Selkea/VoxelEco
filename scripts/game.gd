@@ -194,6 +194,7 @@ func _ready() -> void:
 			gw.gen_oy = gw.band_oy_for(cx, cz)
 			gw.regen(base, base)
 			view.set_stream_origin(base, base)
+			_populate_ecology()   # fly straight into a living meadow
 		# camera hovers above the surface (world-Y), looking down over the vista
 		fly_pos = Vector3(base + world.W * 0.5, surf + world.H * 0.4, base + world.D * 0.5)
 		fly_yaw = 0.0
@@ -282,9 +283,11 @@ func _stream() -> void:
 		gw.gen_oy = noy
 		gw.regen(nox, noz)
 		gw.reset_water_stats()
+		_populate_ecology()         # fresh grid: repopulate the new window
 	elif dx >= world.W or dz >= world.D:
 		gw.regen(nox, noz)          # teleport: whole window is new
 		gw.reset_water_stats()
+		_populate_ecology()
 	else:
 		# TOROIDAL: shift the origin and regenerate ONLY the freshly-entered edge
 		# strips, keeping the rest of the window's water/erosion state intact.
@@ -313,7 +316,43 @@ func _track_band() -> void:
 	gw.gen_oy = target
 	gw.regen(gw.gen_origin_x, gw.gen_origin_z)   # re-fill the window at the new band Y
 	gw.reset_water_stats()
+	_populate_ecology()             # fresh grid: repopulate the re-filled window
 	_refresh_view(true)
+
+## AUTO-POPULATE the living ecosystem for interactive play: drop a cohort of grazers
+## and predators onto the freshly generated window's grass so you fly straight into a
+## self-running food web (vegetation grows, grazers eat it, predators hunt grazers).
+## Called after every FULL window regen (initial spawn, band shift, teleport) — never
+## after a toroidal edge regen, where the interior herd persists and only agents in
+## the re-filled strip self-retire. Cohorts scale to the VISIBLE area (the LOD disc):
+## agents scatter across the whole window but only those near the camera render, so
+## sizing to the full window area would seed — and simulate — tens of thousands off
+## screen. VOX_HERD / VOX_PACK override the visible targets; VOX_NOECO=1 disables it
+## (bare terrain, e.g. for draw-perf measurement).
+func _populate_ecology() -> void:
+	if OS.get_environment("VOX_NOECO") != "":
+		return
+	if not (world is GpuWorld) or not world.gpu_ok:
+		return
+	var gw := world as GpuWorld
+	var cols := float(world.W * world.D)
+	# how many total agents yield a given VISIBLE count near the camera
+	var vis := cols
+	if gw.lod_r > 0:
+		vis = minf(cols, PI * float(gw.lod_r) * float(gw.lod_r))
+	var ratio := cols / maxf(vis, 1.0)
+	var herd := OS.get_environment("VOX_HERD").to_int() if OS.get_environment("VOX_HERD") != "" else 150
+	var pack := OS.get_environment("VOX_PACK").to_int() if OS.get_environment("VOX_PACK") != "" else 18
+	# cap the cohort at a sane fraction of the window so a small world isn't carpeted
+	var nh := 0
+	var np := 0
+	if herd > 0:
+		nh = clampi(int(herd * ratio), 12, maxi(24, world.W * world.D / 100))
+		gw.seed_herbivores(nh)
+	if pack > 0:
+		np = clampi(int(pack * ratio), 3, maxi(6, world.W * world.D / 400))
+		gw.seed_predators(np)
+	print("ecology: seeded %d grazers + %d predators into the window" % [nh, np])
 
 ## FLOATING ORIGIN: the emit draws the world in a local frame relative to the
 ## window origin (world_coord - gen_origin), so the camera is offset by the same

@@ -926,6 +926,72 @@ void do_face_emit() {
 	if (!found) { topmark[id] = 0u; }   // all-air column (can't happen post-gen)
 }
 
+// mode 24: AGENT OVERLAY for the world-mesh renderer. The unified surface mesh
+// draws the terrain (and do_heights deliberately treats PLANT/HERB/PRED as "not
+// terrain", so the mesh surface passes UNDER them), which leaves the living layer
+// invisible. This pass emits ONLY the foliage/animal voxels as instanced faces on
+// top of the mesh — the same chunky HERB/PRED critters and PLANT tufts the voxel
+// path draws, without re-emitting the millions of terrain faces the mesh already
+// covers. One thread per column, but it only ever touches the thin band of
+// non-terrain cells just above the ground, so it stays cheap at map scale.
+void do_agent_emit() {
+	uint id = flat_id();
+	if (id >= p.W * p.D) { return; }
+	uint x = id % p.W;
+	uint z = id / p.W;
+	if (z < p.cut_z) { return; }
+	float wx = float(world_coord(x, p.gen_ox, p.W) - p.gen_ox);
+	float wz = float(world_coord(z, p.gen_oz, p.D) - p.gen_oz);
+	// distance LOD, same disc do_face_emit uses: living things are only drawn near
+	// the camera (far agents are subpixel and would just cost instances). lod_r 0 =
+	// small world, emit everywhere.
+	if (p.lod_r > 0u) {
+		float ddx = wx - float(p.lod_cx);
+		float ddz = wz - float(p.lod_cz);
+		float cy = float(p.lod_cy);
+		if (ddx * ddx + ddz * ddz + cy * cy > float(p.lod_r) * float(p.lod_r)) { return; }
+		if (cone_out(ddx, ddz, 400.0)) { return; }
+	}
+	// walk down from the column watermark (do_heights keeps it tight in mesh mode):
+	// skip the air above, emit each PLANT/HERB/PRED voxel, and STOP at the first
+	// ground/water cell — nothing below the surface is a living voxel.
+	uint yy = min(topmark[id] + 1u, p.H);
+	while (yy > 0u) {
+		yy--;
+		uint cid = cidx(x, yy, z);
+		uint m = MAT(cget(cid));
+		if (m == AIR) { continue; }
+		if (m != PLANT && m != HERB && m != PRED) { break; }   // hit terrain/water
+		float Y = float(int(yy) + int(p.gen_oy));
+		uint nbr[6];
+		int solid_n = 0;
+		for (uint k = 0u; k < 6u; k++) {
+			int dx = k==0u?1:(k==1u?-1:0);
+			int dy = k==2u?1:(k==3u?-1:0);
+			int dz = k==4u?1:(k==5u?-1:0);
+			int nx = int(x)+dx, ny = int(yy)+dy, nz = int(z)+dz;
+			uint nm = AIR;
+			bool oob = nx<0 || nx>=int(p.W) || ny>=int(p.H) || nz<0 || nz>=int(p.D);
+			if (ny < 0) { nm = BEDROCK; }
+			else if (nz < int(p.cut_z)) { nm = AIR; }
+			else if (oob && dy == 0) { nm = BEDROCK; }
+			else if (!oob) { nm = MAT(cget(cidx(uint(nx), uint(ny), uint(nz)))); }
+			nbr[k] = nm;
+			if (nm != AIR && nm != WATER) { solid_n += 1; }
+		}
+		float jit = 1.0 + (float(pcg(cid * 2654435761u) & 255u) / 255.0 * 0.24 - 0.12);
+		float ao = 1.0 - float(solid_n) * 0.05;
+		vec4 col = vec4(mat_color(m) * jit * ao, 1.0);
+		// inflate animal bodies into chunky critters (render-only); a predator reads
+		// bulkier than a grazer. PLANT keeps its slim 1x1 voxel (grow 0), matching
+		// the per-voxel render path exactly.
+		float grow = (m == HERB) ? 0.45 : (m == PRED ? 0.6 : 0.0);
+		for (uint k = 0u; k < 6u; k++) {
+			if (nbr[k] == AIR || nbr[k] == WATER) { emit_face(false, k, wx, Y, wz, col, grow); }
+		}
+	}
+}
+
 // one thread per COLUMN: walk it top-down and emit every exposed voxel, then stop
 // once a cell is buried in solid on all six sides — in this sim nothing below such
 // a cell is ever visible (no caves; water sits on top, the subsurface is solid
@@ -2512,5 +2578,6 @@ void main() {
 	else if (mode == 21u) { do_herbivore(); }
 	else if (mode == 22u) { do_pred_seed(); }
 	else if (mode == 23u) { do_predator(); }
+	else if (mode == 24u) { do_agent_emit(); }
 	else { do_step(); }
 }
