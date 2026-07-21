@@ -624,6 +624,15 @@ func _take_screenshot() -> void:
 			var hrun := OS.get_environment("VOX_HERBRUN").to_int()
 			world.run(hrun if hrun > 0 else 500)
 			print("SHOT: seeded %d grazers, population now %d" % [shot_herb, (world as GpuWorld).herb_population()])
+		# PREDATORS: seed onto the grazed meadow so hunters spread among the herd
+		# before the shot (VOX_PRED = cohort, VOX_PREDRUN = ticks to hunt/spread).
+		var shot_pred := OS.get_environment("VOX_PRED").to_int()
+		if shot_pred > 0 and world is GpuWorld:
+			(world as GpuWorld).seed_predators(shot_pred)
+			var prun := OS.get_environment("VOX_PREDRUN").to_int()
+			world.run(prun if prun > 0 else 400)
+			print("SHOT: seeded %d predators, population now %d (herd %d)" % [
+				shot_pred, (world as GpuWorld).pred_population(), (world as GpuWorld).herb_population()])
 		world.set_rain_mm_hr(0.0)
 		var ro := _render_off()
 		var vy := OS.get_environment("VOX_CAMY").to_float()
@@ -1765,6 +1774,117 @@ func _run_sim_test() -> void:
 		print("HERBTEST OK (grazers roam, eat the plant tier, breed/starve; water conserved)" if ok
 			else "HERBTEST FAIL")
 		hw.free_gpu(); cw.free_gpu()
+		get_tree().quit()
+		return
+	if OS.get_environment("VOX_PREDTEST") != "":
+		# PREDATORS: mobile hunters eat grazers, burn energy, breed and starve. Two
+		# identical meadows are grown and BOTH seeded with the same herbivore cohort,
+		# then the herd is left to establish (identical, deterministic) — after which
+		# predators are seeded into ONE world only. We assert (a) HUNTING — the predated
+		# world ends with FEWER grazers than the control; (b) motion — a tracked predator
+		# changes position; (c) population dynamics — the pred live count moves off the
+		# seed (births/deaths); (d) water is conserved despite both agent pools (leak~0);
+		# (e) embodiment — PRED cells exist. Predators touch only AIR/PLANT/HERB/PRED.
+		var psz := OS.get_environment("VOX_SIZE").to_int()
+		if psz <= 0: psz = 96
+		var pph := maxi(48, psz * 3 / 4)
+		var prules := OS.get_environment("VOX_RULES").to_int() if OS.get_environment("VOX_RULES") != "" else 0x1FF
+		var prain := OS.get_environment("VOX_RAIN").to_float() if OS.get_environment("VOX_RAIN") != "" else 40.0
+		var pwarm := OS.get_environment("VOX_WARMUP").to_int() if OS.get_environment("VOX_WARMUP") != "" else 1200
+		var hcohort := OS.get_environment("VOX_HERBN").to_int() if OS.get_environment("VOX_HERBN") != "" else 70
+		var pcohort := OS.get_environment("VOX_PREDN").to_int() if OS.get_environment("VOX_PREDN") != "" else 14
+		var establish := OS.get_environment("VOX_ESTABLISH").to_int() if OS.get_environment("VOX_ESTABLISH") != "" else 1400
+		var pw := GpuWorld.new(12345, psz, psz, pph)   # predated world
+		var cw2 := GpuWorld.new(12345, psz, psz, pph)  # control (herbivores only)
+		if not pw.gpu_ok or not cw2.gpu_ok:
+			print("PREDTEST: no GPU"); get_tree().quit(); return
+		pw.rules_mask = prules; cw2.rules_mask = prules
+		var count_mat := func(wld: GpuWorld) -> Dictionary:
+			var raw := wld.read_cells_raw()
+			var d := {"plant": 0, "herb": 0, "pred": 0, "water": 0, "grass": 0}
+			for c in raw:
+				match c & 0xFF:
+					VoxWorld.PLANT: d.plant += 1
+					VoxWorld.HERB: d.herb += 1
+					VoxWorld.PRED: d.pred += 1
+					VoxWorld.WATER: d.water += 1
+					VoxWorld.GRASS: d.grass += 1
+			return d
+		print("PREDTEST: %dx%dx%d rules=0x%x rain=%.0f warm=%d herd=%d pred=%d establish=%d cap=%d" % [
+			psz, psz, pph, prules, prain, pwarm, hcohort, pcohort, establish, pw.pred_cap])
+		# grow both worlds to the SAME lush meadow, seed the SAME herd, let it establish
+		for wld: GpuWorld in [pw, cw2]:
+			wld.regen_tracked(100000, 100000)
+			wld.set_rain_mm_hr(prain)
+			wld.run(pwarm)
+			wld.seed_herbivores(hcohort)
+			wld.run(establish)                   # herd spreads/grows (identical in both)
+		var pre: Dictionary = count_mat.call(pw)
+		var cpre: Dictionary = count_mat.call(cw2)
+		var herd0 := pw.herb_population()
+		var chd0 := cw2.herb_population()
+		print("PREDTEST: herds established — predated herb=%d control herb=%d cells (~match); grazers %d vs %d; plants=%d grass=%d" % [
+			pre.herb, cpre.herb, herd0, chd0, pre.plant, pre.grass])
+		var standing0: int = pre.water
+		pw.reset_water_stats()
+		pw.seed_predators(pcohort)
+		var pseeded := pw.pred_population()
+		print("PREDTEST: seeded %d predators (of cohort %d), herd now %d" % [
+			pseeded, pcohort, pw.herb_population()])
+		var panel_prev := {}                     # record index -> last pos key, for a panel
+		var moved := false
+		var peak_pred := pseeded
+		var min_herd := herd0                    # lowest the predated herd is driven (any phase)
+		var batch := 350
+		for b in range(12):
+			pw.run(batch)
+			cw2.run(batch)                       # control herd evolves WITHOUT predators
+			var m: Dictionary = count_mat.call(pw)
+			var ppop := pw.pred_population()
+			var hpop := pw.herb_population()
+			peak_pred = maxi(peak_pred, ppop)
+			min_herd = mini(min_herd, hpop)
+			var preds := pw.read_preds()
+			# movement: track a panel of records (0..15); a record alive across two
+			# batches yet at a new position means the pack is genuinely roaming
+			for j in range(16):
+				var bse := GpuWorld.PRED_HDR + j * GpuWorld.PRED_STRIDE
+				if preds[bse] == 1:
+					var key: int = preds[bse + 1] * 100000 + preds[bse + 2] * 300 + preds[bse + 3]
+					if panel_prev.has(j) and panel_prev[j] != key:
+						moved = true
+					panel_prev[j] = key
+				else:
+					panel_prev.erase(j)
+			print("  +%5d: pred=%d herd=%d (control herd=%d) | pred_cells=%d plants=%d moved=%s" % [
+				(b + 1) * batch, ppop, hpop, cw2.herb_population(), m.pred, m.plant, moved])
+		var fin: Dictionary = count_mat.call(pw)
+		pw.sync_cells()                          # pull water stats for the leak ledger
+		var standing: int = fin.water
+		var expected: int = standing0 + pw.water_added - pw.water_evaporated - pw.water_absorbed - pw.water_deposited
+		var leak: int = standing - expected
+		var finpred := pw.pred_population()
+		var finherd := pw.herb_population()
+		var ctrlherd := cw2.herb_population()
+		print("PREDTEST: herd predated final=%d min=%d vs control=%d (predators thin the herd; min suppression %d)" % [
+			finherd, min_herd, ctrlherd, ctrlherd - min_herd])
+		print("PREDTEST: predator pop %d -> peak %d -> %d (cap %d)" % [
+			pseeded, peak_pred, finpred, pw.pred_cap])
+		print("PREDTEST: water standing=%d expected=%d leak=%d (added=%d evap=%d absorbed=%d deposited=%d)" % [
+			standing, expected, leak, pw.water_added, pw.water_evaporated, pw.water_absorbed, pw.water_deposited])
+		# hunting: the herd is driven at least 15 grazers below the un-predated control
+		# at some point — well beyond the worlds' natural (atomic-nondeterministic) drift
+		var hunted_ok: bool = min_herd < ctrlherd - 15
+		# population dynamics: the pack grew (births) and/or ended off its seed count
+		var pop_ok := (peak_pred > pseeded or finpred != pseeded) and finpred >= 0
+		var water_ok := absi(leak) <= maxi(50, standing / 50)
+		var embodied_ok: bool = fin.pred > 0 or finpred == 0
+		var ok: bool = hunted_ok and moved and pop_ok and water_ok and embodied_ok
+		print("PREDTEST: hunted=%s moved=%s pop_dynamics=%s water_conserved=%s embodied=%s" % [
+			hunted_ok, moved, pop_ok, water_ok, embodied_ok])
+		print("PREDTEST OK (predators roam, hunt the herd, breed/starve; water conserved)" if ok
+			else "PREDTEST FAIL")
+		pw.free_gpu(); cw2.free_gpu()
 		get_tree().quit()
 		return
 	if OS.get_environment("VOX_DROPTEST") != "":

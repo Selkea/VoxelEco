@@ -90,6 +90,14 @@ layout(set = 0, binding = 15, std430) restrict buffer TopMarkBuf { uint topmark[
 // WINDOW-LOCAL (buffer-slot coords) — fine for static test/shot worlds; a
 // streaming window would re-seed (a v1 limitation, documented).
 layout(set = 0, binding = 19, std430) restrict buffer HerbBuf { uint herb[]; };
+// PREDATOR agents (mobile hunters). Identical layout to HerbBuf: a 4-uint HEADER
+// [cap, seed_cohort, live_count, reserved] + `cap` records of PRED_STRIDE uints
+// [alive, x, y, z, energy, rng]. The seed pass (mode 22) places a cohort on grass
+// and the agent pass (mode 23, one thread per record) moves/hunts/breeds/starves
+// them. A predator gains energy only by catching a grazer (claiming its HERB cell),
+// so the herd's abundance regulates the predators and the predators thin the herd —
+// the classic predator<->prey coupling on top of the vegetation<->herbivore one.
+layout(set = 0, binding = 20, std430) restrict buffer PredBuf { uint pred[]; };
 
 layout(push_constant) uniform Params {
 	uint W; uint H; uint D; uint tick;
@@ -208,6 +216,13 @@ const uint HERB = 9u;     // HERBIVORE body voxel: a mobile grazing agent's occu
                           // holds no water (dens 3 fall-through), so the physics and
                           // vegetation rules leave it alone with no edits; the agent
                           // pass moves it by claiming AIR cells and clearing old ones.
+const uint PRED = 10u;    // PREDATOR body voxel: a mobile hunting agent's occupied cell
+                          // (see do_predator). Same immovable/water-blind dens-3 fall-
+                          // through as HERB, so physics/sediment/vegetation ignore it.
+                          // A predator HUNTS by claiming a HERB cell (its prey's body):
+                          // the eaten grazer sees its anchor is no longer HERB on its
+                          // next pass and self-retires, so the two agent pools couple
+                          // through the shared cell grid with no cross-buffer access.
 
 // A cell is one uint: material in byte 0, ground-water SATURATION
 // (0..sat_cap, phenomenological % of pore space) in byte 1. Wetness therefore
@@ -763,6 +778,7 @@ vec3 mat_color(uint m) {
 	if (m == GRASS) return vec3(0.086, 0.210, 0.052);
 	if (m == PLANT) return vec3(0.175, 0.365, 0.085);   // fresher green than the grass mat below
 	if (m == HERB) return vec3(0.640, 0.575, 0.470);    // woolly cream — a grazer stands out on green
+	if (m == PRED) return vec3(0.360, 0.110, 0.070);    // dark rust — a hunter reads apart from cream herd + green
 	return vec3(1.0);
 }
 
@@ -896,7 +912,9 @@ void do_face_emit() {
 			}
 			col = vec4(base * jit * ao, 1.0);
 		}
-		float grow = (m == HERB) ? 0.45 : 0.0;   // inflate grazer bodies into chunky critters
+		// inflate animal bodies into chunky critters (render-only); a predator is
+		// bulkier than a grazer so it reads as the bigger animal at a glance
+		float grow = (m == HERB) ? 0.45 : (m == PRED ? 0.6 : 0.0);
 		for (uint k = 0u; k < 6u; k++) {
 			uint nm = nbr[k];
 			bool open = is_water ? (nm == AIR) : (nm == AIR || nm == WATER);
@@ -1577,8 +1595,9 @@ void do_heights() {
 		// PLANT is standing foliage above the ground, not terrain: stop the ground
 		// surface below it so tufts never bulge or tint the world-mesh surface
 		// (they render as voxels in the instanced paths instead). HERB (a grazer
-		// standing on the ground) is treated the same — it isn't terrain either.
-		if (m == AIR || m == PLANT || m == HERB) { break; }
+		// standing on the ground) and PRED (a hunter) are treated the same — an
+		// animal standing on the surface isn't terrain either.
+		if (m == AIR || m == PLANT || m == HERB || m == PRED) { break; }
 		if (m == WATER) {
 			if (!wseen) { wseen = true; ysolid = y; }
 			maxload = max(maxload, B2(cc));   // muddiest cell drives the tint
@@ -1686,7 +1705,7 @@ int ground_y(uint x, uint z, out bool flooded, out uint gm) {
 	while (yy > 0u) {
 		yy--;
 		uint m = MAT(cget(cidx(x, yy, z)));
-		if (m == AIR || m == PLANT || m == HERB) { continue; }
+		if (m == AIR || m == PLANT || m == HERB || m == PRED) { continue; }
 		if (m == WATER) { flooded = true; continue; }
 		gm = m; return int(yy);
 	}
@@ -1863,6 +1882,250 @@ void do_herbivore() {
 	herb[base + 4u] = energy; herb[base + 5u] = g_state;
 }
 
+// ===================== PREDATORS (modes 22-23) =====================
+// Mobile hunters held in PredBuf — the herbivore machinery one trophic level up.
+// Each predator is a slim PRED column standing on the ground (rendered bulky, see
+// emit_face's grow). Every dispatch it senses the neighbour columns for a grazer (a
+// HERB cell at the stepping height IS a prey's anchor), pounces onto it — which is
+// EATING: it claims that HERB cell as its own body voxel (energy IN), and the eaten
+// grazer, finding its anchor is no longer HERB on its next pass, self-retires (the
+// grazer code is untouched — the two agent pools couple purely through the shared
+// cell grid, no cross-buffer access). It burns energy to exist (energy OUT), breeds
+// into a free record when well fed, and starves when the herd thins. So the herd's
+// abundance regulates the predators and the predators thin the herd — a Lotka-
+// Volterra predator<->prey loop stacked on the vegetation<->grazer one. Like grazers,
+// predators only ever touch AIR/PLANT/HERB/PRED, so the water/sediment ledgers are
+// untouched.
+const uint PRED_HDR    = 4u;    // header uints [cap, cohort, live_count, reserved]
+const uint PRED_STRIDE = 6u;    // uints per record: alive, x, y, z, energy, rng
+const uint PRED_BODY   = 3u;    // body height in voxels (rendered bulkier than a grazer)
+const int  PRED_CLIMB  = 3;     // max voxels a predator can step up/down in one move
+const int  PRED_SIGHT  = 6;     // how far (voxels, Manhattan) a hunter smells a grazer.
+                                // Prey are sparse (~2% of columns): a range-1 sensor is
+                                // just a random walk that starves before it feeds, so a
+                                // predator scans a sight box and PURSUES the nearest herd
+                                // member — directed hunting is what makes the loop close.
+                                // Kept modest so grazers just out of range have a REFUGE:
+                                // the herd is thinned, not annihilated, which is what lets
+                                // predator and prey settle into a lasting oscillation.
+const uint PRED_START  = 280u;  // a seeded predator's starting energy
+const uint PRED_METAB  = 2u;    // energy burned per pass — efficient, since prey are sparse
+const uint PRED_BITE   = 120u;  // energy from catching one grazer: a big, infrequent meal
+                                // (~60 passes of upkeep) so a kill sustains a long hunt
+const uint PRED_MAXE   = 540u;  // energy cap = FAT RESERVE. A well-fed hunter survives ~270
+                                // passes (~800 ticks) with no kill, so it can BRIDGE the prey
+                                // trough its own hunting causes instead of starving out —
+                                // this reserve is what turns a one-shot boom-bust into a
+                                // sustained predator<->prey coexistence (must exceed REPRO)
+const uint PRED_REPRO  = 460u;  // at/above this energy a predator MAY breed — set high (over
+                                // ~1.5 banked kills) so the pack irrupts slowly and doesn't
+                                // over-hunt the herd to collapse
+const uint PRED_CHILD  = 260u;  // a cub's starting energy (the parent pays it): costly, so a
+                                // parent drops well below REPRO and must re-bank to breed again
+const float PRED_BREED_P = 0.035;// per-pass birth chance when eligible — throttles the
+                                // predator irruption to a believable, laggy rate
+
+uint pbase(uint i) { return PRED_HDR + i * PRED_STRIDE; }
+
+// stamp a PRED body up to PRED_BODY tall from the anchor (x,ay,z), overwriting the
+// AIR / PLANT / HERB it passes through (a hunter tramples foliage and consumes a
+// grazer's leftover body voxels) and stopping at the first solid cell. The anchor is
+// claimed by the caller. Raises the column watermark so the emit walkers see it.
+bool pred_stamp(uint x, uint ay, uint z) {
+	bool wrote = false;
+	for (uint b = 1u; b < PRED_BODY; b++) {
+		uint yy = ay + b;
+		if (yy >= p.H) { break; }
+		uint hc = MAT(cget(cidx(x, yy, z)));
+		if (hc == AIR || hc == PLANT || hc == HERB) { cset(cidx(x, yy, z), PRED); wrote = true; }
+		else { break; }   // blocked by solid — a shorter body here
+	}
+	atomicMax(topmark[z * p.W + x], min(ay + PRED_BODY - 1u, p.H - 1u));
+	return wrote;
+}
+
+// clear this predator's PRED body voxels (up from anchor) back to AIR
+bool pred_clear(uint x, uint ay, uint z) {
+	bool wrote = false;
+	for (uint b = 0u; b < PRED_BODY; b++) {
+		uint yy = ay + b;
+		if (yy >= p.H) { break; }
+		if (MAT(cget(cidx(x, yy, z))) == PRED) { cset(cidx(x, yy, z), AIR); wrote = true; }
+	}
+	return wrote;
+}
+
+// mode 22: seed the initial cohort. Thread i owns record i: the first `cohort`
+// records find a grass column with clear air and stand a predator there; the rest
+// are marked dead (spare capacity for later births).
+void do_pred_seed() {
+	uint cap = pred[0];
+	uint cohort = pred[1];
+	uint i = flat_id();
+	if (i >= cap) { return; }
+	uint base = pbase(i);
+	if (i >= cohort) { pred[base] = 0u; return; }       // spare record: dead
+	g_state = pcg(i * 2654435761u ^ pcg(p.seedv + 0x2f9a1b3du));
+	for (uint t = 0u; t < 8u; t++) {
+		uint x = pcg(g_state) % p.W; g_state = pcg(g_state);
+		uint z = pcg(g_state) % p.D; g_state = pcg(g_state);
+		bool flooded; uint gm;
+		int gy = ground_y(x, z, flooded, gm);
+		if (gy < 0 || flooded || gm != GRASS) { continue; }
+		uint ay = uint(gy) + 1u;
+		if (ay >= p.H) { continue; }
+		if (cclaim(cidx(x, ay, z), AIR, PRED) != AIR) { continue; }   // column already taken
+		pred_stamp(x, ay, z);
+		mark_dirty(x, ay, z);
+		pred[base + 1u] = x; pred[base + 2u] = ay; pred[base + 3u] = z;
+		pred[base + 4u] = PRED_START; pred[base + 5u] = pcg(g_state ^ (i * 40503u));
+		pred[base] = 1u;                                  // publish alive last
+		atomicAdd(pred[2], 1u);
+		return;
+	}
+	pred[base] = 0u;                                      // couldn't place — dead
+}
+
+// mode 23: one thread per record. sense -> move+hunt -> metabolize -> breed/die.
+void do_predator() {
+	uint cap = pred[0];
+	uint i = flat_id();
+	if (i >= cap) { return; }
+	uint base = pbase(i);
+	if (pred[base] != 1u) { return; }                     // dead or mid-birth: skip
+	uint x = pred[base + 1u];
+	uint ay = pred[base + 2u];
+	uint z = pred[base + 3u];
+	uint energy = pred[base + 4u];
+	g_state = pred[base + 5u] ^ pcg(p.tick * 2654435761u + i + 0x6d2b79f5u);
+	// safety: if our anchor is no longer PRED (an adjacent hunter clipped it), clear
+	// any remaining body and retire the record — never leave orphaned PRED voxels.
+	if (MAT(cget(cidx(x, ay, z))) != PRED) {
+		pred_clear(x, ay, z); mark_dirty(x, ay, z);
+		pred[base] = 0u; atomicAdd(pred[2], 0xFFFFFFFFu); return;
+	}
+
+	const int NDX[4] = int[4](1, -1, 0, 0);
+	const int NDZ[4] = int[4](0, 0, 1, -1);
+	// sense the 4 neighbour columns for a reachable, dry standing spot; a HERB at the
+	// stepping height is a grazer's anchor = PREY
+	uint vnx[4]; uint vnz[4]; uint vny[4]; uint nv = 0u;
+	uint prey_ix[4]; uint npr = 0u;
+	for (uint d = 0u; d < 4u; d++) {
+		int nxi = int(x) + NDX[d];
+		int nzi = int(z) + NDZ[d];
+		if (nxi < 0 || nxi >= int(p.W) || nzi < 0 || nzi >= int(p.D)) { continue; }
+		uint nx = uint(nxi); uint nz = uint(nzi);
+		bool fl; uint gm;
+		int gy = ground_y(nx, nz, fl, gm);
+		if (gy < 0 || fl) { continue; }
+		uint nay = uint(gy) + 1u;
+		if (nay >= p.H || abs(int(nay) - int(ay)) > PRED_CLIMB) { continue; }
+		uint hc = MAT(cget(cidx(nx, nay, nz)));
+		if (hc != AIR && hc != PLANT && hc != HERB) { continue; }   // blocked (solid/pred/water)
+		vnx[nv] = nx; vnz[nv] = nz; vny[nv] = nay;
+		if (hc == HERB) { prey_ix[npr] = nv; npr++; }               // a grazer to pounce on
+		nv++;
+	}
+
+	// choose a move. Priority: (1) POUNCE on an immediately adjacent grazer; else
+	// (2) PURSUE — scan a sight box for the nearest grazer and step the walkable
+	// neighbour that closes on it; else (3) wander; else stay put.
+	int pick = -1;
+	if (npr > 0u && rnd() < 0.8) {
+		pick = int(prey_ix[uint(rnd() * float(npr)) % npr]);        // pounce on adjacent prey (a fifth escape)
+	} else {
+		// ranged hunt: find the nearest grazer anchor (HERB at ground+1) in the sight box
+		int tdx = 0; int tdz = 0; int tbest = 9999;
+		for (int dz = -PRED_SIGHT; dz <= PRED_SIGHT; dz++) {
+			for (int dx = -PRED_SIGHT; dx <= PRED_SIGHT; dx++) {
+				int md = abs(dx) + abs(dz);
+				if (md == 0 || md >= tbest) { continue; }
+				int sx = int(x) + dx; int sz = int(z) + dz;
+				if (sx < 0 || sx >= int(p.W) || sz < 0 || sz >= int(p.D)) { continue; }
+				bool sfl; uint sgm;
+				int sgy = ground_y(uint(sx), uint(sz), sfl, sgm);
+				if (sgy < 0) { continue; }
+				uint say = uint(sgy) + 1u;
+				if (say < p.H && MAT(cget(cidx(uint(sx), say, uint(sz)))) == HERB) {
+					tbest = md; tdx = dx; tdz = dz;                 // a closer grazer
+				}
+			}
+		}
+		if (tbest < 9999 && nv > 0u) {
+			// step the walkable neighbour that most reduces Manhattan distance to the prey
+			int bestv = -1; int bestd = 9999;
+			for (uint v = 0u; v < nv; v++) {
+				int nd = abs(tdx - (int(vnx[v]) - int(x))) + abs(tdz - (int(vnz[v]) - int(z)));
+				if (nd < bestd) { bestd = nd; bestv = int(v); }
+			}
+			if (bestv >= 0 && rnd() < 0.9) { pick = bestv; }        // commit to the chase (with slack)
+		}
+		if (pick < 0 && nv > 0u && rnd() < 0.45) { pick = int(uint(rnd() * float(nv)) % nv); }  // wander
+	}
+
+	bool moved = false;
+	if (pick >= 0) {
+		uint nx = vnx[pick]; uint nz = vnz[pick]; uint nay = vny[pick];
+		uint want = cget(cidx(nx, nay, nz));               // AIR / PLANT / HERB (prey)
+		uint wm = MAT(want);
+		if ((wm == AIR || wm == PLANT || wm == HERB) && cclaim(cidx(nx, nay, nz), want, PRED) == want) {
+			if (wm == HERB) { energy = min(energy + PRED_BITE, PRED_MAXE); }   // caught a grazer
+			pred_clear(x, ay, z); mark_dirty(x, ay, z);    // vacate the old column
+			x = nx; z = nz; ay = nay;
+			pred_stamp(x, ay, z); mark_dirty(x, ay, z);    // (may consume the prey's leftover body voxels)
+			moved = true;
+		}
+	}
+	if (!moved) {
+		// stand watch: keep the body coherent
+		if (pred_stamp(x, ay, z)) { mark_dirty(x, ay, z); }
+	}
+
+	// metabolism, death, reproduction
+	energy = energy > PRED_METAB ? energy - PRED_METAB : 0u;
+	if (energy == 0u) {
+		pred_clear(x, ay, z); mark_dirty(x, ay, z);
+		pred[base] = 0u;
+		atomicAdd(pred[2], 0xFFFFFFFFu);                   // live_count -= 1
+		return;
+	}
+	if (energy >= PRED_REPRO && rnd() < PRED_BREED_P) {
+		// birth a cub onto an adjacent clear grass spot in a free record
+		for (uint d = 0u; d < 4u; d++) {
+			uint dd = (d + uint(rnd() * 4.0)) & 3u;
+			int nxi = int(x) + NDX[dd];
+			int nzi = int(z) + NDZ[dd];
+			if (nxi < 0 || nxi >= int(p.W) || nzi < 0 || nzi >= int(p.D)) { continue; }
+			uint nx = uint(nxi); uint nz = uint(nzi);
+			bool fl; uint gm;
+			int gy = ground_y(nx, nz, fl, gm);
+			if (gy < 0 || fl || gm != GRASS) { continue; }
+			uint nay = uint(gy) + 1u;
+			if (nay >= p.H || abs(int(nay) - int(ay)) > PRED_CLIMB) { continue; }
+			if (MAT(cget(cidx(nx, nay, nz))) != AIR) { continue; }
+			// find a free record via a short random CAS scan (alive 0 -> 2 "claiming")
+			int slot = -1;
+			for (uint s = 0u; s < 6u; s++) {
+				uint cand = pcg(g_state) % cap; g_state = pcg(g_state);
+				if (atomicCompSwap(pred[pbase(cand)], 0u, 2u) == 0u) { slot = int(cand); break; }
+			}
+			if (slot < 0) { break; }                        // population at capacity
+			if (cclaim(cidx(nx, nay, nz), AIR, PRED) != AIR) { pred[pbase(uint(slot))] = 0u; continue; }
+			uint cbase = pbase(uint(slot));
+			pred_stamp(nx, nay, nz); mark_dirty(nx, nay, nz);
+			pred[cbase + 1u] = nx; pred[cbase + 2u] = nay; pred[cbase + 3u] = nz;
+			pred[cbase + 4u] = PRED_CHILD; pred[cbase + 5u] = pcg(g_state ^ (uint(slot) * 2246822519u));
+			pred[cbase] = 1u;                               // publish alive last
+			atomicAdd(pred[2], 1u);
+			energy = energy > PRED_CHILD ? energy - PRED_CHILD : 1u;
+			break;
+		}
+	}
+	pred[base + 1u] = x; pred[base + 2u] = ay; pred[base + 3u] = z;
+	pred[base + 4u] = energy; pred[base + 5u] = g_state;
+}
+
 // mode 9: STANDING VEGETATION. One thread per column grows soft PLANT voxels UP
 // from watered, sunlit GRASS and prunes them when the ground dries, floods, is
 // buried or grazed. A per-column walk (like do_emit/do_heights) gives full
@@ -1885,7 +2148,7 @@ void do_vegetate() {
 	while (yy > 0u) {
 		yy--;
 		uint m = MAT(cget(cidx(x, yy, z)));
-		if (m == AIR || m == PLANT || m == HERB) { continue; }
+		if (m == AIR || m == PLANT || m == HERB || m == PRED) { continue; }
 		if (m == WATER) { flooded = true; continue; }
 		gy = yy; gm = m; found = true; break;
 	}
@@ -2247,5 +2510,7 @@ void main() {
 	else if (mode == 19u) { do_hsmooth(); }
 	else if (mode == 20u) { do_herb_seed(); }
 	else if (mode == 21u) { do_herbivore(); }
+	else if (mode == 22u) { do_pred_seed(); }
+	else if (mode == 23u) { do_predator(); }
 	else { do_step(); }
 }
