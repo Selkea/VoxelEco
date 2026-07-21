@@ -37,9 +37,11 @@ var uniform_set: RID
 var _solid_target: RID    # multimesh buffers (bound by the view) or placeholders
 var _water_target: RID
 var _grass_target: RID    # grass-tuft multimesh buffer (living-layer overlay)
+var _animal_target: RID   # critter multimesh buffer (grazers + predators)
 var _placeholder_a: RID
 var _placeholder_b: RID
 var _placeholder_c: RID
+var _placeholder_d: RID
 # HERBIVORES (binding 19): a persistent agent buffer — 4-uint header
 # [cap, cohort, live_count, reserved] + herb_cap records of HERB_STRIDE uints
 # [alive, x, y, z, energy, rng]. Seeded on demand (seed_herbivores) and stepped
@@ -68,6 +70,7 @@ var chunk_h := 0    # y-chunks: the physics awake grid is 3D (16^3 chunks)
 var solid_cap := 0
 var water_cap := 0
 var grass_cap := 0    # grass-tuft instance capacity (living-layer overlay)
+var animal_cap := 0   # critter instance capacity (= herb_cap + pred_cap)
 var _need_gpu_gen := false
 
 var _step_groups := Vector3i()
@@ -231,15 +234,18 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	# cap_grass, cap_animal]. The living-layer counters (grass/animal) share the emit
 	# buffer so one readback pulls every visible-instance count. cap_animal is filled
 	# in when the animal overlay is wired.
+	# cap_animal (slot 7) is filled once herb_cap/pred_cap are known, below.
 	var caps := PackedInt32Array([0, 0, solid_cap, water_cap, 0, 0, grass_cap, 0]).to_byte_array()
 	inst_count_buf = rd.storage_buffer_create(32, caps)
 	# tiny placeholders until the view binds real multimesh buffers
 	_placeholder_a = rd.storage_buffer_create(64)
 	_placeholder_b = rd.storage_buffer_create(64)
 	_placeholder_c = rd.storage_buffer_create(64)
+	_placeholder_d = rd.storage_buffer_create(64)
 	_solid_target = _placeholder_a
 	_water_target = _placeholder_b
 	_grass_target = _placeholder_c
+	_animal_target = _placeholder_d
 	# herbivore agent pool: ~one potential grazer per 40 columns, clamped. Created
 	# zeroed (every record dead) with the cap in header slot 0; seed_herbivores fills
 	# a cohort. Sized off the resident window, so streaming worlds keep it bounded.
@@ -259,6 +265,10 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	pz[0] = pred_cap               # header: cap
 	pred_buf = rd.storage_buffer_create(pred_words * 4, pz.to_byte_array())
 	_pred_groups = ceili(pred_cap / 64.0)
+	# critter multimesh holds at most every live agent (grazers + predators); publish
+	# the cap into InstCount slot 7 now that both pools are sized.
+	animal_cap = herb_cap + pred_cap
+	rd.buffer_update(inst_count_buf, 28, 4, PackedInt32Array([animal_cap]).to_byte_array())
 	_rebuild_uniform_set()
 
 	_step_groups = Vector3i(
@@ -598,7 +608,7 @@ func _rebuild_uniform_set() -> void:
 		iu.add_id(ipair[1])
 		us.append(iu)
 	for pair: Array in [[14, awake_list_buf], [15, topmark_buf], [19, herb_buf], [20, pred_buf],
-			[21, _grass_target]]:
+			[21, _grass_target], [22, _animal_target]]:
 		var bu := RDUniform.new()
 		bu.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
 		bu.binding = pair[0]
@@ -608,13 +618,16 @@ func _rebuild_uniform_set() -> void:
 
 ## the view hands us its MultiMesh storage buffers: the emit pass writes
 ## instance transforms/colors straight into them on the GPU
-func bind_instance_buffers(solid_rid: RID, water_rid: RID, grass_rid: RID = RID()) -> void:
+func bind_instance_buffers(solid_rid: RID, water_rid: RID, grass_rid: RID = RID(),
+		animal_rid: RID = RID()) -> void:
 	if not gpu_ok:
 		return
 	_solid_target = solid_rid
 	_water_target = water_rid
 	if grass_rid.is_valid():
 		_grass_target = grass_rid
+	if animal_rid.is_valid():
+		_animal_target = animal_rid
 	_rebuild_uniform_set()
 
 const PC_SIZE := 112   # push constant byte size (must match the shader struct)
@@ -839,7 +852,7 @@ func dispatch_emit() -> PackedInt32Array:
 		return PackedInt32Array()
 	# reset all four instance counters (keep the caps in slots 2,3,6,7)
 	rd.buffer_update(inst_count_buf, 0, 32,
-			PackedInt32Array([0, 0, solid_cap, water_cap, 0, 0, grass_cap, 0]).to_byte_array())
+			PackedInt32Array([0, 0, solid_cap, water_cap, 0, 0, grass_cap, animal_cap]).to_byte_array())
 	var cl := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(cl, pipeline)
 	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
@@ -851,15 +864,19 @@ func dispatch_emit() -> PackedInt32Array:
 				rd.compute_list_set_push_constant(cl, _pc(11, 0), PC_SIZE)   # coarse far block quads
 				rd.compute_list_dispatch(cl, _block_groups, 1, 1)
 		elif world_mesh and not ray_render:
-			# the world mesh draws the terrain; overlay the living layer on top. Animals
-			# stay as (inflated) instanced faces via do_agent_emit; the plant tier is
-			# drawn as real grass tufts (do_grass_emit) instead of green cubes, so the
-			# meadow reads as foliage over the smooth mesh, not voxels. update_heights
-			# (run by the mesh path before this) keeps the column watermark tight.
-			rd.compute_list_set_push_constant(cl, _pc(24, 0), PC_SIZE)   # animals (faces)
-			rd.compute_list_dispatch(cl, _col_groups, 1, 1)
+			# the world mesh draws the terrain; overlay the LIVING layer on top as
+			# foliage + critters, not voxels: the PLANT tier as grass-blade tufts
+			# (do_grass_emit) and each agent as a low-poly critter (do_animal_emit,
+			# one dispatch over the grazer records, one over the predators). update_heights
+			# (run by the mesh path before this) keeps the column watermark tight for grass.
 			rd.compute_list_set_push_constant(cl, _pc(25, 0), PC_SIZE)   # grass tufts
 			rd.compute_list_dispatch(cl, _col_groups, 1, 1)
+			if herb_seeded:
+				rd.compute_list_set_push_constant(cl, _pc(26, 0), PC_SIZE)   # grazer critters
+				rd.compute_list_dispatch(cl, _herb_groups, 1, 1)
+			if pred_seeded:
+				rd.compute_list_set_push_constant(cl, _pc(26, 1), PC_SIZE)   # predator critters
+				rd.compute_list_dispatch(cl, _pred_groups, 1, 1)
 		if far_field and far_tiles and lod_r > 0:
 			for ring in range(FAR_SIDES.size()):   # heightfield vista rings out to 8 km
 				rd.compute_list_set_push_constant(cl, _pc(12, ring), PC_SIZE)
@@ -874,7 +891,7 @@ func dispatch_emit() -> PackedInt32Array:
 	# [n_solid, n_water, cap_solid, cap_water, n_grass, n_animal] — pick the four counters
 	var counts := rd.buffer_get_data(inst_count_buf, 0, 24).to_int32_array()
 	return PackedInt32Array([mini(counts[0], solid_cap), mini(counts[1], water_cap),
-			mini(counts[4], grass_cap), counts[5]])
+			mini(counts[4], grass_cap), mini(counts[5], animal_cap)])
 
 ## Pull GPU state back to the CPU: cell bytes (tests/analysis), water stats,
 ## dirty-chunk flags. Stalls the pipe — fine for tests, not per-frame.
@@ -998,7 +1015,8 @@ func free_gpu() -> void:
 	# free our resources, never the shared main device
 	for r in [uniform_set, pipeline, shader, cells_buf, cells_buf2, cells_buf3, pack_buf,
 			stats_buf, dirty_buf, active_buf, step_args_buf, awake_list_buf, topmark_buf,
-			inst_count_buf, _placeholder_a, _placeholder_b, _placeholder_c, herb_buf, pred_buf,
+			inst_count_buf, _placeholder_a, _placeholder_b, _placeholder_c, _placeholder_d,
+			herb_buf, pred_buf,
 			heights_buf, hmax_buf, cam_buf, ray_tex, terra_tex, terra_s_tex, tcol_tex]:
 		if r.is_valid():
 			rd.free_rid(r)

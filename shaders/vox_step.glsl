@@ -105,6 +105,10 @@ layout(set = 0, binding = 20, std430) restrict buffer PredBuf { uint pred[]; };
 // tier rendered as real foliage over the world mesh instead of green cubes. Filled
 // by do_grass_emit (mode 25); drawn by grass.gdshader as a MultiMesh of blade fans.
 layout(set = 0, binding = 21, std430) restrict buffer GrassInst { float grass_inst[]; };
+// ANIMAL instance stream (16 floats each): grazers + predators drawn as small
+// low-poly critters over the world mesh instead of voxel cubes. Filled by
+// do_animal_emit (mode 26) reading the agent records; drawn as a MultiMesh.
+layout(set = 0, binding = 22, std430) restrict buffer AnimalInst { float animal_inst[]; };
 
 layout(push_constant) uniform Params {
 	uint W; uint H; uint D; uint tick;
@@ -1057,7 +1061,7 @@ void do_grass_emit() {
 	float r3 = float(h & 1023u) / 1023.0;
 	float yaw = r0 * 6.2831853;
 	float sxz = 0.8 + r1 * 0.5;                       // horizontal spread variation
-	float hsc = 0.85 + 0.26 * float(min(plant, 4));   // taller where more foliage stands
+	float hsc = 0.7 + 0.17 * float(min(plant, 4));   // taller where more foliage stands
 	float baseY = float(gy + 1 + int(p.gen_oy));      // root on the grass top face
 	vec3 ax = vec3(cos(yaw) * sxz, 0.0, sin(yaw) * sxz);
 	vec3 az = vec3(-sin(yaw) * sxz, 0.0, cos(yaw) * sxz);
@@ -1067,6 +1071,52 @@ void do_grass_emit() {
 	vec3 col = vec3(mix(0.80, 1.15, r2), mix(0.85, 1.10, r3), mix(0.70, 1.0, r0));
 	uint slot = atomicAdd(n_grass, 1u);
 	if (slot < cap_grass) { write_grass(slot, ax, ay, az, org, col); }
+}
+
+// write an animal (critter) MultiMesh instance: 3x4 transform + colour.
+void write_animal(uint slot, vec3 ax, vec3 ay, vec3 az, vec3 org, vec3 col) {
+	uint b = slot * 16u;
+	float t[12] = float[12](ax.x, ay.x, az.x, org.x,
+			ax.y, ay.y, az.y, org.y,
+			ax.z, ay.z, az.z, org.z);
+	for (uint k = 0u; k < 12u; k++) { animal_inst[b + k] = t[k]; }
+	animal_inst[b+12u] = col.r; animal_inst[b+13u] = col.g; animal_inst[b+14u] = col.b; animal_inst[b+15u] = 1.0;
+}
+
+// mode 26: ANIMALS. One thread per agent record (p.offset 0 = grazers/herb[], 1 =
+// predators/pred[]); a live agent writes one low-poly critter instance standing on
+// its anchor cell, coloured + sized by trophic role (cream grazer / bigger rust
+// hunter), yaw from its rng. Reads the agent POSITIONS directly (not the cell grid),
+// so it's independent of the sim body voxels. HDR=4 / STRIDE=6 match HERB_/PRED_*.
+void do_animal_emit() {
+	uint i = flat_id();
+	uint cap = (p.offset == 0u) ? herb[0] : pred[0];
+	if (i >= cap) { return; }
+	uint base = 4u + i * 6u;
+	uint alive = (p.offset == 0u) ? herb[base] : pred[base];
+	if (alive != 1u) { return; }
+	uint ax_, ay_, az_, rng;
+	if (p.offset == 0u) { ax_ = herb[base+1u]; ay_ = herb[base+2u]; az_ = herb[base+3u]; rng = herb[base+5u]; }
+	else                { ax_ = pred[base+1u]; ay_ = pred[base+2u]; az_ = pred[base+3u]; rng = pred[base+5u]; }
+	float wx = float(world_coord(ax_, p.gen_ox, p.W) - p.gen_ox);
+	float wz = float(world_coord(az_, p.gen_oz, p.D) - p.gen_oz);
+	if (p.lod_r > 0u) {
+		float ddx = wx - float(p.lod_cx);
+		float ddz = wz - float(p.lod_cz);
+		float cy = float(p.lod_cy);
+		if (ddx * ddx + ddz * ddz + cy * cy > float(p.lod_r) * float(p.lod_r)) { return; }
+		if (cone_out(ddx, ddz, 400.0)) { return; }
+	}
+	float yaw = float(pcg(rng) & 1023u) / 1023.0 * 6.2831853;
+	bool pred_a = p.offset != 0u;
+	float s = pred_a ? 2.3 : 1.75;                       // hunters read bigger; both stand above the grass
+	vec3 col = pred_a ? vec3(0.46, 0.17, 0.11) : vec3(0.87, 0.84, 0.76);
+	vec3 ax = vec3(cos(yaw) * s, 0.0, sin(yaw) * s);
+	vec3 az = vec3(-sin(yaw) * s, 0.0, cos(yaw) * s);
+	vec3 ayv = vec3(0.0, s, 0.0);
+	vec3 org = vec3(wx + 0.5, float(int(ay_) + int(p.gen_oy)), wz + 0.5);
+	uint slot = atomicAdd(n_animal, 1u);
+	if (slot < cap_animal) { write_animal(slot, ax, ayv, az, org, col); }
 }
 
 // one thread per COLUMN: walk it top-down and emit every exposed voxel, then stop
@@ -2657,5 +2707,6 @@ void main() {
 	else if (mode == 23u) { do_predator(); }
 	else if (mode == 24u) { do_agent_emit(); }
 	else if (mode == 25u) { do_grass_emit(); }
+	else if (mode == 26u) { do_animal_emit(); }
 	else { do_step(); }
 }

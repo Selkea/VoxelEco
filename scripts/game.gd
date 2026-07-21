@@ -121,7 +121,8 @@ func _ready() -> void:
 	view.use_instances = world.gpu_ok
 	add_child(view)
 	if view.use_instances:
-		world.bind_instance_buffers(view.solid_buffer_rid(), view.water_buffer_rid(), view.grass_buffer_rid())
+		world.bind_instance_buffers(view.solid_buffer_rid(), view.water_buffer_rid(),
+				view.grass_buffer_rid(), view.animal_buffer_rid())
 	# far field as a clipmap MESH (default): continuous heightfield rings
 	# displaced in the vertex shader by the worldgen noise — smooth connected
 	# slopes instead of instanced tiles, and zero emit instances out there.
@@ -432,7 +433,8 @@ func _process(dt: float) -> void:
 		view.world = world
 		view.use_instances = world.gpu_ok
 		if view.use_instances:
-			world.bind_instance_buffers(view.solid_buffer_rid(), view.water_buffer_rid(), view.grass_buffer_rid())
+			world.bind_instance_buffers(view.solid_buffer_rid(), view.water_buffer_rid(),
+				view.grass_buffer_rid(), view.animal_buffer_rid())
 		_refresh_view(true)
 
 	if speed_mult > 0:
