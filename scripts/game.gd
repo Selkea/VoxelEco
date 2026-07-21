@@ -104,6 +104,11 @@ func _clamp_cells(ws: Vector3i) -> Vector3i:
 	return Vector3i(ws.x, ws.y, h)
 
 func _ready() -> void:
+	# coarse shallow-water solver test (multi-res background fluid) — runs before
+	# the big world is built, on its own local device. See _run_sw_test.
+	if OS.get_environment("VOX_SWTEST") != "":
+		_run_sw_test()
+		return
 	var ws := _world_size()
 	world = GpuWorld.new(12345, ws.x, ws.y, ws.z)
 	if world is GpuWorld:
@@ -408,6 +413,8 @@ func _place_cam() -> void:
 	cam.look_at(c, Vector3.UP)
 
 func _process(dt: float) -> void:
+	if world == null:
+		return   # a test path (e.g. VOX_SWTEST) that quits before building the world
 	if Input.is_action_just_pressed("pause"):
 		speed_mult = 0 if speed_mult > 0 else 1
 	for i in range(SPEEDS.size()):
@@ -985,6 +992,113 @@ func _take_screenshot() -> void:
 ## Headless self-test: tick the pure sim and assert the water cycle works —
 ## rain accumulates, water sinks to low ground and pools, mass is conserved
 ## (added = standing + evaporated), nothing crashes.
+# COARSE SHALLOW-WATER acceptance test (VOX_SWTEST=1, windowed). Proves the
+# background pipe-model fluid (ShallowWater / shaders/shallow_water.glsl) is
+# physically correct on two synthetic terrains:
+#   1) tilted plane, reflective walls — mass is conserved to float precision and
+#      the water migrates DOWNHILL (its centre of mass slides to the low side);
+#   2) radial bowl — an off-centre pond flows to the basin floor and LEVELS OUT
+#      (the water surface flattens to near-constant while the bed under it is not).
+# Mass conservation is the design doc's named acceptance test for the coarse
+# solver (docs/ECOSYSTEM_ENGINE_DESIGN.md, section A "open technical questions").
+func _run_sw_test() -> void:
+	var n := OS.get_environment("VOX_SWN").to_int() if OS.get_environment("VOX_SWN") != "" else 192
+	var sw := ShallowWater.new(n, 4.0)
+	if not sw.ok():
+		print("SWTEST: no GPU (needs a windowed/Vulkan context)"); get_tree().quit(); return
+	sw.dt = 0.05
+	print("SWTEST: grid %dx%d  cell=%.1f vox  dt=%.3f g=%.2f A=%.1f" % [n, n, sw.L, sw.dt, sw.g, sw.A])
+
+	# helpers over a row-major depth grid ------------------------------------
+	var any_bad := func(w: PackedFloat32Array) -> bool:
+		for d in w:
+			if is_nan(d) or is_inf(d) or d < -1e-3:
+				return true
+		return false
+	var com_x := func(w: PackedFloat32Array) -> float:
+		var sx := 0.0; var sw_ := 0.0
+		for z in range(n):
+			for x in range(n):
+				var d: float = w[x + z * n]
+				sx += d * x; sw_ += d
+		return sx / maxf(sw_, 1e-9)
+	var com_r := func(w: PackedFloat32Array) -> float:   # mean radius from grid centre
+		var c := n * 0.5; var sr := 0.0; var sw_ := 0.0
+		for z in range(n):
+			for x in range(n):
+				var d: float = w[x + z * n]
+				sr += d * sqrt((x - c) * (x - c) + (z - c) * (z - c)); sw_ += d
+		return sr / maxf(sw_, 1e-9)
+
+	# --- Test 1: tilted plane, mass conservation + downhill flow -------------
+	# terrain drops 0.5 vox/cell toward +x, so the low side is high-x.
+	sw.init_plane(400.0, -0.5, 0.0)
+	sw.add_water(int(n * 0.35), int(n * 0.35), int(n * 0.5), int(n * 0.65), 8.0)  # off to the high side
+	var w0 := sw.read_water()
+	var tot0 := sw.total_water()
+	var cx0: float = com_x.call(w0)
+	sw.step(4000)
+	var w1 := sw.read_water()
+	var tot1 := sw.total_water()
+	var cx1: float = com_x.call(w1)
+	var mass_err := absf(tot1 - tot0) / maxf(tot0, 1e-9)
+	var plane_finite: bool = not any_bad.call(w1)
+	var flowed_downhill := cx1 > cx0 + 1.0
+	print("SWTEST plane: water_vol %.1f -> %.1f (mass_err=%s)  com_x %.1f -> %.1f (downhill=+x)  finite=%s" % [
+		tot0, tot1, mass_err, cx0, cx1, str(plane_finite)])
+
+	# --- Test 2: bowl, pooling + leveling -----------------------------------
+	sw.init_bowl(100.0, 0.02)
+	sw.add_water(int(n * 0.15), int(n * 0.15), int(n * 0.4), int(n * 0.4), 20.0)  # off-centre blob
+	var terr := sw.read_terr()
+	var b0 := sw.read_water()
+	var btot0 := sw.total_water()
+	var r0: float = com_r.call(b0)
+	sw.step(12000)
+	var b1 := sw.read_water()
+	var btot1 := sw.total_water()
+	var r1: float = com_r.call(b1)
+	var bmass_err := absf(btot1 - btot0) / maxf(btot0, 1e-9)
+	var bowl_finite: bool = not any_bad.call(b1)
+	# leveling: over the settled pond INTERIOR (deep cells — excludes the thin film
+	# receding down the steep walls), the water SURFACE (b+d) should be near-constant
+	# even though the BED (b) under it varies a lot. Scale-free acceptance: the
+	# surface std must be a small fraction of the bed relief it spans (the water
+	# clearly found ONE level across an uneven basin), not an absolute voxel count.
+	const PONDMIN := 3.0
+	var sm := 0.0; var scount := 0; var bed_lo := 1e9; var bed_hi := -1e9
+	for i in range(n * n):
+		if b1[i] > PONDMIN:
+			var surf: float = terr[i] + b1[i]
+			sm += surf; scount += 1
+			bed_lo = minf(bed_lo, terr[i]); bed_hi = maxf(bed_hi, terr[i])
+	var smean := sm / maxf(scount, 1)
+	var svar := 0.0
+	for i in range(n * n):
+		if b1[i] > PONDMIN:
+			var surf: float = terr[i] + b1[i]
+			svar += (surf - smean) * (surf - smean)
+	var sstd := sqrt(svar / maxf(scount, 1))
+	var bed_span := bed_hi - bed_lo
+	var pooled := r1 < r0 - 1.0                          # moved toward the basin floor
+	var leveled := sstd < 0.15 * bed_span and bed_span > 8.0  # flat pond over an uneven bed
+	print("SWTEST bowl: water_vol %.1f -> %.1f (mass_err=%s)  com_r %.1f -> %.1f (basin at 0)  finite=%s" % [
+		btot0, btot1, bmass_err, r0, r1, str(bowl_finite)])
+	print("SWTEST bowl: pond surface std=%.2f vox over a bed spanning %.1f vox (%d wet cells)" % [
+		sstd, bed_span, scount])
+
+	var mass_ok := mass_err < 1e-3 and bmass_err < 1e-3
+	var finite_ok := plane_finite and bowl_finite
+	var flow_ok := flowed_downhill and pooled
+	var level_ok := leveled
+	var ok := mass_ok and finite_ok and flow_ok and level_ok
+	print("SWTEST: mass_conserved=%s finite=%s flow(downhill+pool)=%s leveled=%s" % [
+		str(mass_ok), str(finite_ok), str(flow_ok), str(level_ok)])
+	print("SWTEST OK (coarse shallow-water conserves mass, flows downhill, and finds its level)" if ok
+		else "SWTEST FAIL")
+	sw.free_gpu()
+	get_tree().quit()
+
 func _run_sim_test() -> void:
 	var w := GpuWorld.new(12345)
 	if not w.gpu_ok:
