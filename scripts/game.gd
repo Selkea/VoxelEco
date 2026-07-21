@@ -8,8 +8,14 @@ var cam: Camera3D
 # real-time clock: at 1x, one simulated second passes per wall second,
 # independent of frame rate. A tick is 1/TICK_RATE simulated seconds.
 const TICK_RATE := 30.0
-const SPEEDS := [1, 2, 4, 8, 16, 32, 64]
-const MAX_TICKS_PER_FRAME := 96   # keeps extreme speeds from death-spiraling
+# with real-life-paced biology (see GpuWorld.bio_period), most of the interesting
+# ecology plays out over sim-days, so the speed ladder reaches deep fast-forward:
+# 3600x = one sim-hour per real second. Keys 1..7.
+const SPEEDS := [1, 4, 16, 64, 256, 1024, 3600]
+# GPU can burst thousands of ticks/frame, which is what makes deep fast-forward
+# usable (3600x = 1800 ticks/frame at 60 fps); the CPU fallback keeps the old cap.
+const MAX_TICKS_PER_FRAME := 2000
+const CPU_TICKS_PER_FRAME := 96   # keeps the CPU fallback from death-spiraling
 var speed_mult := 1               # 0 = paused
 var time_acc := 0.0
 var mesh_acc := 0.0
@@ -195,6 +201,12 @@ func _ready() -> void:
 			gw.gen_oy = gw.band_oy_for(cx, cz)
 			gw.regen(base, base)
 			view.set_stream_origin(base, base)
+			# grow a mature meadow FAST (bio_period 1), THEN switch to real-life pace so
+			# the ecology only changes slowly from here — you spawn into an established
+			# field, not bare soil. Fast-forward (number keys) to watch days pass.
+			world.run(500)
+			var bp := OS.get_environment("VOX_BIOPERIOD")
+			gw.bio_period = bp.to_float() if bp != "" else 77000.0
 			_populate_ecology()   # fly straight into a living meadow
 		# camera hovers above the surface (world-Y), looking down over the vista
 		fly_pos = Vector3(base + world.W * 0.5, surf + world.H * 0.4, base + world.D * 0.5)
@@ -442,7 +454,7 @@ func _process(dt: float) -> void:
 		var ticks := int(time_acc * TICK_RATE)
 		if ticks > 0:
 			time_acc -= ticks / TICK_RATE
-			world.run(mini(ticks, MAX_TICKS_PER_FRAME))
+			world.run(mini(ticks, MAX_TICKS_PER_FRAME if world.gpu_ok else CPU_TICKS_PER_FRAME))
 
 	mesh_acc += dt
 	if mesh_acc >= 0.07:       # refresh the render ~14 Hz

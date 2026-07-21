@@ -31,10 +31,11 @@ void vertex() {
 }
 
 void fragment() {
-	// base (shaded, cool green) -> tip (brighter, yellow-green); per-instance COLOR
-	// carries the emit's meadow tint variation so a field isn't one flat green
-	vec3 base = vec3(0.11, 0.24, 0.07);
-	vec3 tip  = vec3(0.44, 0.60, 0.20);
+	// base (deep green) -> tip (bright grass green); a saturated green ramp, no
+	// yellow. COLOR is left uniform (no per-tuft tint jitter) so the field reads as
+	// one clean green rather than a speckled patchwork.
+	vec3 base = vec3(0.06, 0.26, 0.07);
+	vec3 tip  = vec3(0.20, 0.56, 0.16);
 	vec3 g = mix(base, tip, v_h) * COLOR.rgb;
 	// a touch of ambient occlusion crushed into the very base of the tuft
 	g *= mix(0.7, 1.0, smoothstep(0.0, 0.35, v_h));

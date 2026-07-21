@@ -148,6 +148,13 @@ layout(push_constant) uniform Params {
 	// sphere around the eye, so climbing pushes the whole view to coarse blocks
 	// instead of keeping a full-detail patch pinned under a high camera.
 	uint lod_cy;
+	// biological time dilation: metabolism, breeding and plant growth each advance at
+	// 1/bio_period of their base rate. bio_period = 1 is the tuned fast dynamics (what
+	// the headless ecology tests exercise); a large value stretches starvation,
+	// breeding and regrowth out to real-life days while MOVEMENT stays real-time
+	// (movement is driven by the wall-clock tick rate, not this). Padded so the
+	// push-constant stays a multiple of 16 bytes.
+	float bio_period; uint _pad0; uint _pad1; uint _pad2;
 } p;
 
 // route a linear cell index to its buffer (see CellsBuf2/3). Spatially adjacent
@@ -1056,9 +1063,7 @@ void do_grass_emit() {
 	uint wzi = world_coord(z, p.gen_oz, p.D);
 	uint h = pcg(wxi * 374761393u ^ (wzi * 668265263u) ^ p.seedv);
 	float r0 = float(h & 1023u) / 1023.0; h = pcg(h);
-	float r1 = float(h & 1023u) / 1023.0; h = pcg(h);
-	float r2 = float(h & 1023u) / 1023.0; h = pcg(h);
-	float r3 = float(h & 1023u) / 1023.0;
+	float r1 = float(h & 1023u) / 1023.0;
 	float yaw = r0 * 6.2831853;
 	float sxz = 0.8 + r1 * 0.5;                       // horizontal spread variation
 	float hsc = 0.7 + 0.17 * float(min(plant, 4));   // taller where more foliage stands
@@ -1067,8 +1072,8 @@ void do_grass_emit() {
 	vec3 az = vec3(-sin(yaw) * sxz, 0.0, cos(yaw) * sxz);
 	vec3 ay = vec3(0.0, hsc, 0.0);
 	vec3 org = vec3(wx + 0.5, baseY, wz + 0.5);
-	// meadow tone variation (multiplies the shader's base->tip green gradient)
-	vec3 col = vec3(mix(0.80, 1.15, r2), mix(0.85, 1.10, r3), mix(0.70, 1.0, r0));
+	// uniform green — no per-tuft tint jitter; the base->tip gradient does the shading
+	vec3 col = vec3(1.0);
 	uint slot = atomicAdd(n_grass, 1u);
 	if (slot < cap_grass) { write_grass(slot, ax, ay, az, org, col); }
 }
@@ -2030,15 +2035,19 @@ void do_herbivore() {
 		if (herb_stamp(x, ay, z, energy)) { mark_dirty(x, ay, z); }
 	}
 
-	// metabolism, death, reproduction
-	energy = energy > HERB_METAB ? energy - HERB_METAB : 0u;
+	// metabolism, death, reproduction. On the dilated clock the METAB drain fires only
+	// 1/bio_period of the passes (bio_period <= 1 keeps the exact per-pass drain, so the
+	// tests are bit-unchanged and no extra random is drawn).
+	bool tick_metab = true;
+	if (p.bio_period > 1.0) { tick_metab = rnd() < 1.0 / p.bio_period; }
+	if (tick_metab) { energy = energy > HERB_METAB ? energy - HERB_METAB : 0u; }
 	if (energy == 0u) {
 		herb_clear(x, ay, z); mark_dirty(x, ay, z);
 		herb[base] = 0u;
 		atomicAdd(herb[2], 0xFFFFFFFFu);                   // live_count -= 1
 		return;
 	}
-	if (energy >= HERB_REPRO && rnd() < HERB_BREED_P) {
+	if (energy >= HERB_REPRO && rnd() < HERB_BREED_P / p.bio_period) {
 		// birth a child onto an adjacent clear grass spot in a free record
 		for (uint d = 0u; d < 4u; d++) {
 			uint dd = (d + uint(rnd() * 4.0)) & 3u;
@@ -2275,15 +2284,17 @@ void do_predator() {
 		if (pred_stamp(x, ay, z)) { mark_dirty(x, ay, z); }
 	}
 
-	// metabolism, death, reproduction
-	energy = energy > PRED_METAB ? energy - PRED_METAB : 0u;
+	// metabolism, death, reproduction (dilated clock — see do_herbivore)
+	bool tick_metab = true;
+	if (p.bio_period > 1.0) { tick_metab = rnd() < 1.0 / p.bio_period; }
+	if (tick_metab) { energy = energy > PRED_METAB ? energy - PRED_METAB : 0u; }
 	if (energy == 0u) {
 		pred_clear(x, ay, z); mark_dirty(x, ay, z);
 		pred[base] = 0u;
 		atomicAdd(pred[2], 0xFFFFFFFFu);                   // live_count -= 1
 		return;
 	}
-	if (energy >= PRED_REPRO && rnd() < PRED_BREED_P) {
+	if (energy >= PRED_REPRO && rnd() < PRED_BREED_P / p.bio_period) {
 		// birth a cub onto an adjacent clear grass spot in a free record
 		for (uint d = 0u; d < 4u; d++) {
 			uint dd = (d + uint(rnd() * 4.0)) & 3u;
@@ -2378,7 +2389,7 @@ void do_vegetate() {
 		uint ny = gy + 1u + ph;
 		if (MAT(cget(cidx(x, ny, z))) == AIR
 				&& (ny + 1u >= p.H || MAT(cget(cidx(x, ny + 1u, z))) == AIR)
-				&& rnd() < VEG_GROW) {
+				&& rnd() < VEG_GROW / p.bio_period) {
 			cset(cidx(x, ny, z), PLANT);
 			atomicMax(topmark[id], ny);
 			wrote = true;
