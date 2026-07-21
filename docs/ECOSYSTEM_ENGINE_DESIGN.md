@@ -59,9 +59,28 @@ math and the coarse fluid model, which Option 2 also needs), and treat Option 2 
 destination once the multi-res model is proven. The coupling + shallow-water solver is the
 reusable core either way.
 
+### Progress
+- **Coarse shallow-water solver — PROTOTYPED & VERIFIED** (`shaders/shallow_water.glsl`,
+  `scripts/shallow_water.gd`). The virtual-pipe model (Mei et al. 2007): one water column
+  per coarse cell over a terrain heightfield, neighbours coupled by pressure-driven pipes,
+  with the per-cell outflow clamped to available water so depth stays non-negative and mass
+  is exactly conserved under reflective boundaries. It is a standalone module on its own
+  (optionally local) RenderingDevice — zero coupling to the fine sim — so it was built and
+  tested in isolation. Acceptance test `VOX_SWTEST=1` (game.gd `_run_sw_test`) proves on two
+  synthetic terrains: mass conserved to ~1e-7 (the named acceptance test), no NaN/instability,
+  water flows fully downhill on a tilted plane, and an off-centre pond pools to a basin floor
+  and LEVELS OUT (surface std ~2.5 vox over a 26-vox-relief bed). This is the reusable core
+  both Option 1 and Option 2 need.
+- **Next on this track**: (a) fill the solver's terrain from the real `world_height`
+  worldgen field (a compute port, so the coarse water sits on the same surface the far field
+  draws); (b) render the coarse water as a translucent heightfield over the far field so
+  km-scale rivers/lakes are visible; (c) couple the fine window's edge water ↔ the coarse
+  grid (flux handoff, mass conserved across the seam) — the multi-res join proper.
+
 ### Open technical questions
 - Coarse fluid model that agrees with fine falling-sand at a seam (shallow-water pipe model
-  vs. cellular). Mass conservation across resolution jumps is the acceptance test.
+  vs. cellular). Mass conservation across resolution jumps is the acceptance test. — the
+  coarse solver's own mass conservation is now proven; the *cross-seam* handoff is still open.
 - Agent handoff across levels (individual voxel agents ↔ coarse/statistical agents).
 - Streaming state preservation (today a window recenter re-generates; real streaming must
   carry live water/erosion/agents across the move).
@@ -114,5 +133,7 @@ grazer's energy integrates to X over a sim-day"), rather than running whole life
 1. Prey fleeing (B2) — highest-impact behaviour, fits the current agent model.
 2. Age/lifespan + a first real species pair with real numbers (B1).
 3. Seasons/day-night + growth coupling (B3) — also a big "looks good" win.
-4. Multi-res coupling + coarse shallow-water solver prototype (A, Option 1).
+4. Multi-res coupling + coarse shallow-water solver prototype (A, Option 1). — solver core
+   DONE & verified (see Progress above); worldgen terrain, rendering, and the cross-seam
+   coupling remain.
 5. Custom compute engine with sparse/streaming bricks (A, Option 2) — the endgame.
