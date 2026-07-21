@@ -49,6 +49,16 @@ var _herb_groups := 0
 const HERB_HDR := 4        # header uints (must match the shader's HERB_HDR)
 const HERB_STRIDE := 6     # uints per record (must match the shader's HERB_STRIDE)
 const HERB_EVERY := 3      # ticks between herbivore updates (motion pace)
+# PREDATORS (binding 20): the same agent buffer one trophic level up — hunters that
+# eat grazers (claim a HERB cell as their body; the eaten grazer self-retires). See
+# vox_step.glsl do_pred_seed / do_predator.
+var pred_buf: RID
+var pred_cap := 0
+var pred_seeded := false
+var _pred_groups := 0
+const PRED_HDR := 4        # header uints (must match the shader's PRED_HDR)
+const PRED_STRIDE := 6     # uints per record (must match the shader's PRED_STRIDE)
+const PRED_EVERY := 3      # ticks between predator updates (motion pace)
 
 var chunk_w := 0
 var chunk_d := 0
@@ -227,6 +237,15 @@ func _init(seed_v: int = 0, w: int = 64, d: int = 64, h: int = 40) -> void:
 	hz[0] = herb_cap               # header: cap
 	herb_buf = rd.storage_buffer_create(herb_words * 4, hz.to_byte_array())
 	_herb_groups = ceili(herb_cap / 64.0)
+	# predator agent pool: sparser than the herd (a higher trophic level), so ~1 per
+	# 40 columns, clamped. Same zeroed-record + cap-in-slot-0 layout as the herd.
+	pred_cap = clampi(W * D / 40, 128, 12000)
+	var pred_words := PRED_HDR + pred_cap * PRED_STRIDE
+	var pz := PackedInt32Array()
+	pz.resize(pred_words)          # all zero -> all records alive=0 (dead)
+	pz[0] = pred_cap               # header: cap
+	pred_buf = rd.storage_buffer_create(pred_words * 4, pz.to_byte_array())
+	_pred_groups = ceili(pred_cap / 64.0)
 	_rebuild_uniform_set()
 
 	_step_groups = Vector3i(
@@ -565,7 +584,7 @@ func _rebuild_uniform_set() -> void:
 		iu.binding = ipair[0]
 		iu.add_id(ipair[1])
 		us.append(iu)
-	for pair: Array in [[14, awake_list_buf], [15, topmark_buf], [19, herb_buf]]:
+	for pair: Array in [[14, awake_list_buf], [15, topmark_buf], [19, herb_buf], [20, pred_buf]]:
 		var bu := RDUniform.new()
 		bu.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
 		bu.binding = pair[0]
@@ -710,6 +729,12 @@ func run(n: int) -> void:
 			rd.compute_list_set_push_constant(cl, _pc(21, 0), PC_SIZE)          # herbivores graze/move/breed
 			rd.compute_list_dispatch(cl, _herb_groups, 1, 1)
 			rd.compute_list_add_barrier(cl)
+		# predators run AFTER the herd's move (barrier above), so they hunt the
+		# grazers' current positions; the eaten grazers self-retire next herb pass
+		if pred_seeded and tick_count % PRED_EVERY == 0:
+			rd.compute_list_set_push_constant(cl, _pc(23, 0), PC_SIZE)          # predators hunt/move/breed
+			rd.compute_list_dispatch(cl, _pred_groups, 1, 1)
+			rd.compute_list_add_barrier(cl)
 	rd.compute_list_end()
 
 ## place an initial cohort of `n` grazers on grass columns. Call AFTER the world
@@ -742,6 +767,35 @@ func read_herbs() -> PackedInt32Array:
 	if not gpu_ok:
 		return PackedInt32Array()
 	return rd.buffer_get_data(herb_buf).to_int32_array()
+
+## place an initial cohort of `n` predators on grass columns. Call AFTER the herd is
+## established (they seek grass with clear air, like grazers, then hunt the herd);
+## births and deaths run autonomously in the per-tick agent pass thereafter.
+func seed_predators(n: int) -> void:
+	if not gpu_ok:
+		return
+	n = clampi(n, 0, pred_cap)
+	rd.buffer_update(pred_buf, 0, 16, PackedInt32Array([pred_cap, n, 0, 0]).to_byte_array())
+	var cl := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(cl, pipeline)
+	rd.compute_list_bind_uniform_set(cl, uniform_set, 0)
+	rd.compute_list_set_push_constant(cl, _pc(22, 0), PC_SIZE)   # seed cohort
+	rd.compute_list_dispatch(cl, _pred_groups, 1, 1)
+	rd.compute_list_end()
+	pred_seeded = true
+
+## live predator count (header live_count, maintained by births/deaths in the pass)
+func pred_population() -> int:
+	if not gpu_ok:
+		return 0
+	return rd.buffer_get_data(pred_buf, 8, 4).to_int32_array()[0]
+
+## TEST SCAFFOLDING: pull the whole predator buffer to the CPU (small worlds).
+## Same decode as read_herbs, with PRED_HDR / PRED_STRIDE.
+func read_preds() -> PackedInt32Array:
+	if not gpu_ok:
+		return PackedInt32Array()
+	return rd.buffer_get_data(pred_buf).to_int32_array()
 
 ## did the physics change any cell since the last check? (reads + clears the
 ## dirty-chunk flags). Lets the renderer skip re-emitting a static world — no
@@ -914,7 +968,7 @@ func free_gpu() -> void:
 	# free our resources, never the shared main device
 	for r in [uniform_set, pipeline, shader, cells_buf, cells_buf2, cells_buf3, pack_buf,
 			stats_buf, dirty_buf, active_buf, step_args_buf, awake_list_buf, topmark_buf,
-			inst_count_buf, _placeholder_a, _placeholder_b, herb_buf,
+			inst_count_buf, _placeholder_a, _placeholder_b, herb_buf, pred_buf,
 			heights_buf, hmax_buf, cam_buf, ray_tex, terra_tex, terra_s_tex, tcol_tex]:
 		if r.is_valid():
 			rd.free_rid(r)
