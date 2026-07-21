@@ -92,6 +92,11 @@ var can_toggle_render := false   # buffers sized for both render modes (live tog
 var _pack_full := false   # pack buffer grown to full size on first sync_cells
 
 var rules_mask := 0   # debug: bit0 gravity, 1 diagonal, 2 lateral, 3 evap, 4 erosion; 0 = all
+# biological time dilation (see the shader's bio_period): 1.0 = the tuned fast
+# ecology dynamics (headless tests); the interactive game raises it so metabolism,
+# breeding and plant growth play out over real-life days while movement stays
+# real-time. Kept at 1.0 by default so tests / the pure-sim path are unchanged.
+var bio_period := 1.0
 # world-space origin of this buffer in voxels — worldgen samples noise at
 # (local + origin) so a chunk generates seamlessly at any world position.
 var gen_origin_x := 0
@@ -630,7 +635,7 @@ func bind_instance_buffers(solid_rid: RID, water_rid: RID, grass_rid: RID = RID(
 		_animal_target = animal_rid
 	_rebuild_uniform_set()
 
-const PC_SIZE := 112   # push constant byte size (must match the shader struct)
+const PC_SIZE := 128   # push constant byte size (must match the shader struct; multiple of 16)
 
 # camera-cone emit culling: unit XZ view direction + cos(cull half-angle).
 # cone_cos -2.0 = off (tests/shots emit all around). Set per-emit by the game.
@@ -695,6 +700,7 @@ func _pc(mode: int, offset: int) -> PackedByteArray:
 	pc.encode_float(100, cone_dir.y)
 	pc.encode_float(104, cone_cos)
 	pc.encode_u32(108, lod_cy)          # camera height above surface (3D LOD)
+	pc.encode_float(112, maxf(bio_period, 1.0))   # biological time dilation (112..127 incl. pad)
 	return pc
 
 # standing vegetation (do_vegetate, mode 9) runs once every this many ticks —
