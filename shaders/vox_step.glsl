@@ -50,7 +50,10 @@ layout(set = 0, binding = 3, std430) restrict buffer DirtyBuf { uint dirty[]; };
 // filled by the emit pass so the CPU never loops over cells to mesh
 layout(set = 0, binding = 4, std430) restrict buffer SolidInst { float solid_inst[]; };
 layout(set = 0, binding = 5, std430) restrict buffer WaterInst { float water_inst[]; };
-layout(set = 0, binding = 6, std430) restrict buffer InstCount { uint n_solid; uint n_water; uint cap_solid; uint cap_water; };
+layout(set = 0, binding = 6, std430) restrict buffer InstCount {
+	uint n_solid; uint n_water; uint cap_solid; uint cap_water;
+	uint n_grass; uint n_animal; uint cap_grass; uint cap_animal;   // living-layer overlay
+};
 // active-block gating (per 16x16x16 chunk — 3D, unlike the 2D per-column dirty
 // grid): the physics only steps chunks with recent activity, and settled regions
 // sleep. A change wakes its chunk (+1-cell margin in all axes) to KEEPALIVE;
@@ -98,6 +101,10 @@ layout(set = 0, binding = 19, std430) restrict buffer HerbBuf { uint herb[]; };
 // so the herd's abundance regulates the predators and the predators thin the herd —
 // the classic predator<->prey coupling on top of the vegetation<->herbivore one.
 layout(set = 0, binding = 20, std430) restrict buffer PredBuf { uint pred[]; };
+// GRASS-TUFT instance stream (16 floats each: 3x4 transform + colour), the plant
+// tier rendered as real foliage over the world mesh instead of green cubes. Filled
+// by do_grass_emit (mode 25); drawn by grass.gdshader as a MultiMesh of blade fans.
+layout(set = 0, binding = 21, std430) restrict buffer GrassInst { float grass_inst[]; };
 
 layout(push_constant) uniform Params {
 	uint W; uint H; uint D; uint tick;
@@ -960,8 +967,8 @@ void do_agent_emit() {
 		yy--;
 		uint cid = cidx(x, yy, z);
 		uint m = MAT(cget(cid));
-		if (m == AIR) { continue; }
-		if (m != PLANT && m != HERB && m != PRED) { break; }   // hit terrain/water
+		if (m == AIR || m == PLANT) { continue; }   // plants drawn as grass tufts (do_grass_emit)
+		if (m != HERB && m != PRED) { break; }       // hit terrain/water
 		float Y = float(int(yy) + int(p.gen_oy));
 		uint nbr[6];
 		int solid_n = 0;
@@ -990,6 +997,76 @@ void do_agent_emit() {
 			if (nbr[k] == AIR || nbr[k] == WATER) { emit_face(false, k, wx, Y, wz, col, grow); }
 		}
 	}
+}
+
+// write a grass-tuft MultiMesh instance: 3x4 transform (scaled+rotated basis in the
+// columns, origin in the last) + colour, same 16-float layout the terrain quads use.
+void write_grass(uint slot, vec3 ax, vec3 ay, vec3 az, vec3 org, vec3 col) {
+	uint b = slot * 16u;
+	float t[12] = float[12](ax.x, ay.x, az.x, org.x,
+			ax.y, ay.y, az.y, org.y,
+			ax.z, ay.z, az.z, org.z);
+	for (uint k = 0u; k < 12u; k++) { grass_inst[b + k] = t[k]; }
+	grass_inst[b+12u] = col.r; grass_inst[b+13u] = col.g; grass_inst[b+14u] = col.b; grass_inst[b+15u] = 1.0;
+}
+
+// mode 25: GRASS TUFTS. One thread per column; where the sim's PLANT tier stands
+// (the tier grazers eat), plant ONE blade-fan tuft rooted on the grass, its height
+// scaled by how much foliage the column holds — so grazing visibly mows the meadow.
+// Bounded to a tight near disc (grass is only worth drawing close; the mesh's green
+// tint carries the distance), stable per world-column so streaming never reshuffles
+// the field. Writes the grass MultiMesh the world-mesh render draws over the terrain.
+const float GRASS_R = 360.0;   // grass draw radius (voxels) — well inside the terrain LOD disc
+void do_grass_emit() {
+	uint id = flat_id();
+	if (id >= p.W * p.D) { return; }
+	uint x = id % p.W;
+	uint z = id / p.W;
+	if (z < p.cut_z) { return; }
+	float wx = float(world_coord(x, p.gen_ox, p.W) - p.gen_ox);
+	float wz = float(world_coord(z, p.gen_oz, p.D) - p.gen_oz);
+	if (p.lod_r > 0u) {
+		float gr = min(float(p.lod_r), GRASS_R);
+		float ddx = wx - float(p.lod_cx);
+		float ddz = wz - float(p.lod_cz);
+		float cy = float(p.lod_cy);
+		if (ddx * ddx + ddz * ddz + cy * cy > gr * gr) { return; }
+		if (cone_out(ddx, ddz, 400.0)) { return; }
+	}
+	// walk down: count the PLANT tier, then land on the ground it roots in
+	uint yy = min(topmark[id] + 1u, p.H);
+	int plant = 0;
+	int gy = -1;
+	while (yy > 0u) {
+		yy--;
+		uint m = MAT(cget(cidx(x, yy, z)));
+		if (m == AIR) { continue; }
+		if (m == PLANT) { plant++; continue; }
+		if (m == HERB || m == PRED) { continue; }   // an animal's column: no tuft
+		if (m == WATER) { return; }                  // no grass on water
+		gy = int(yy); break;                         // terrain top
+	}
+	if (plant == 0 || gy < 0) { return; }
+	// stable per-world-column hash for placement jitter (survives streaming)
+	uint wxi = world_coord(x, p.gen_ox, p.W);
+	uint wzi = world_coord(z, p.gen_oz, p.D);
+	uint h = pcg(wxi * 374761393u ^ (wzi * 668265263u) ^ p.seedv);
+	float r0 = float(h & 1023u) / 1023.0; h = pcg(h);
+	float r1 = float(h & 1023u) / 1023.0; h = pcg(h);
+	float r2 = float(h & 1023u) / 1023.0; h = pcg(h);
+	float r3 = float(h & 1023u) / 1023.0;
+	float yaw = r0 * 6.2831853;
+	float sxz = 0.8 + r1 * 0.5;                       // horizontal spread variation
+	float hsc = 0.85 + 0.26 * float(min(plant, 4));   // taller where more foliage stands
+	float baseY = float(gy + 1 + int(p.gen_oy));      // root on the grass top face
+	vec3 ax = vec3(cos(yaw) * sxz, 0.0, sin(yaw) * sxz);
+	vec3 az = vec3(-sin(yaw) * sxz, 0.0, cos(yaw) * sxz);
+	vec3 ay = vec3(0.0, hsc, 0.0);
+	vec3 org = vec3(wx + 0.5, baseY, wz + 0.5);
+	// meadow tone variation (multiplies the shader's base->tip green gradient)
+	vec3 col = vec3(mix(0.80, 1.15, r2), mix(0.85, 1.10, r3), mix(0.70, 1.0, r0));
+	uint slot = atomicAdd(n_grass, 1u);
+	if (slot < cap_grass) { write_grass(slot, ax, ay, az, org, col); }
 }
 
 // one thread per COLUMN: walk it top-down and emit every exposed voxel, then stop
@@ -2579,5 +2656,6 @@ void main() {
 	else if (mode == 22u) { do_pred_seed(); }
 	else if (mode == 23u) { do_predator(); }
 	else if (mode == 24u) { do_agent_emit(); }
+	else if (mode == 25u) { do_grass_emit(); }
 	else { do_step(); }
 }

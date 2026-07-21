@@ -121,7 +121,7 @@ func _ready() -> void:
 	view.use_instances = world.gpu_ok
 	add_child(view)
 	if view.use_instances:
-		world.bind_instance_buffers(view.solid_buffer_rid(), view.water_buffer_rid())
+		world.bind_instance_buffers(view.solid_buffer_rid(), view.water_buffer_rid(), view.grass_buffer_rid())
 	# far field as a clipmap MESH (default): continuous heightfield rings
 	# displaced in the vertex shader by the worldgen noise — smooth connected
 	# slopes instead of instanced tiles, and zero emit instances out there.
@@ -432,7 +432,7 @@ func _process(dt: float) -> void:
 		view.world = world
 		view.use_instances = world.gpu_ok
 		if view.use_instances:
-			world.bind_instance_buffers(view.solid_buffer_rid(), view.water_buffer_rid())
+			world.bind_instance_buffers(view.solid_buffer_rid(), view.water_buffer_rid(), view.grass_buffer_rid())
 		_refresh_view(true)
 
 	if speed_mult > 0:
@@ -560,15 +560,15 @@ func _refresh_view(force := false) -> void:
 				if gw.ray_render or gw.world_mesh:
 					gw.update_heights()   # rays read the heightfield; refresh with the sim
 				var counts: PackedInt32Array = world.dispatch_emit()
-				if counts.size() == 2:
-					view.set_visible_counts(counts[0], counts[1])
+				if counts.size() >= 4:
+					view.set_visible_counts(counts[0], counts[1], counts[2], counts[3])
 			return
 		# only re-emit when the sim actually changed (or forced on first show /
 		# restart). A static world keeps its instance buffer, so it can't flicker.
 		if force or world.any_dirty_and_clear():
 			var counts: PackedInt32Array = world.dispatch_emit()
-			if counts.size() == 2:
-				view.set_visible_counts(counts[0], counts[1])
+			if counts.size() >= 4:
+				view.set_visible_counts(counts[0], counts[1], counts[2], counts[3])
 	else:
 		world.sync_cells()
 		view.rebuild(world.dirty_chunks)
@@ -714,7 +714,7 @@ func _take_screenshot() -> void:
 		if gw.ray_render or gw.world_mesh:
 			gw.update_heights()                            # heights/surface textures for the new origin
 		var cnt: PackedInt32Array = gw.dispatch_emit()
-		view.set_visible_counts(cnt[0], cnt[1])
+		view.set_visible_counts(cnt[0], cnt[1], cnt[2], cnt[3])
 		if OS.get_environment("VOX_NOPLANE") != "" and view.water_plane != null:
 			view.water_plane.visible = false      # bare-terrain debug shots
 		if gw.ray_render:
@@ -839,7 +839,7 @@ func _take_screenshot() -> void:
 		gw.lod_cx = maxi(0, int(cx) - gw.gen_origin_x)   # LOD near disc at window centre
 		gw.lod_cz = maxi(0, int(cz) - gw.gen_origin_z)
 		var cnt: PackedInt32Array = gw.dispatch_emit()
-		view.set_visible_counts(cnt[0], cnt[1])
+		view.set_visible_counts(cnt[0], cnt[1], cnt[2], cnt[3])
 		var lo := 1e9
 		var hi := -1e9
 		for gz in range(0, 40000, 2000):
@@ -882,7 +882,7 @@ func _take_screenshot() -> void:
 		world.set_rain_mm_hr(0.0)
 		world.run(60)
 		var scnt: PackedInt32Array = gw.dispatch_emit()
-		view.set_visible_counts(scnt[0], scnt[1])
+		view.set_visible_counts(scnt[0], scnt[1], scnt[2], scnt[3])
 		print("STREAM emit at origin %d: solid=%d water=%d instances" % [soff, scnt[0], scnt[1]])
 		var wc := Vector3(soff + world.W * 0.5, world.H * 0.3, soff + world.D * 0.5)
 		cam.position = Vector3(wc.x, world.W * 0.95, wc.z + 1.0)   # near top-down
@@ -947,7 +947,7 @@ func _take_screenshot() -> void:
 			# FORCE a re-emit (reshuffles instance order) to test the worst case:
 			# does the render change just because the buffer order changed?
 			var counts: PackedInt32Array = world.dispatch_emit()
-			view.set_visible_counts(counts[0], counts[1])
+			view.set_visible_counts(counts[0], counts[1], counts[2], counts[3])
 			await get_tree().create_timer(0.15).timeout
 		var b := get_viewport().get_texture().get_image()
 		var diff := 0
